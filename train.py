@@ -1,6 +1,6 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
-  # 8 GPUs, defaults: 253m, global batch 2048 = 8 GPU x 128 x accum 2; 10% of the data, 3 098 steps (~11 epochs)
+  # 8 GPUs, defaults: 253m, global batch 2048 = 8 GPU x 64 x accum 4; 10% of the data, 3 098 steps (~11 epochs)
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora
   # out of memory: --micro-batch 128 (accumulation 2 is derived automatically, global batch stays 2048)
   # full dataset, 30 976 steps
@@ -58,7 +58,7 @@ def get_args():
     p.add_argument("--fraction", type=float, default=0.1,
                    help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
                         "--fraction); 1 = full dataset")
-    p.add_argument("--micro-batch", type=int, default=128,  # 256 OOMs on 24 GB for 253m + 27m TE
+    p.add_argument("--micro-batch", type=int, default=64,  # 128 and 256 OOM on 24 GB for 253m + 27m TE
                    help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
