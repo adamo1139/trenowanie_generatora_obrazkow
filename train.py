@@ -30,7 +30,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.flop_counter import FlopCounterMode
 
-from aurora.data import MASK_ID, ShardStore, TrainStream, load_val, null_ids, select_shards
+from aurora.data import (MASK_ID, ShardStore, TrainStream, full_shard_list, list_shards, load_val, null_ids,
+                         select_shards, split_shards)
 from aurora.model import SIZES, TE_SIZES, DenoiserConfig, TextEncoderConfig, build_models, make_configs
 from aurora.muon import Muon
 
@@ -105,6 +106,9 @@ def get_args():
     p.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--load-hf", default="", help="init from a released AuroraIMG2 repo dir")
+    p.add_argument("--per-shard", type=int, default=0,
+                   help="--eval-only: also report loss per shard (N samples each) for the val shards and for the first "
+                        "and a middle training shard of every subset, to tell generalisation from memorisation")
     return p.parse_args()
 
 
@@ -243,6 +247,25 @@ def hf_configs(repo):
     return read("transformer", DenoiserConfig), read("text_encoder", TextEncoderConfig)
 
 
+def eval_per_shard(te, den, args, device, log):
+    full = full_shard_list(args.data)
+    present = set(list_shards(args.data))
+    train, val = split_shards(full)
+    groups = {}
+    for n in train:
+        groups.setdefault(n.rsplit("-", 3)[0], []).append(n)
+    picks = [(n, "val") for n in val] + [(g[i], "train") for g in groups.values() for i in (0, len(g) // 2)]
+    log(f"{'shard':45s} {'split':5s} {'loss':>7s} {'no text':>8s} {'gain':>6s}")
+    for name, split in picks:
+        if name not in present:
+            log(f"{name:45s} {split:5s}  (not prepared)")
+            continue
+        lat, ids = load_val(args.data, [name], args.per_shard)
+        a = evaluate(te, den, (lat, ids), device)["val/loss"]
+        b = evaluate(te, den, (lat, torch.from_numpy(null_ids()).expand_as(ids).clone()), device)["val/loss"]
+        log(f"{name:45s} {split:5s} {a:7.4f} {b:8.4f} {b - a:6.3f}")
+
+
 def load_hf(te, den, repo):
     from safetensors.torch import load_file
     te.load_state_dict(load_file(os.path.join(repo, "text_encoder", "diffusion_pytorch_model.safetensors")))
@@ -349,6 +372,8 @@ def main():
             res.update({k.replace("val/", "val_no_text/"): v for k, v in no_text.items()})
             res["text_gain"] = no_text["val/loss"] - res["val/loss"]
             log(json.dumps(res, indent=1))
+            if args.per_shard:
+                eval_per_shard(te, den, args, device, log)
         if distributed:
             dist.destroy_process_group()
         return
