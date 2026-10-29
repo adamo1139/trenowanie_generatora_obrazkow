@@ -89,10 +89,10 @@ def get_args():
     p.add_argument("--ckpt-every", type=int, default=None,
                    help="overwrite <out>/latest.pt (full state, for resuming); default: steps / 50")
     p.add_argument("--merge-every", type=int, default=None,
-                   help="WSM: save raw weights to <out>/merge/ every N steps (default steps/100); 0 = off. "
+                   help="WSM: save raw weights to <out>/merge/ every N steps (default steps/25, i.e. 4%%); 0 = off. "
                         "Combine them afterwards with merge.py")
-    p.add_argument("--merge-start", type=float, default=0.7,
-                   help="WSM: start saving merge checkpoints at this fraction of training (0.7 -> last 30%%)")
+    p.add_argument("--merge-start", type=float, default=0.8,
+                   help="WSM: start saving merge checkpoints at this fraction of training (0.8 -> last 20%%)")
     p.add_argument("--keep-every", type=int, default=None,
                    help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); default steps/10, 0 = off")
     p.add_argument("--val-samples", type=int, default=4096)
@@ -294,7 +294,7 @@ def resolve_defaults(args):
     if args.ckpt_every is None:
         args.ckpt_every = max(1, args.steps // 50)
     if args.merge_every is None:
-        args.merge_every = max(1, args.steps // 100)
+        args.merge_every = max(1, args.steps // 25)
     if args.keep_every is None:
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:

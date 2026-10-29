@@ -67,7 +67,7 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
     Przy 2048 to ×2.83 (ukryte 2.83e-4, spójne z Surjo: 2e-4 przy 1024), przy 8192 ×5.66 (ukryte 5.66e-4, embedding 2.8e-3).
     `--no-lr-batch-scaling` wyłącza. Lr Muona nie jest skalowany;
   - **EMA**: `0.9995^(batch/256)` na krok (0.98412 przy 8192), czyli to samo okno w próbkach co w oryginale;
-  - eval co 1/20 runu, `latest.pt` co 1/50, snapshoty co 1/10, WSM co 1/100.
+  - eval co 1/20 runu, `latest.pt` co 1/50, snapshoty co 1/10, WSM co 1/25 przez ostatnie 20%.
   `--batch 256 --micro-batch 32` przywraca dokładnie oryginalny batch.
 - **Dane: zamiast „rotującej puli shardów w VRAM” robimy mmap z dysku.** Oryginał miał 96 GB VRAM, my mamy 24 GB na kartę.
   Shardy są konwertowane do surowych `.npy` (fp16) i czytane przez `np.load(mmap_mode="r")`. Page cache jest współdzielony
@@ -190,9 +190,10 @@ ważone uśrednienie ostatnich checkpointów: **WSM, Warmup-Stable-Merge** ([Tia
   Prosta średnia ≙ liniowe wygaszanie.
 - W artykule najlepiej wypadło **1-sqrt**, tuż za nim **mean**, a **EMA wyraźnie gorzej**. Najważniejsza jest **długość okna**.
 - `train.py` zapisuje surowe wagi (fp32, bez optymalizatora i EMA) do `<out>/merge/step_*.pt` co `--merge-every` kroków
-  (domyślnie 1% treningu) przez ostatnie 30% treningu (`--merge-start 0.7`). Wychodzi ~31 plików, **~14 GB dla 116M**
-  (~0.46 GB każdy), niezależnie od długości runu. `--merge-every 0` wyłącza zapisy.
-- `merge.py <run>` uśrednia je dla każdej kombinacji schematu (`1-sqrt`, `mean`, `cosine`) i okna (5/10/20/30% treningu),
+  (domyślnie co 4% treningu) przez ostatnie 20% treningu (`--merge-start 0.8`). Wychodzi ~6 plików, **~6.5 GB dla 272M**
+  (~1.1 GB każdy), niezależnie od długości runu. `--merge-every 0` wyłącza zapisy. Wcześniej było co 1% przez 30% (~31 plików);
+  zmniejszone dla miejsca na dysku. Kosztem jest rzadsza siatka okien: w `p10` najlepsze było okno 5% przy 6 checkpointach.
+- `merge.py <run>` uśrednia je dla każdej kombinacji schematu (`1-sqrt`, `mean`, `cosine`) i okna (4/8/12/20% treningu, czyli 2/3/4/6 checkpointów),
   liczy `val/loss` na hold-oucie, wypisuje porównanie z surowymi wagami i z EMA, a najlepszy wariant zapisuje do `<run>/merged.pt`.
   Dalej `export.py <run>/merged.pt ...` jak zwykle. Okno i schemat dobiera się więc na danych, a nie z góry.
 - Ze stałym lr można scalać w dowolnym momencie (np. z ostatnich 10% dotychczasowego treningu), żeby zobaczyć, jak dobry jest

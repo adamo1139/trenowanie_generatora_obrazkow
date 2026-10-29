@@ -1,7 +1,7 @@
 """WSM (Warmup-Stable-Merge, Tian et al. 2025, arXiv:2507.17634): instead of decaying the lr, train at constant lr and
 average the last checkpoints with weights that emulate a decay schedule.
 
-train.py saves raw weights to <run>/merge/step_*.pt over the last 30% of training (--merge-start / --merge-every).
+train.py saves raw weights to <run>/merge/step_*.pt every 4% over the last 20% of training (--merge-start / --merge-every).
 This script tries every (scheme, window) combination on the held-out val set, compares with the EMA from latest.pt,
 and writes the best one as a checkpoint that export.py takes:
 
@@ -47,7 +47,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("run", help="training output dir (contains merge/ and latest.pt)")
     p.add_argument("--schemes", default="1-sqrt,mean,cosine")
-    p.add_argument("--windows", default="0.05,0.1,0.2,0.3",
+    p.add_argument("--windows", default="0.04,0.08,0.12,0.2",
                    help="merge durations as fractions of the whole training run (counted back from the last step)")
     p.add_argument("--data", default="data/aurora")
     p.add_argument("--val-samples", type=int, default=4096)
