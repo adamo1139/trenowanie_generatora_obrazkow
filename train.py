@@ -17,6 +17,7 @@ import json
 import math
 import os
 import time
+import uuid
 from dataclasses import asdict
 
 import torch
@@ -82,7 +83,10 @@ def get_args():
     p.add_argument("--val-samples", type=int, default=4096)
     p.add_argument("--peak-tflops", type=float, default=0,
                    help="GPU peak bf16 TFLOPS for MFU (default: looked up from the GPU name, 0 = unknown)")
-    p.add_argument("--wandb", default="", help="wandb project name (empty = off)")
+    p.add_argument("--wandb", default="trenowanie_generatora_obrazkow",
+                   help="wandb project name. Logging is on automatically when wandb is logged in (`wandb login`), "
+                        "otherwise off; a resumed run continues the same wandb run (id in <out>/wandb_id.txt)")
+    p.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--load-hf", default="", help="init from a released AuroraIMG2 repo dir")
     return p.parse_args()
@@ -223,6 +227,37 @@ def load_hf(te, den, repo):
     den.load_state_dict(load_file(os.path.join(repo, "transformer", "diffusion_pytorch_model.safetensors")))
 
 
+def wandb_logged_in() -> bool:
+    """True if wandb is installed and has credentials: WANDB_API_KEY, offline mode, or the ~/.netrc entry that
+    `wandb login` writes."""
+    try:
+        import wandb  # noqa: F401
+    except ImportError:
+        return False
+    if os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") in ("offline", "dryrun"):
+        return True
+    import netrc
+    from urllib.parse import urlparse
+    host = urlparse(os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")).hostname
+    try:
+        return netrc.netrc(os.environ.get("NETRC")).authenticators(host) is not None
+    except (FileNotFoundError, netrc.NetrcParseError):
+        return False
+
+
+def init_wandb(args):
+    """One wandb run per output dir: the id is stored in <out>/wandb_id.txt, so resuming continues the same run."""
+    import wandb
+    id_path = os.path.join(args.out, "wandb_id.txt")
+    run_id = open(id_path).read().strip() if os.path.exists(id_path) else uuid.uuid4().hex[:12]
+    with open(id_path, "w") as f:
+        f.write(run_id)
+    wb = wandb.init(project=args.wandb, id=run_id, resume="allow", dir=args.out,
+                    name=os.path.basename(os.path.normpath(args.out)))
+    wb.config.update(vars(args), allow_val_change=True)
+    return wb
+
+
 def main():
     args = get_args()
     if args.steps is None:
@@ -320,9 +355,11 @@ def main():
     null_row = torch.from_numpy(null_ids()).to(device)
 
     wb = None
-    if master and args.wandb:
-        import wandb
-        wb = wandb.init(project=args.wandb, config=vars(args), resume="allow", dir=args.out)
+    if master and args.wandb and not args.no_wandb:
+        if wandb_logged_in():
+            wb = init_wandb(args)
+        else:
+            log("wandb: off (not logged in; run `wandb login` to enable, or pass --no-wandb to silence this)")
 
     def save():
         if not master:
@@ -406,7 +443,10 @@ def main():
             stats = {"train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
                      "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
                      "imgs_per_s": n * args.batch / dt, "tflops_per_gpu": flops_micro * accum * n / dt / 1e12}
-            mfu = f" MFU {stats['tflops_per_gpu'] / peak:.0%}" if peak else ""
+            mfu = ""
+            if peak:
+                stats["mfu"] = stats["tflops_per_gpu"] / peak
+                mfu = f" MFU {stats['mfu']:.0%}"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | mlm {stats['train/loss_mlm']:.3f} | "
                 f"gn {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
@@ -431,6 +471,8 @@ def main():
             dist.barrier()
 
     log("done")
+    if wb:
+        wb.finish()
     if distributed:
         dist.destroy_process_group()
 

@@ -43,6 +43,7 @@ python prepare_data.py tokenize --data data/aurora
 
 # trening na 8 GPU. Domyślnie 10% danych, 24 780 kroków (~11 epok); całość: --fraction 1 (247 805 kroków).
 # Wznawia się sam z <out>/latest.pt (co 5k kroków); trwałe snap_<krok>.pt co 1/10 runu.
+# wandb włącza się sam, jeśli jest zalogowany (`wandb login`); projekt trenowanie_generatora_obrazkow, --no-wandb wyłącza.
 torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m
 
 # WSM: zamiast wygaszać lr, uśredniamy checkpointy z końcówki treningu (schemat i okno wybierane na walidacji)

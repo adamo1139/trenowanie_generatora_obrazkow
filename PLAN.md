@@ -171,6 +171,15 @@ ważone uśrednienie ostatnich checkpointów: **WSM, Warmup-Stable-Merge** ([Tia
 - `<out>/merge/step_<krok>.pt`: surowe wagi dla WSM, opisane wyżej.
 - Wszystko zapisuje rank 0. Na koniec treningu zapis jest zawsze.
 
+### wandb
+- Włącza się automatycznie, gdy wandb jest zalogowany (`WANDB_API_KEY` albo wpis w `~/.netrc` po `wandb login`).
+  Bez logowania trening idzie dalej z komunikatem „wandb: off”. Projekt domyślnie `trenowanie_generatora_obrazkow`
+  (`--wandb <projekt>`), `--no-wandb` wyłącza.
+- Nazwa runu = nazwa katalogu `--out`. ID runu jest w `<out>/wandb_id.txt`, więc wznowiony trening dopisuje się do tego
+  samego runu w wandb.
+- Co `--log-every` kroków: `train/loss_fm`, `train/loss_mlm`, `train/grad_norm`, `lr_mult`, `steps_per_s`, `imgs_per_s`,
+  `tflops_per_gpu`, `mfu`. Co `--eval-every`: `val/loss` (EMA) i `val/loss` w 4 przedziałach t. Config = wszystkie argumenty.
+
 ## 3. Szacunki
 
 - **Dysk** (maszyna treningowa): ~370 GB na przekonwertowane dane + ~10 GB captionów. `convert --download --delete-raw`
@@ -213,10 +222,10 @@ done
 torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/ab_muon --size 116m --steps 20000 --eval-every 2000 --optimizer muon
 
 # 4. trening na 10% danych (domyślnie: 24 780 kroków, ~11 epok; wznawia się sam z runs/p10/latest.pt)
-torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/p10 --size 116m --lr-hidden <z 3b> --wandb aurora-repro
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/p10 --size 116m --lr-hidden <z 3b>
 
 # 4b. jeśli pomysł działa: całość (najpierw convert --fraction 1 + tokenize), 247 805 kroków
-torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1 --wandb aurora-repro
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1
 
 # 5. WSM: uśrednienie checkpointów z końcówki (wybór schematu i okna na val), eksport do formatu HF + siatka 8 promptów
 python merge.py runs/p10                       # -> runs/p10/merged.pt, tabela val/loss: surowe / EMA / WSM
