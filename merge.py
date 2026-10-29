@@ -22,7 +22,7 @@ import os
 import torch
 
 from aurora.data import full_shard_list, load_val, split_shards
-from aurora.model import DenoiserConfig, build_models
+from aurora.model import build_models, configs_from_ckpt
 from train import evaluate
 
 DECAYS = {  # lr multiplier as a function of progress p in (0, 1) through the window
@@ -81,8 +81,7 @@ def main():
                     cb["acc"][key].add_(tensors[key], alpha=cj)
 
     val = load_val(args.data, split_shards(full_shard_list(args.data))[1], args.val_samples)
-    den_cfg = DenoiserConfig(**meta[0]["den_config"])
-    te, den = build_models(den_cfg)
+    te, den = build_models(*configs_from_ckpt(meta[0]))
     te.to(dev), den.to(dev)
 
     def score(te_sd, den_sd):
@@ -112,7 +111,7 @@ def main():
     te_sd = {k: v.cpu() for k, v in te_sd.items()}
     den_sd = {k: v.cpu() for k, v in den_sd.items()}
     # same layout as a training checkpoint; "ema" holds the merged weights too, so export.py picks them by default
-    torch.save(dict(step=last, den_config=meta[0]["den_config"], te=te_sd, den=den_sd,
+    torch.save(dict(step=last, den_config=meta[0]["den_config"], te_config=meta[0].get("te_config", {}), te=te_sd, den=den_sd,
                     ema=list(te_sd.values()) + list(den_sd.values()),
                     wsm=dict(scheme=cb["scheme"], window=cb["window"], steps=[steps[i] for i in cb["idx"]],
                              weights=cb["c"], val_loss=loss)), out)

@@ -47,6 +47,11 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
   do 8192 (ryzyko przekroczenia krytycznego batcha) inwestujemy w większy model. Komunikacja na próbkę jest taka sama jak przy
   64 × 4, szersze matmule powinny podnieść MFU, a lr macierzy ukrytych skaluje się μP-owo jak 1/szerokość względem 768
   (`1e-4 × 768/1024 = 7.5e-5` przy batchu 256, ×2.83 → 2.12e-4). 367 GFLOP na próbkę.
+- **Text encoder 27M (domyślnie, `--te-size 27m`): 512 × 8, 8 głowic (2 KV), MLP 1408.** Rośnie mniej więcej tak samo jak
+  denoiser (12.6M → 26.7M wobec 104M → 245M). Słabością tych modeli jest rozumienie promptu (liczenie, położenie, czasowniki),
+  a encoder przetwarza tylko 64 tokeny, więc kosztuje ~2% FLOP-ów (375 vs 367 GFLOP na próbkę). Cross-attention w DiT
+  czyta wektory 512 zamiast 384 (+4.2M parametrów). Eksport zapisuje oba configi, oryginalny `pipeline.py` je wczytuje.
+  Checkpointy sprzed tej zmiany nie mają `te_config` i są traktowane jako `13m`. Wznowienie starego runu: `--te-size 13m`.
 - Rozważane wcześniej: **batch 8192 = 8 GPU × 256 × akumulacja 4**. Najpierw było 2048 = 8 × 64 × 4: 2292 img/s, 45.8 TFLOPS/GPU,
   czyli MFU ~30% względem 153 TFLOPS (karty z odblokowaną akumulacją fp32). Pamięci zostawało dużo (11 GB przy mb 64), stąd
   micro-batch 256. Ryzyko: 4× mniej kroków (7 744 na całości) i lr ×5.66. Wyżej niż typowy krytyczny batch małych DiT,

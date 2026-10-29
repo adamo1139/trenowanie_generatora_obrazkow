@@ -31,7 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.flop_counter import FlopCounterMode
 
 from aurora.data import MASK_ID, ShardStore, TrainStream, load_val, null_ids, select_shards
-from aurora.model import SIZES, DenoiserConfig, build_models
+from aurora.model import SIZES, TE_SIZES, DenoiserConfig, TextEncoderConfig, build_models, make_configs
 from aurora.muon import Muon
 
 
@@ -41,6 +41,8 @@ def get_args():
     p.add_argument("--out", required=True)
     p.add_argument("--size", choices=sorted(SIZES), default="253m",
                    help="denoiser size preset (50m = released model; 116m / 253m = 768x12 / 1024x16)")
+    p.add_argument("--te-size", choices=sorted(TE_SIZES), default="27m",
+                   help="text encoder size preset (13m = released 384x6, 27m = 512x8)")
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
                    help="optimizer for the hidden matrices; everything else is always AdamW. muon = released recipe")
     p.add_argument("--lr-hidden", type=float, default=None,  # all AdamW lrs are given at batch 256
@@ -231,10 +233,12 @@ def evaluate(te, den, val, device, seed=1234, chunk=256):
     return out
 
 
-def hf_denoiser_config(repo):
-    with open(os.path.join(repo, "transformer", "config.json")) as f:
-        cfg = json.load(f)
-    return DenoiserConfig(**{k: v for k, v in cfg.items() if k in DenoiserConfig.__dataclass_fields__})
+def hf_configs(repo):
+    def read(sub, cls):
+        with open(os.path.join(repo, sub, "config.json")) as f:
+            cfg = json.load(f)
+        return cls(**{k: v for k, v in cfg.items() if k in cls.__dataclass_fields__})
+    return read("transformer", DenoiserConfig), read("text_encoder", TextEncoderConfig)
 
 
 def load_hf(te, den, repo):
@@ -274,8 +278,8 @@ def init_wandb(args):
     return wb
 
 
-def main():
-    args = get_args()
+def resolve_defaults(args):
+    """Defaults that depend on other arguments (size, batch, fraction)."""
     if args.lr_hidden is None:
         args.lr_hidden = 1e-4 * 768 / (SIZES[args.size].dim if not args.load_hf else 768)
     ref_ratio = args.batch / 256  # released recipe: batch 256, 247 805 steps (~11 epochs over the full data)
@@ -294,6 +298,11 @@ def main():
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
+    return args
+
+
+def main():
+    args = resolve_defaults(get_args())
     distributed = "RANK" in os.environ
     if distributed:
         dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))  # gloo only for single-GPU tests
@@ -322,8 +331,8 @@ def main():
     val = load_val(args.data, val_names, args.val_samples) if (master and val_names) else None
 
     # ---- model ---------------------------------------------------------------------------------
-    den_cfg = hf_denoiser_config(args.load_hf) if args.load_hf else SIZES[args.size]
-    te, den = build_models(den_cfg)
+    den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size)
+    te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)
     te.to(device), den.to(device)
@@ -349,6 +358,8 @@ def main():
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         assert ck["den_config"] == asdict(den_cfg), f"checkpoint was trained with {ck['den_config']}"
+        ck_te = ck.get("te_config", asdict(TextEncoderConfig()))
+        assert ck_te == asdict(te_cfg), f"checkpoint was trained with text encoder {ck_te} (see --te-size)"
         te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
         for o, s in zip(opts, ck["opts"]):
             o.load_state_dict(s)
@@ -392,11 +403,11 @@ def main():
             return
         sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
         tmp = ckpt_path + ".tmp"
-        torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
+        torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
                         ema=[e.cpu() for e in ema], args=vars(args)), tmp)
         os.replace(tmp, ckpt_path)
         if args.keep_every and step % args.keep_every == 0:
-            torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
+            torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
                        os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     def save_merge():
@@ -405,7 +416,7 @@ def main():
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, f"step_{step:07d}.pt")
         sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
-        torch.save(dict(step=step, total_steps=args.steps, den_config=asdict(den_cfg), te=sd(te), den=sd(den)),
+        torch.save(dict(step=step, total_steps=args.steps, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den)),
                    path + ".tmp")
         os.replace(path + ".tmp", path)
 

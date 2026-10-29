@@ -5,7 +5,7 @@ so released weights load with strict=True and our checkpoints export to that lay
 The building blocks are copied from the reference pipeline.py; only the init scheme is ours (not published).
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -287,8 +287,26 @@ SIZES = {
 }
 
 
-def build_models(den_cfg: DenoiserConfig = DenoiserConfig()):
-    te, den = TextEncoder(), Denoiser(den_cfg)
+# Text encoder sizes. "13m" is the released one (12.6M); "27m" (512 x 8) goes with the larger denoisers.
+TE_SIZES = {
+    "13m": TextEncoderConfig(),
+    "27m": TextEncoderConfig(dim=512, depth=8, heads=8, kv_heads=2, head_dim=64, mlp_hidden=1408),
+}
+
+
+def make_configs(size: str, te_size: str):
+    te_cfg = TE_SIZES[te_size]
+    return replace(SIZES[size], text_dim=te_cfg.dim), te_cfg
+
+
+def configs_from_ckpt(ck):
+    """Configs stored in a checkpoint; checkpoints from before te_config existed used the released text encoder."""
+    return DenoiserConfig(**ck["den_config"]), TextEncoderConfig(**ck.get("te_config", {}))
+
+
+def build_models(den_cfg: DenoiserConfig = DenoiserConfig(), te_cfg: TextEncoderConfig = TextEncoderConfig()):
+    assert den_cfg.text_dim == te_cfg.dim, f"denoiser text_dim {den_cfg.text_dim} != text encoder dim {te_cfg.dim}"
+    te, den = TextEncoder(te_cfg), Denoiser(den_cfg)
     te.init_weights()
     den.init_weights()
     return te, den

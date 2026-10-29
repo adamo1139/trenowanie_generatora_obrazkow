@@ -5,7 +5,9 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 (rectified flow) z DiT-em, text encoderem trenowanym razem z nim i zamrożonym dekoderem FLUX.2. Celujemy w 8× RTX 3090 Ti.
 
 - Architektura jest 1:1 z oryginałem: opublikowane wagi ładują się w trybie strict i dają identyczny output (`tests/check_model.py`).
-- Rozmiary: `--size 50m` (oryginał, 63M z text encoderem), `--size 116m` (DiT 768×12) i `--size 253m` (DiT 1024×16, domyślny).
+- Rozmiary DiT: `--size 50m` (oryginał), `116m` (768×12), `253m` (1024×16, domyślny). Text encoder: `--te-size 13m`
+  (oryginał, 384×6) albo `27m` (512×8, domyślny). Domyślnie razem ~272M (DiT 245M z szerszym cross-attention + TE 26.7M).
+  Odtworzenie oryginału: `--size 50m --te-size 13m`.
 - Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie) + **WSM** (uśrednianie checkpointów
   zamiast wygaszania lr, `merge.py`). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
 - Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).

@@ -2,7 +2,7 @@
 import importlib.util, sys, torch
 sys.path.insert(0, ".")
 from aurora.model import build_models
-from train import load_hf, param_groups, get_args
+from train import load_hf, param_groups, get_args, resolve_defaults
 
 import types, inspect, functools
 from types import SimpleNamespace
@@ -56,6 +56,6 @@ print("text max abs diff", (a - b).abs().max().item(), "velocity max abs diff", 
 assert torch.equal(a, b) and torch.equal(va, vb)
 
 sys.argv = ["x", "--data", "x", "--out", "x", "--no-compile"]
-_, counts = param_groups(te, den, get_args())
+_, counts = param_groups(te, den, resolve_defaults(get_args()))
 print("optimizer groups:", {k: f"{v/1e6:.2f}M" for k, v in counts.items()})
 print("OK")
