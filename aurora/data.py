@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import re
+import resource
 
 import numpy as np
 import torch
@@ -77,9 +78,23 @@ def select_shards(root: str, fraction: float):
     return train, val
 
 
+def ensure_open_files(needed: int):
+    """Every mmap holds a file descriptor and each DataLoader worker maps 2 files per shard (~2300 for the full set),
+    above the usual soft limit of 1024. Raise the soft limit to the hard one (inherited by forked workers)."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= needed:
+        return
+    target = needed if hard == resource.RLIM_INFINITY else min(max(needed, 65536), hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    if target < needed:
+        raise SystemExit(f"need ~{needed} open files per process for {needed // 2} shards, hard limit is {hard}; "
+                         f"raise it (e.g. `ulimit -Hn 65536` as root / limits.conf)")
+
+
 class ShardStore:
     def __init__(self, root: str, names):
         self.root, self.names = root, list(names)
+        ensure_open_files(2 * len(self.names) + 512)
         self.offs = [np.load(self._p(n, "off")) for n in self.names]
         self.sizes = np.array([len(o) - 1 for o in self.offs], dtype=np.int64)
         self.starts = np.concatenate([[0], np.cumsum(self.sizes)])
