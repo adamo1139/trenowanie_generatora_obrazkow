@@ -32,6 +32,25 @@ MAX_TOKENS = 64
 PAD_ID, BOS_ID, EOS_ID = 0, 2, 3
 
 
+def replace_file(path, write):
+    """Write via a temp file + rename: atomic, and never modifies a file hard-linked from another data dir
+    (`cp -al data/aurora data/aurora_full` shares inodes)."""
+    tmp = path + ".tmp"
+    write(tmp)
+    os.replace(tmp, path)
+
+
+def save_npy(path, arr):
+    replace_file(path, lambda tmp: np.save(open(tmp, "wb"), arr))
+
+
+def save_json(path, obj, **kw):
+    def write(tmp):
+        with open(tmp, "w") as f:
+            json.dump(obj, f, **kw)
+    replace_file(path, write)
+
+
 def normalize_caps(c):
     """Flatten whatever one `caps` entry is (list / array / dict / JSON string / str) into a list of strings."""
     if isinstance(c, np.ndarray):
@@ -79,8 +98,7 @@ def convert_one(src: str, out: str, delete_raw: bool):
     assert len(caps) == len(lat)
     tmp = os.path.join(out, name + ".lat.tmp.npy")
     np.save(tmp, lat)
-    with open(os.path.join(out, name + ".caps.json"), "w") as f:
-        json.dump(caps, f, ensure_ascii=False)
+    save_json(os.path.join(out, name + ".caps.json"), caps, ensure_ascii=False)
     os.replace(tmp, os.path.join(out, name + ".lat.npy"))  # .lat.npy appears last = shard done
     if delete_raw:
         os.remove(src)
@@ -95,8 +113,8 @@ def download_and_convert(fname: str, raw: str, out: str, delete_raw: bool):
 
 def write_manifest(out, files):
     """Full shard list of the source, so train.py --fraction picks the same shards whatever has been downloaded."""
-    with open(os.path.join(out, "manifest.json"), "w") as f:
-        json.dump({"shards": sorted(os.path.basename(x)[: -len(".npz")] for x in files)}, f, indent=0)
+    save_json(os.path.join(out, "manifest.json"),
+              {"shards": sorted(os.path.basename(x)[: -len(".npz")] for x in files)}, indent=0)
 
 
 def pick_fraction(files, fraction):
@@ -157,8 +175,8 @@ def tokenize_one(name: str, data: str, tokenizer_path: str):
         rows[j, 0] = BOS_ID
         rows[j, 1:1 + len(ids)] = ids
         rows[j, 1 + len(ids)] = EOS_ID
-    np.save(os.path.join(data, name + ".tok.npy"), rows)
-    np.save(os.path.join(data, name + ".off.npy"), off)  # .off.npy written last = shard tokenised
+    save_npy(os.path.join(data, name + ".tok.npy"), rows)
+    save_npy(os.path.join(data, name + ".off.npy"), off)  # .off.npy written last = shard tokenised
     return name, len(caps), len(flat)
 
 
