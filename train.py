@@ -1,0 +1,365 @@
+"""AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
+
+  # 8 GPUs (global batch 256 = 8 x 32)
+  torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora
+
+  # 1 GPU smoke test (gradient accumulation keeps the global batch at 256)
+  python train.py --data /data/aurora --out runs/test --micro-batch 64 --steps 200
+
+  # reference: val loss of the released EMA weights on our held-out shards
+  python train.py --data /data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
+"""
+import argparse
+import contextlib
+import json
+import math
+import os
+import time
+from dataclasses import asdict
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from aurora.data import MASK_ID, ShardStore, TrainStream, list_shards, load_val, null_ids, split_shards
+from aurora.model import SIZES, DenoiserConfig, build_models
+from aurora.muon import Muon
+
+
+def get_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--size", choices=sorted(SIZES), default="50m", help="denoiser size preset (50m = released model)")
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                   help="optimizer for the hidden matrices; everything else is always AdamW. muon = released recipe")
+    p.add_argument("--lr-hidden", type=float, default=1e-4,
+                   help="AdamW peak lr for hidden matrices (--optimizer adamw), see PLAN.md for the derivation")
+    p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
+    p.add_argument("--steps", type=int, default=247_805)
+    p.add_argument("--batch", type=int, default=256, help="global batch size")
+    p.add_argument("--micro-batch", type=int, default=0, help="per-GPU micro batch (default: batch / world)")
+    p.add_argument("--warmup-frac", type=float, default=0.02)
+    p.add_argument("--lr-muon", type=float, default=1e-2)
+    p.add_argument("--lr-emb", type=float, default=5e-4)
+    p.add_argument("--lr-adam", type=float, default=3e-4)
+    p.add_argument("--wd", type=float, default=None,
+                   help="decoupled weight decay on matrices (default: 0.1 with adamw, 0.01 with muon)")
+    p.add_argument("--schedule", choices=["constant", "cosine"], default="constant",
+                   help="after warmup: constant lr, or cosine to 0 (released recipe)")
+    p.add_argument("--momentum", type=float, default=0.95)
+    p.add_argument("--ns-steps", type=int, default=5)
+    p.add_argument("--clip", type=float, default=1.0)
+    p.add_argument("--ema", type=float, default=0.9995)
+    p.add_argument("--cfg-drop", type=float, default=0.1)
+    p.add_argument("--mlm-weight", type=float, default=0.05)
+    p.add_argument("--mlm-every", type=int, default=4)
+    p.add_argument("--mlm-prob", type=float, default=0.15)
+    p.add_argument("--grad-comm", choices=["fp32", "bf16"], default="bf16",
+                   help="bf16 halves DDP all-reduce traffic (PCIe-only 3090 Ti boxes)")
+    p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--eval-every", type=int, default=5000)
+    p.add_argument("--ckpt-every", type=int, default=5000)
+    p.add_argument("--val-samples", type=int, default=4096)
+    p.add_argument("--wandb", default="", help="wandb project name (empty = off)")
+    p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--load-hf", default="", help="init from a released AuroraIMG2 repo dir")
+    return p.parse_args()
+
+
+class FlowModel(nn.Module):
+    """Both trainable nets in one module so DDP buckets and syncs them together."""
+
+    def __init__(self, te, den, mlm_weight):
+        super().__init__()
+        self.te, self.den, self.mlm_weight = te, den, mlm_weight
+
+    def forward(self, x0, ids, t, eps, mlm_ids=None, mlm_labels=None):
+        text, valid = self.te(ids)
+        tt = t.view(-1, 1, 1, 1)
+        z_t = (1 - tt) * x0 + tt * eps
+        v = self.den(z_t, t, text, valid)
+        loss_fm = F.mse_loss(v.float(), eps - x0)
+        if mlm_ids is None:
+            return loss_fm, loss_fm.detach(), None
+        h, _ = self.te(mlm_ids)
+        logits = h @ self.te.token_embedding.weight.to(h.dtype).T  # MLM head tied to the token embedding
+        loss_mlm = F.cross_entropy(logits.float().flatten(0, 1), mlm_labels.flatten(), ignore_index=-100)
+        return loss_fm + self.mlm_weight * loss_mlm, loss_fm.detach(), loss_mlm.detach()
+
+
+def make_mlm(ids, prob):
+    maskable = ids > MASK_ID  # never mask PAD/UNK/BOS/EOS/NULL/MASK
+    m = (torch.rand(ids.shape, device=ids.device) < prob) & maskable
+    return ids.masked_fill(m, MASK_ID), ids.masked_fill(~m, -100)
+
+
+def param_groups(te, den, args):
+    muon, emb, proj, other = [], [], [], []
+    for prefix, mod in (("te", te), ("den", den)):
+        for name, p in mod.named_parameters():
+            full = f"{prefix}.{name}"
+            if full == "te.token_embedding.weight":
+                emb.append(p)
+            elif ".blocks." in f".{name}" and p.ndim == 2 and not name.endswith("mod_table"):
+                muon.append(p)  # hidden matrices: attention, cross-attention, MLP
+            elif p.ndim == 2 and not name.endswith("mod_table"):
+                proj.append(p)  # patch_in / patch_out / time_mlp / ada
+            else:
+                other.append(p)  # norms, mod tables, biases
+    adam_groups = [
+        dict(params=emb, lr=args.lr_emb, base_lr=args.lr_emb, weight_decay=0.0),
+        dict(params=proj, lr=args.lr_adam, base_lr=args.lr_adam, weight_decay=args.wd),
+        dict(params=other, lr=args.lr_adam, base_lr=args.lr_adam, weight_decay=0.0),
+    ]
+    opts = []
+    if args.optimizer == "muon":
+        opts.append(Muon([dict(params=muon, base_lr=args.lr_muon)], lr=args.lr_muon, momentum=args.momentum,
+                         ns_steps=args.ns_steps, weight_decay=args.wd, compile_ns=not args.no_compile))
+    else:
+        adam_groups.append(dict(params=muon, lr=args.lr_hidden, base_lr=args.lr_hidden, weight_decay=args.wd))
+    beta2 = args.beta2 if args.beta2 is not None else (0.99 if args.optimizer == "adamw" else 0.95)
+    opts.append(torch.optim.AdamW(adam_groups, betas=(0.9, beta2), eps=1e-8, fused=True))
+    counts = {k: sum(p.numel() for p in v) for k, v in
+              dict(hidden=muon, emb=emb, proj=proj, other=other).items()}
+    return opts, counts
+
+
+def lr_mult(step, total, warmup, schedule):
+    if step < warmup:
+        return (step + 1) / warmup
+    if schedule == "constant":
+        return 1.0
+    return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, total - warmup))))
+
+
+@torch.no_grad()
+def evaluate(te, den, val, device, seed=1234, chunk=256):
+    """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs."""
+    lat, ids = val
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    t_all = torch.sigmoid(torch.randn(len(lat), generator=g))
+    eps_all = torch.randn(lat.shape, generator=g)
+    te.eval(), den.eval()
+    tot, n = 0.0, 0
+    buckets = torch.zeros(4), torch.zeros(4)
+    for i in range(0, len(lat), chunk):
+        x0 = lat[i:i + chunk].to(device).float()
+        t, eps = t_all[i:i + chunk].to(device), eps_all[i:i + chunk].to(device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            text, valid = te(ids[i:i + chunk].to(device))
+            tt = t.view(-1, 1, 1, 1)
+            v = den((1 - tt) * x0 + tt * eps, t, text, valid)
+        per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
+        tot += per.sum().item()
+        n += len(per)
+        b = (t.cpu() * 4).long().clamp(max=3)
+        buckets[0].index_add_(0, b, per)
+        buckets[1].index_add_(0, b, torch.ones_like(per))
+    te.train(), den.train()
+    out = {"val/loss": tot / n}
+    for k in range(4):
+        out[f"val/loss_t{k / 4:.2f}-{(k + 1) / 4:.2f}"] = (buckets[0][k] / buckets[1][k].clamp(min=1)).item()
+    return out
+
+
+def hf_denoiser_config(repo):
+    with open(os.path.join(repo, "transformer", "config.json")) as f:
+        cfg = json.load(f)
+    return DenoiserConfig(**{k: v for k, v in cfg.items() if k in DenoiserConfig.__dataclass_fields__})
+
+
+def load_hf(te, den, repo):
+    from safetensors.torch import load_file
+    te.load_state_dict(load_file(os.path.join(repo, "text_encoder", "diffusion_pytorch_model.safetensors")))
+    den.load_state_dict(load_file(os.path.join(repo, "transformer", "diffusion_pytorch_model.safetensors")))
+
+
+def main():
+    args = get_args()
+    if args.wd is None:
+        args.wd = 0.1 if args.optimizer == "adamw" else 0.01
+    distributed = "RANK" in os.environ
+    if distributed:
+        dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))  # gloo only for single-GPU tests
+        rank, world = dist.get_rank(), dist.get_world_size()
+        local = int(os.environ["LOCAL_RANK"])
+    else:
+        rank, world, local = 0, 1, 0
+    local %= torch.cuda.device_count()
+    torch.cuda.set_device(local)
+    device = torch.device("cuda", local)
+    master = rank == 0
+    torch.manual_seed(args.seed * 1000 + rank)  # different noise / t / dropout per rank
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    log = print if master else (lambda *a, **k: None)
+
+    mb = args.micro_batch or args.batch // world
+    accum = args.batch // (mb * world)
+    assert mb * world * accum == args.batch, "batch must be divisible by micro_batch * world"
+
+    # ---- data ----------------------------------------------------------------------------------
+    train_names, val_names = split_shards(list_shards(args.data))
+    assert train_names, f"no prepared shards in {args.data}"
+    store = ShardStore(args.data, train_names)
+    log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
+    val = load_val(args.data, val_names, args.val_samples) if (master and val_names) else None
+
+    # ---- model ---------------------------------------------------------------------------------
+    den_cfg = hf_denoiser_config(args.load_hf) if args.load_hf else SIZES[args.size]
+    te, den = build_models(den_cfg)
+    if args.load_hf:
+        load_hf(te, den, args.load_hf)
+    te.to(device), den.to(device)
+    log(f"params: text encoder {sum(p.numel() for p in te.parameters()) / 1e6:.2f}M, "
+        f"denoiser {sum(p.numel() for p in den.parameters()) / 1e6:.2f}M")
+
+    if args.eval_only:
+        if val is not None:
+            res = evaluate(te, den, val, device)
+            log(json.dumps(res, indent=1))
+        if distributed:
+            dist.destroy_process_group()
+        return
+
+    opts, counts = param_groups(te, den, args)
+    log(f"optimizer: {args.optimizer} for hidden matrices; split (params): {counts}")
+    ema = [p.detach().clone().float() for p in list(te.parameters()) + list(den.parameters())] if master else None
+
+    # ---- resume --------------------------------------------------------------------------------
+    os.makedirs(args.out, exist_ok=True)
+    ckpt_path = os.path.join(args.out, "latest.pt")
+    step = 0
+    if os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        assert ck["den_config"] == asdict(den_cfg), f"checkpoint was trained with {ck['den_config']}"
+        te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
+        for o, s in zip(opts, ck["opts"]):
+            o.load_state_dict(s)
+        if master:
+            for e, v in zip(ema, ck["ema"]):
+                e.copy_(v)
+        step = ck["step"]
+        log(f"resumed from {ckpt_path} at step {step}")
+        del ck
+
+    if not args.no_compile:
+        te.compile()
+        den.compile()
+    model = FlowModel(te, den, args.mlm_weight)
+    if distributed:
+        model = DDP(model, device_ids=[local], bucket_cap_mb=64, gradient_as_bucket_view=True)
+        if args.grad_comm == "bf16":
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+            model.register_comm_hook(None, default_hooks.bf16_compress_hook)
+    params = [p for p in model.parameters()]
+
+    stream = TrainStream(store, mb, rank, world, args.seed, start_micro=step * accum)
+    loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
+                                              pin_memory=True, prefetch_factor=4 if args.workers else None,
+                                              persistent_workers=args.workers > 0))
+    null_row = torch.from_numpy(null_ids()).to(device)
+
+    wb = None
+    if master and args.wandb:
+        import wandb
+        wb = wandb.init(project=args.wandb, config=vars(args), resume="allow", dir=args.out)
+
+    def save():
+        if not master:
+            return
+        sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
+        tmp = ckpt_path + ".tmp"
+        torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
+                        ema=[e.cpu() for e in ema], args=vars(args)), tmp)
+        os.replace(tmp, ckpt_path)
+
+    @torch.no_grad()
+    def ema_eval():
+        """Copy EMA weights into the live modules, evaluate, restore."""
+        live = [p.detach().clone() for p in list(te.parameters()) + list(den.parameters())]
+        torch._foreach_copy_(list(te.parameters()) + list(den.parameters()), ema)
+        res = evaluate(te, den, val, device)
+        torch._foreach_copy_(list(te.parameters()) + list(den.parameters()), live)
+        return res
+
+    warmup = max(1, int(args.warmup_frac * args.steps))
+    log(f"lr: {args.schedule} after {warmup} warmup steps, weight decay {args.wd}")
+    log(f"global batch {args.batch} = {world} GPU x {mb} x accum {accum}; {args.steps} steps, warmup {warmup}")
+    acc = torch.zeros(3, device=device)  # sum fm, sum mlm, n mlm
+    t0, t_last = time.time(), step
+    while step < args.steps:
+        mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
+        for micro in range(accum):
+            lat, ids = next(loader)
+            x0 = lat.to(device, non_blocking=True).float()
+            ids = ids.to(device, non_blocking=True)
+            b = x0.shape[0]
+            t = torch.sigmoid(torch.randn(b, device=device))  # logit-normal(0, 1)
+            eps = torch.randn_like(x0)
+            drop = torch.rand(b, device=device) < args.cfg_drop
+            cond_ids = torch.where(drop[:, None], null_row, ids)
+            mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
+            sync = contextlib.nullcontext() if (not distributed or micro == accum - 1) else model.no_sync()
+            with sync:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss, l_fm, l_mlm = model(x0, cond_ids, t, eps, mlm_ids, mlm_labels)
+                (loss / accum).backward()
+            acc[0] += l_fm / accum
+            if l_mlm is not None:
+                acc[1] += l_mlm / accum
+                acc[2] += 1 / accum
+
+        gnorm = torch.nn.utils.clip_grad_norm_(params, args.clip)
+        mult = lr_mult(step, args.steps, warmup, args.schedule)
+        for o in opts:
+            for g in o.param_groups:
+                g["lr"] = g["base_lr"] * mult
+            o.step()
+            o.zero_grad(set_to_none=True)
+        if master:
+            d = min(args.ema, (1 + step) / (10 + step))
+            torch._foreach_lerp_(ema, [p.detach() for p in list(te.parameters()) + list(den.parameters())], 1 - d)
+        step += 1
+
+        if step % args.log_every == 0 or step == args.steps:
+            if distributed:
+                dist.all_reduce(acc)
+                acc /= world
+            n = step - t_last
+            dt = time.time() - t0
+            stats = {"train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
+                     "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
+                     "imgs_per_s": n * args.batch / dt}
+            eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
+            log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | mlm {stats['train/loss_mlm']:.3f} | "
+                f"gn {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
+                f"{stats['imgs_per_s']:.0f} img/s | eta {eta_h:.1f} h", flush=True)
+            if wb:
+                wb.log(stats, step=step)
+            acc.zero_()
+            t0, t_last = time.time(), step
+
+        if val is not None and (step % args.eval_every == 0 or step == args.steps):
+            res = ema_eval()
+            log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
+            if wb:
+                wb.log(res, step=step)
+        if step % args.ckpt_every == 0 or step == args.steps:
+            save()
+        if distributed and (step % args.eval_every == 0 or step % args.ckpt_every == 0):
+            dist.barrier()
+
+    log("done")
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

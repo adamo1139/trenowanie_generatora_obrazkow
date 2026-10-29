@@ -1,0 +1,13 @@
+# reference model (download with huggingface-cli, see README)
+/AuroraIMG2-50M-Preview
+# data, runs, exports
+data/
+runs/
+exports/
+wandb/
+*.pt
+*.npz
+*.npy
+*.safetensors
+__pycache__/
+*.pyc

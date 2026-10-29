@@ -1,0 +1,9 @@
+torch>=2.5          # bf16 autocast, SDPA flash attention on Ampere, torch.compile
+numpy
+safetensors
+tokenizers
+huggingface_hub     # prepare_data.py --download
+wandb               # optional (--wandb)
+# only for sample.py (decoding with the FLUX.2 small decoder):
+diffusers>=0.36     # needs AutoencoderKLFlux2
+transformers
