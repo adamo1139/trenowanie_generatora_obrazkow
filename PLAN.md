@@ -9,7 +9,7 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
 | | |
 |---|---|
 | Architektura | dokładnie z `pipeline.py`: odtworzona w `aurora/model.py`, **ładuje opublikowane wagi strict i daje bit-w-bit ten sam output** (`tests/check_model.py`) |
-| Dane | `QLNI/FLUX-Reason-6M-flux2-latents`: 997 shardów `.npz`, 384 GB, ~5.6M obrazów, latenty fp16 `(128,16,16)`, już znormalizowane BN i spakowane 2×2 |
+| Dane | `QLNI/FLUX-Reason-6M-flux2-latents`: ~1000 shardów `.npz` w 3 podzbiorach (aesthetics-part01/02, imaginative; podzbioru „text” z karty datasetu na HF jeszcze nie ma), ~385 GB, ~5.6M obrazów, latenty fp16 `(128,16,16)`, już znormalizowane BN i spakowane 2×2 |
 | Cel | velocity `eps - z`, `z_t = (1-t)z + t·eps`, t ~ logit-normal(0,1), MSE |
 | CFG | 10% captionów → `[BOS][NULL][EOS]` |
 | MLM aux | waga 0.05, co 4. krok, 15% maskowania, głowica związana z embeddingiem |
@@ -27,7 +27,8 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
 - **MLM**: maskujemy tylko zwykłe tokeny (id > 5), zawsze `[MASK]` (bez 80/10/10), na captionach przed CFG-dropem.
 - **Tokenizer**: używamy opublikowanego `tokenizer.json`. Był trenowany na tych samych captionach, więc to ten sam
   wynik co trening własnego BPE, a prościej.
-- **Hold-out**: ostatni shard każdego subsetu (4 shardy), z nich 4096 obrazów do val.
+- **Hold-out**: ostatni shard każdego podzbioru (obecnie 3 shardy), z nich 4096 obrazów do val. Te same shardy są zawsze
+  pobierane, także przy `--fraction`, więc `val/loss` z treningu na 10% i na całości można porównać.
 - **EMA warmup**: `decay = min(0.9995, (1+step)/(10+step))`.
 
 ## 2. Uproszczenia pod 8× 3090 Ti
@@ -127,6 +128,26 @@ Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**.
 - Na 3090 Ti szczyt matmuli jest niższy (80 vs 113 TFLOPS), a przepustowość pamięci podobna (~1 TB/s), więc MFU powinno wyjść
   podobne albo wyższe. Spodziewane ~45–55 TFLOPS/GPU, czyli ~300 img/s na kartę dla 116M (przed narzutem komunikacji DDP).
 
+### Trening na części danych (np. 10%, żeby najpierw sprawdzić pomysł)
+- `prepare_data.py convert --fraction 0.1` pobiera **99 z ~1000 shardów treningowych + 3 walidacyjne: ~39 GB, ~0.57M obrazków**.
+  Shardy są rozłożone równomiernie w każdym podzbiorze, więc proporcje danych są takie jak w całości.
+- `train.py --train-fraction 0.1` robi ten sam wybór na już pobranym pełnym zbiorze (te same shardy co przy `--fraction 0.1`).
+  Na danych pobranych z `--fraction 0.1` **nie dawać** `--train-fraction`, bo to wzięłoby 10% z 10%.
+- **Liczba kroków:** domyślne 247 805 kroków na 10% danych to ~113 epok, czyli niemal na pewno przeuczenie. Oryginał robił
+  ~11 epok, więc na test pomysłu: **`--steps 25000`** (~6.4M próbek, ~11 epok; dla 116M ~45 min na 8× 3090 Ti przy ~2.5k img/s).
+  Log na starcie pokazuje liczbę epok. Przeuczenie widać jako rosnący `val/loss`, bo walidacja jest na shardach spoza treningu.
+- Potem pełny trening: pobrać resztę tym samym `convert --download` (bez `--fraction`) do **tego samego katalogu**.
+  Już skonwertowane shardy są pomijane, więc dociąga się tylko brakujące ~90%.
+
+### Checkpointy
+- `<out>/latest.pt` co `--ckpt-every` kroków (domyślnie **5000**, dla 116M na 8 kartach mniej więcej co 8–9 min).
+  Pełny stan (wagi, optymalizator, EMA, krok), **nadpisywany** atomowo, służy do wznawiania: ten sam `torchrun` z tym samym `--out`.
+  Rozmiar ~2.3 GB dla 116M.
+- `<out>/snap_<krok>.pt` co `--keep-every` kroków (domyślnie **25000**, ~10 snapshotów na pełny run), tylko wagi + EMA (~1 GB
+  dla 116M), **nie są nadpisywane**. Każdy da się wyeksportować: `python export.py runs/x/snap_0025000.pt exports/x_25k`.
+  `--keep-every 0` wyłącza snapshoty.
+- Wszystko zapisuje rank 0. Na koniec treningu zapis jest zawsze.
+
 ## 3. Szacunki
 
 - **Dysk** (maszyna treningowa): ~370 GB na przekonwertowane dane + ~10 GB captionów. `convert --download --delete-raw`
@@ -150,8 +171,8 @@ huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir Au
 python prepare_data.py convert --out /data/aurora --download --limit 1
 python prepare_data.py inspect /data/aurora/_raw/data/<shard>.npz   # (albo pobrać ręcznie 1 shard bez --delete-raw)
 
-# 1. dane (~384 GB do pobrania)
-python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6
+# 1. dane: najpierw 10% (~39 GB), żeby sprawdzić pomysł; potem ta sama komenda bez --fraction dociąga resztę
+python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6 --fraction 0.1
 python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
 
 # 2. punkt odniesienia: val loss opublikowanych wag na naszym hold-oucie (to jest liczba do pobicia)
@@ -168,7 +189,10 @@ done
 # 3c. (opcjonalnie) A/B z Muonem, po ~20k kroków; porównać val/loss względem czasu zegarowego, nie kroków
 torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/ab_muon --size 116m --steps 20000 --eval-every 2000 --optimizer muon
 
-# 4. pełny run (wznawia się sam z runs/aurora/latest.pt po przerwaniu)
+# 3a. test pomysłu na 10% danych (~11 epok)
+torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/p10 --size 116m --steps 25000 --eval-every 2500
+
+# 4. pełny run na całości (wznawia się sam z runs/aurora/latest.pt po przerwaniu)
 torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --wandb aurora-repro
 
 # 5. eksport EMA do formatu HF + siatka 8 promptów z README

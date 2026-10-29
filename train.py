@@ -24,7 +24,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.flop_counter import FlopCounterMode
 
-from aurora.data import MASK_ID, ShardStore, TrainStream, list_shards, load_val, null_ids, split_shards
+from aurora.data import (MASK_ID, ShardStore, TrainStream, list_shards, load_val, null_ids, select_fraction,
+                         split_shards)
 from aurora.model import SIZES, DenoiserConfig, build_models
 from aurora.muon import Muon
 
@@ -41,6 +42,8 @@ def get_args():
     p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
     p.add_argument("--steps", type=int, default=247_805)
     p.add_argument("--batch", type=int, default=256, help="global batch size")
+    p.add_argument("--train-fraction", type=float, default=1.0,
+                   help="train on this fraction of the prepared training shards (same pick as prepare_data --fraction)")
     p.add_argument("--micro-batch", type=int, default=0, help="per-GPU micro batch (default: batch / world)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
@@ -65,7 +68,9 @@ def get_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--eval-every", type=int, default=5000)
-    p.add_argument("--ckpt-every", type=int, default=5000)
+    p.add_argument("--ckpt-every", type=int, default=5000, help="overwrite <out>/latest.pt (full state, for resuming)")
+    p.add_argument("--keep-every", type=int, default=25000,
+                   help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); 0 = off")
     p.add_argument("--val-samples", type=int, default=4096)
     p.add_argument("--peak-tflops", type=float, default=0,
                    help="GPU peak bf16 TFLOPS for MFU (default: looked up from the GPU name, 0 = unknown)")
@@ -236,9 +241,11 @@ def main():
 
     # ---- data ----------------------------------------------------------------------------------
     train_names, val_names = split_shards(list_shards(args.data))
+    train_names = select_fraction(train_names, args.train_fraction)
     assert train_names, f"no prepared shards in {args.data}"
     store = ShardStore(args.data, train_names)
     log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
+    log(f"{args.steps} steps x {args.batch} = {args.steps * args.batch / len(store):.1f} epochs over the training set")
     val = load_val(args.data, val_names, args.val_samples) if (master and val_names) else None
 
     # ---- model ---------------------------------------------------------------------------------
@@ -313,6 +320,9 @@ def main():
         torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
                         ema=[e.cpu() for e in ema], args=vars(args)), tmp)
         os.replace(tmp, ckpt_path)
+        if args.keep_every and step % args.keep_every == 0:
+            torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
+                       os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     @torch.no_grad()
     def ema_eval():
@@ -386,9 +396,10 @@ def main():
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
                 wb.log(res, step=step)
-        if step % args.ckpt_every == 0 or step == args.steps:
+        if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
             save()
-        if distributed and (step % args.eval_every == 0 or step % args.ckpt_every == 0):
+        if distributed and (step % args.eval_every == 0 or step % args.ckpt_every == 0
+                            or (args.keep_every and step % args.keep_every == 0)):
             dist.barrier()
 
     log("done")

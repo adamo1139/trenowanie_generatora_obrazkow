@@ -29,15 +29,32 @@ def list_shards(root: str):
     return [n for n in names if os.path.exists(os.path.join(root, n + ".lat.npy"))]
 
 
+def _by_subset(names):
+    groups = {}
+    for n in sorted(names):
+        groups.setdefault(re.sub(r"-\d+-of-\d+$", "", n), []).append(n)
+    return groups
+
+
 def split_shards(names, val_names=None):
     """Default hold-out: the last shard of every subset (aesthetics-part01, -part02, imaginative, text)."""
     if val_names is None:
-        groups = {}
-        for n in names:
-            groups.setdefault(re.sub(r"-\d+-of-\d+$", "", n), []).append(n)
-        val_names = [g[-1] for g in groups.values() if len(g) > 1]
+        val_names = [g[-1] for g in _by_subset(names).values() if len(g) > 1]
     val = [n for n in names if n in set(val_names)]
     return [n for n in names if n not in set(val)], val
+
+
+def select_fraction(train_names, fraction: float):
+    """Deterministic subset of training shards: evenly spaced shards from every subset, so the mix of
+    aesthetics / imaginative / text stays the same as in the full dataset. Used by both prepare_data.py and train.py,
+    so `convert --fraction f` downloads exactly what `train --train-fraction f` would pick from the full data."""
+    if fraction >= 1:
+        return list(train_names)
+    picked = []
+    for g in _by_subset(train_names).values():
+        k = max(1, round(fraction * len(g)))
+        picked += [g[i] for i in sorted(set(np.linspace(0, len(g) - 1, k).round().astype(int)))]
+    return sorted(picked)
 
 
 class ShardStore:

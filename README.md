@@ -36,9 +36,10 @@ huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir Au
 
 # dane: pobranie + konwersja do mmap .npy + tokenizacja
 python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6
+#   tylko 10% (~39 GB, ~0.57M obrazków; trenować wtedy z --steps 25000): dodać --fraction 0.1
 python prepare_data.py tokenize --data /data/aurora
 
-# trening na 8 GPU (wznawia się sam z <out>/latest.pt)
+# trening na 8 GPU (wznawia się sam z <out>/latest.pt; latest.pt co 5k kroków, trwałe snap_<krok>.pt co 25k)
 torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m
 
 # eksport wag EMA do formatu diffusers + siatka próbek

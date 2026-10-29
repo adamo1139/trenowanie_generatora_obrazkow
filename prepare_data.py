@@ -8,6 +8,9 @@
   #    or from already downloaded files:
   python prepare_data.py convert --out /data/aurora --src /data/raw
 
+  #    only part of the dataset (evenly spaced shards from every subset + the held-out val shards):
+  python prepare_data.py convert --out /data/aurora10 --download --delete-raw --fraction 0.1
+
   # 2) tokenize captions (uses the released BPE tokenizer by default)
   python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
 
@@ -20,6 +23,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
+
+from aurora.data import select_fraction, split_shards
 
 REPO = "QLNI/FLUX-Reason-6M-flux2-latents"
 MAX_TOKENS = 64
@@ -87,6 +92,17 @@ def download_and_convert(fname: str, raw: str, out: str, delete_raw: bool):
     return convert_one(path, out, delete_raw)
 
 
+def pick_fraction(files, fraction):
+    """Training-shard fraction plus all held-out val shards, so val/loss stays comparable with full-data runs."""
+    if fraction >= 1:
+        return files
+    by_name = {os.path.basename(f)[: -len(".npz")]: f for f in files}
+    train, val = split_shards(sorted(by_name))
+    keep = select_fraction(train, fraction) + val
+    print(f"--fraction {fraction}: {len(keep) - len(val)}/{len(train)} training shards + {len(val)} val shards")
+    return sorted(by_name[n] for n in keep)
+
+
 def cmd_convert(args):
     os.makedirs(args.out, exist_ok=True)
     done = lambda n: os.path.exists(os.path.join(args.out, n + ".lat.npy"))
@@ -96,11 +112,13 @@ def cmd_convert(args):
         if args.include:
             files = [f for f in files if args.include in f]
         files = files[: args.limit] if args.limit else files
+        files = pick_fraction(files, args.fraction)
         todo = [f for f in files if not done(os.path.basename(f)[:-4])]
         raw = args.src or os.path.join(args.out, "_raw")
         jobs = [(download_and_convert, f, raw) for f in todo]
     else:
         files = sorted(glob.glob(os.path.join(args.src, "**", "*.npz"), recursive=True))
+        files = pick_fraction(files, args.fraction)
         todo = [f for f in files if not done(os.path.basename(f)[:-4])]
         jobs = [(convert_one, f) for f in todo]
     print(f"{len(files)} shards, {len(files) - len(todo)} already converted, {len(todo)} to do")
@@ -157,6 +175,8 @@ def main():
     s.add_argument("--download", action="store_true")
     s.add_argument("--include", help="only shards whose path contains this string")
     s.add_argument("--limit", type=int, default=0, help="only the first N shards (for tests)")
+    s.add_argument("--fraction", type=float, default=1.0,
+                   help="download/convert only this fraction of training shards (+ val shards), e.g. 0.1")
     s.add_argument("--delete-raw", action="store_true")
     s.add_argument("--workers", type=int, default=4)
     s = sub.add_parser("tokenize")
