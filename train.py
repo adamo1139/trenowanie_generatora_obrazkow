@@ -58,7 +58,8 @@ def get_args():
     p.add_argument("--fraction", type=float, default=0.1,
                    help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
                         "--fraction); 1 = full dataset")
-    p.add_argument("--micro-batch", type=int, default=128,  # 256 OOMs on 24 GB for 253m + 27m TE help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
+    p.add_argument("--micro-batch", type=int, default=128,  # 256 OOMs on 24 GB for 253m + 27m TE
+                   help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
     p.add_argument("--lr-emb", type=float, default=5e-4)
