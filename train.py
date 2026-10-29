@@ -1,12 +1,14 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
-  # 8 GPUs (global batch 256 = 8 x 32); default: 10% of the data, 24 780 steps (~11 epochs)
+  # 8 GPUs, default global batch 2048 = 8 GPU x 64 x accum 4; 10% of the data, 3 098 steps (~11 epochs)
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora
-  # full dataset, 247 805 steps
+  # full dataset, 30 976 steps
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora_full --fraction 1
+  # the released recipe's batch (256 = 8 x 32, 24 780 steps at 10%); lr / steps / EMA rescale automatically
+  torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/b256 --batch 256 --micro-batch 32
 
-  # 1 GPU smoke test (gradient accumulation keeps the global batch at 256)
-  python train.py --data data/aurora --out runs/test --micro-batch 64 --steps 200
+  # 1 GPU smoke test (gradient accumulation keeps the global batch)
+  python train.py --data data/aurora --out runs/test --steps 200
 
   # reference: val loss of the released EMA weights on our held-out shards
   python train.py --data data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
@@ -39,20 +41,25 @@ def get_args():
     p.add_argument("--size", choices=sorted(SIZES), default="50m", help="denoiser size preset (50m = released model)")
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
                    help="optimizer for the hidden matrices; everything else is always AdamW. muon = released recipe")
-    p.add_argument("--lr-hidden", type=float, default=1e-4,
+    p.add_argument("--lr-hidden", type=float, default=1e-4,  # all AdamW lrs are given at batch 256
                    help="AdamW peak lr for hidden matrices (--optimizer adamw), see PLAN.md for the derivation")
     p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
     p.add_argument("--steps", type=int, default=None,
                    help="default: 247805 x fraction, i.e. the released run's ~11 epochs over the chosen data")
-    p.add_argument("--batch", type=int, default=256, help="global batch size")
+    p.add_argument("--batch", type=int, default=2048,
+                   help="global batch. 2048 (8 GPU x 64 x accum 4) keeps PCIe x4 all-reduce small relative to compute. "
+                        "Steps, AdamW lrs and EMA decay are rescaled from the released recipe's batch 256")
     p.add_argument("--fraction", type=float, default=0.1,
                    help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
                         "--fraction); 1 = full dataset")
-    p.add_argument("--micro-batch", type=int, default=0, help="per-GPU micro batch (default: batch / world)")
+    p.add_argument("--micro-batch", type=int, default=64, help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
     p.add_argument("--lr-emb", type=float, default=5e-4)
     p.add_argument("--lr-adam", type=float, default=3e-4)
+    p.add_argument("--no-lr-batch-scaling", action="store_true",
+                   help="AdamW lrs are given at batch 256 and multiplied by sqrt(batch / 256) (Malladi et al. 2022); "
+                        "this flag uses them as-is")
     p.add_argument("--wd", type=float, default=None,
                    help="decoupled weight decay on matrices (default: 0.1 with adamw, 0.01 with muon)")
     p.add_argument("--schedule", choices=["constant", "cosine"], default="constant",
@@ -60,7 +67,8 @@ def get_args():
     p.add_argument("--momentum", type=float, default=0.95)
     p.add_argument("--ns-steps", type=int, default=5)
     p.add_argument("--clip", type=float, default=1.0)
-    p.add_argument("--ema", type=float, default=0.9995)
+    p.add_argument("--ema", type=float, default=None,
+                   help="EMA decay per step; default 0.9995 ** (batch / 256), i.e. the released recipe's window in samples")
     p.add_argument("--cfg-drop", type=float, default=0.1)
     p.add_argument("--mlm-weight", type=float, default=0.05)
     p.add_argument("--mlm-every", type=int, default=4)
@@ -71,8 +79,9 @@ def get_args():
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--eval-every", type=int, default=2500)
-    p.add_argument("--ckpt-every", type=int, default=5000, help="overwrite <out>/latest.pt (full state, for resuming)")
+    p.add_argument("--eval-every", type=int, default=None, help="default: steps / 20")
+    p.add_argument("--ckpt-every", type=int, default=None,
+                   help="overwrite <out>/latest.pt (full state, for resuming); default: steps / 50")
     p.add_argument("--merge-every", type=int, default=None,
                    help="WSM: save raw weights to <out>/merge/ every N steps (default steps/100); 0 = off. "
                         "Combine them afterwards with merge.py")
@@ -133,16 +142,18 @@ def param_groups(te, den, args):
             else:
                 other.append(p)  # norms, mod tables, biases
     adam_groups = [
-        dict(params=emb, lr=args.lr_emb, base_lr=args.lr_emb, weight_decay=0.0),
-        dict(params=proj, lr=args.lr_adam, base_lr=args.lr_adam, weight_decay=args.wd),
-        dict(params=other, lr=args.lr_adam, base_lr=args.lr_adam, weight_decay=0.0),
+        dict(params=emb, base_lr=args.lr_emb * args.lr_scale, weight_decay=0.0),
+        dict(params=proj, base_lr=args.lr_adam * args.lr_scale, weight_decay=args.wd),
+        dict(params=other, base_lr=args.lr_adam * args.lr_scale, weight_decay=0.0),
     ]
     opts = []
     if args.optimizer == "muon":
         opts.append(Muon([dict(params=muon, base_lr=args.lr_muon)], lr=args.lr_muon, momentum=args.momentum,
                          ns_steps=args.ns_steps, weight_decay=args.wd, compile_ns=not args.no_compile))
     else:
-        adam_groups.append(dict(params=muon, lr=args.lr_hidden, base_lr=args.lr_hidden, weight_decay=args.wd))
+        adam_groups.append(dict(params=muon, base_lr=args.lr_hidden * args.lr_scale, weight_decay=args.wd))
+    for g in adam_groups:
+        g["lr"] = g["base_lr"]
     beta2 = args.beta2 if args.beta2 is not None else (0.99 if args.optimizer == "adamw" else 0.95)
     opts.append(torch.optim.AdamW(adam_groups, betas=(0.9, beta2), eps=1e-8, fused=True))
     counts = {k: sum(p.numel() for p in v) for k, v in
@@ -161,11 +172,12 @@ def peak_tflops(name: str) -> float:
     return 0.0
 
 
-def measure_flops(model, mb, device, mlm_every, mlm_prob):
-    """Exact training FLOPs (fwd + bwd) of one micro-batch, averaged over MLM / non-MLM steps."""
-    x0 = torch.randn(mb, 128, 16, 16, device=device)
-    ids = torch.randint(MASK_ID + 1, 8192, (mb, 64), device=device)
-    t = torch.rand(mb, device=device)
+def measure_flops(model, mb, device, mlm_every, mlm_prob, probe=4):
+    """Exact training FLOPs (fwd + bwd) of one micro-batch, averaged over MLM / non-MLM steps. Counted eagerly on a
+    `probe`-sample batch (eager needs far more memory than the compiled step) and scaled: FLOPs are linear in batch."""
+    x0 = torch.randn(probe, 128, 16, 16, device=device)
+    ids = torch.randint(MASK_ID + 1, 8192, (probe, 64), device=device)
+    t = torch.rand(probe, device=device)
     flops = []
     for mlm in (False, True):
         with FlopCounterMode(display=False) as fc:
@@ -174,7 +186,7 @@ def measure_flops(model, mb, device, mlm_every, mlm_prob):
             loss.backward()
         flops.append(fc.get_total_flops())
     model.zero_grad(set_to_none=True)
-    return ((mlm_every - 1) * flops[0] + flops[1]) / mlm_every
+    return ((mlm_every - 1) * flops[0] + flops[1]) / mlm_every * mb / probe
 
 
 def lr_mult(step, total, warmup, schedule):
@@ -260,8 +272,16 @@ def init_wandb(args):
 
 def main():
     args = get_args()
+    ref_ratio = args.batch / 256  # released recipe: batch 256, 247 805 steps (~11 epochs over the full data)
     if args.steps is None:
-        args.steps = round(247_805 * args.fraction)
+        args.steps = round(247_805 * args.fraction / ref_ratio)
+    args.lr_scale = 1.0 if args.no_lr_batch_scaling else math.sqrt(ref_ratio)
+    if args.ema is None:
+        args.ema = 0.9995 ** ref_ratio
+    if args.eval_every is None:
+        args.eval_every = max(1, args.steps // 20)
+    if args.ckpt_every is None:
+        args.ckpt_every = max(1, args.steps // 50)
     if args.merge_every is None:
         args.merge_every = max(1, args.steps // 100)
     if args.keep_every is None:
@@ -393,7 +413,10 @@ def main():
         return res
 
     warmup = max(1, int(args.warmup_frac * args.steps))
-    log(f"lr: {args.schedule} after {warmup} warmup steps, weight decay {args.wd}")
+    lrs = ", ".join(f"{g['base_lr']:.2e}" for o in opts for g in o.param_groups)
+    log(f"lr: {args.schedule} after {warmup} warmup steps, peak lrs [{lrs}] (x{args.lr_scale:.2f} for batch "
+        f"{args.batch}), weight decay {args.wd}, EMA {args.ema:.5f}, eval every {args.eval_every}, "
+        f"latest.pt every {args.ckpt_every}")
     if args.merge_every:
         log(f"WSM: raw weights to {args.out}/merge/ every {args.merge_every} steps from step "
             f"{math.ceil(args.merge_start * args.steps)} (~{int((1 - args.merge_start) * args.steps / args.merge_every)} files)")
