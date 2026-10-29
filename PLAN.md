@@ -141,6 +141,24 @@ Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**.
   tylko brakujące ~90%), potem `tokenize`, potem `train.py --fraction 1` (247 805 kroków). Gdy jakiegoś wybranego sharda brakuje,
   `train.py` kończy się czytelnym błędem z podpowiedzią komendy.
 
+### WSM zamiast wygaszania lr (domyślnie)
+Trening idzie ze **stałym lr** (warmup → stała wartość do końca), a efekt wygaszania lr uzyskujemy po fakcie przez
+ważone uśrednienie ostatnich checkpointów: **WSM, Warmup-Stable-Merge** ([Tian i in. 2025](https://arxiv.org/abs/2507.17634)).
+- Twierdzenie 3.1: średnia checkpointów θ_0..θ_k z wagami `c_0 = 1−w_1`, `c_j = w_j − w_{j+1}`, `c_k = w_k` daje to samo,
+  co gdyby kroki między nimi skalować malejącymi współczynnikami w_1..w_k. Każdą krzywą decay da się więc odtworzyć jako średnią.
+  Prosta średnia ≙ liniowe wygaszanie.
+- W artykule najlepiej wypadło **1-sqrt**, tuż za nim **mean**, a **EMA wyraźnie gorzej**. Najważniejsza jest **długość okna**.
+- `train.py` zapisuje surowe wagi (fp32, bez optymalizatora i EMA) do `<out>/merge/step_*.pt` co `--merge-every` kroków
+  (domyślnie 1% treningu) przez ostatnie 30% treningu (`--merge-start 0.7`). Wychodzi ~31 plików, **~14 GB dla 116M**
+  (~0.46 GB każdy), niezależnie od długości runu. `--merge-every 0` wyłącza zapisy.
+- `merge.py <run>` uśrednia je dla każdej kombinacji schematu (`1-sqrt`, `mean`, `cosine`) i okna (5/10/20/30% treningu),
+  liczy `val/loss` na hold-oucie, wypisuje porównanie z surowymi wagami i z EMA, a najlepszy wariant zapisuje do `<run>/merged.pt`.
+  Dalej `export.py <run>/merged.pt ...` jak zwykle. Okno i schemat dobiera się więc na danych, a nie z góry.
+- Ze stałym lr można scalać w dowolnym momencie (np. z ostatnich 10% dotychczasowego treningu), żeby zobaczyć, jak dobry jest
+  model teraz, bez przerywania treningu. Trening da się też przedłużyć: nic nie zostało wygaszone.
+- EMA (0.9995) dalej liczymy, bo kosztuje mało i daje `val/loss` w logu w trakcie treningu. Na końcu `merge.py` pokazuje, czy
+  WSM je bije.
+
 ### Checkpointy
 - Eval (`val/loss` na EMA) co `--eval-every` kroków, domyślnie **2500**.
 - `<out>/latest.pt` co `--ckpt-every` kroków (domyślnie **5000**, dla 116M na 8 kartach mniej więcej co 8–9 min).
@@ -150,6 +168,7 @@ Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**.
   tylko wagi + EMA (~1 GB dla 116M), **nie są nadpisywane**. Każdy da się wyeksportować:
   `python export.py runs/x/snap_0012390.pt exports/x_12k`.
   `--keep-every 0` wyłącza snapshoty.
+- `<out>/merge/step_<krok>.pt`: surowe wagi dla WSM, opisane wyżej.
 - Wszystko zapisuje rank 0. Na koniec treningu zapis jest zawsze.
 
 ## 3. Szacunki
@@ -199,9 +218,10 @@ torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/p10 --size 11
 # 4b. jeśli pomysł działa: całość (najpierw convert --fraction 1 + tokenize), 247 805 kroków
 torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1 --wandb aurora-repro
 
-# 5. eksport EMA do formatu HF + siatka 8 promptów z README
-python export.py runs/aurora/latest.pt exports/aurora
-python sample.py exports/aurora --out grid.png
+# 5. WSM: uśrednienie checkpointów z końcówki (wybór schematu i okna na val), eksport do formatu HF + siatka 8 promptów
+python merge.py runs/p10                       # -> runs/p10/merged.pt, tabela val/loss: surowe / EMA / WSM
+python export.py runs/p10/merged.pt exports/p10   # (albo runs/p10/latest.pt dla EMA)
+python sample.py exports/p10 --out grid.png
 python sample.py AuroraIMG2-50M-Preview --out grid_ref.png
 ```
 
@@ -221,6 +241,7 @@ Gdyby NCCL wisiał na starcie (częste na konsumenckich kartach z IOMMU/ACS): `N
 | `aurora/data.py` | mmap store, deterministyczny i wznawialny strumień, hold-out |
 | `prepare_data.py` | `inspect` / `convert` (pobieranie + konwersja) / `tokenize` |
 | `train.py` | trening DDP, Muon+AdamW, EMA, MLM, eval, checkpointy, wandb |
+| `merge.py` | WSM: ważone uśrednianie checkpointów z `merge/`, wybór schematu i okna na walidacji |
 | `export.py` | checkpoint → katalog w formacie HF (działa z oryginalnym `pipeline.py`) |
 | `sample.py` | siatka promptów z README (wymaga diffusers z `AutoencoderKLFlux2`) |
 | `tests/check_model.py` | zgodność z opublikowanymi wagami i referencyjnym kodem |

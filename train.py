@@ -26,8 +26,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.flop_counter import FlopCounterMode
 
-from aurora.data import (MASK_ID, ShardStore, TrainStream, list_shards, load_val, null_ids, select_fraction,
-                         split_shards)
+from aurora.data import MASK_ID, ShardStore, TrainStream, load_val, null_ids, select_shards
 from aurora.model import SIZES, DenoiserConfig, build_models
 from aurora.muon import Muon
 
@@ -73,6 +72,11 @@ def get_args():
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--eval-every", type=int, default=2500)
     p.add_argument("--ckpt-every", type=int, default=5000, help="overwrite <out>/latest.pt (full state, for resuming)")
+    p.add_argument("--merge-every", type=int, default=None,
+                   help="WSM: save raw weights to <out>/merge/ every N steps (default steps/100); 0 = off. "
+                        "Combine them afterwards with merge.py")
+    p.add_argument("--merge-start", type=float, default=0.7,
+                   help="WSM: start saving merge checkpoints at this fraction of training (0.7 -> last 30%%)")
     p.add_argument("--keep-every", type=int, default=None,
                    help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); default steps/10, 0 = off")
     p.add_argument("--val-samples", type=int, default=4096)
@@ -223,6 +227,8 @@ def main():
     args = get_args()
     if args.steps is None:
         args.steps = round(247_805 * args.fraction)
+    if args.merge_every is None:
+        args.merge_every = max(1, args.steps // 100)
     if args.keep_every is None:
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
@@ -248,16 +254,7 @@ def main():
     assert mb * world * accum == args.batch, "batch must be divisible by micro_batch * world"
 
     # ---- data ----------------------------------------------------------------------------------
-    present = list_shards(args.data)
-    manifest = os.path.join(args.data, "manifest.json")
-    full = json.load(open(manifest))["shards"] if os.path.exists(manifest) else present
-    train_names, val_names = split_shards(full)
-    train_names = select_fraction(train_names, args.fraction)
-    missing = sorted(set(train_names + val_names) - set(present))
-    if missing:
-        raise SystemExit(f"{len(missing)} shards selected by --fraction {args.fraction} are not prepared in {args.data} "
-                         f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {args.fraction} + tokenize")
-    assert train_names, f"no prepared shards in {args.data}"
+    train_names, val_names = select_shards(args.data, args.fraction)
     store = ShardStore(args.data, train_names)
     log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
     log(f"{args.steps} steps x {args.batch} = {args.steps * args.batch / len(store):.1f} epochs over the training set")
@@ -339,6 +336,16 @@ def main():
             torch.save(dict(step=step, den_config=asdict(den_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
                        os.path.join(args.out, f"snap_{step:07d}.pt"))
 
+    def save_merge():
+        """WSM: raw (non-EMA) fp32 weights only, ~0.46 GB for 116m; merge.py averages them."""
+        d = os.path.join(args.out, "merge")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"step_{step:07d}.pt")
+        sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
+        torch.save(dict(step=step, total_steps=args.steps, den_config=asdict(den_cfg), te=sd(te), den=sd(den)),
+                   path + ".tmp")
+        os.replace(path + ".tmp", path)
+
     @torch.no_grad()
     def ema_eval():
         """Copy EMA weights into the live modules, evaluate, restore."""
@@ -350,6 +357,9 @@ def main():
 
     warmup = max(1, int(args.warmup_frac * args.steps))
     log(f"lr: {args.schedule} after {warmup} warmup steps, weight decay {args.wd}")
+    if args.merge_every:
+        log(f"WSM: raw weights to {args.out}/merge/ every {args.merge_every} steps from step "
+            f"{math.ceil(args.merge_start * args.steps)} (~{int((1 - args.merge_start) * args.steps / args.merge_every)} files)")
     log(f"global batch {args.batch} = {world} GPU x {mb} x accum {accum}; {args.steps} steps, warmup {warmup}")
     acc = torch.zeros(3, device=device)  # sum fm, sum mlm, n mlm
     t0, t_last = time.time(), step
@@ -413,6 +423,9 @@ def main():
                 wb.log(res, step=step)
         if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
             save()
+        if master and args.merge_every and step >= args.merge_start * args.steps and (
+                step % args.merge_every == 0 or step == args.steps):
+            save_merge()
         if distributed and (step % args.eval_every == 0 or step % args.ckpt_every == 0
                             or (args.keep_every and step % args.keep_every == 0)):
             dist.barrier()

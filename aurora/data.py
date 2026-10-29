@@ -7,6 +7,7 @@
 Everything is opened with mmap, so the page cache is shared by all ranks and loader workers on a node.
 """
 import glob
+import json
 import os
 import re
 
@@ -55,6 +56,25 @@ def select_fraction(train_names, fraction: float):
         k = max(1, round(fraction * len(g)))
         picked += [g[i] for i in sorted(set(np.linspace(0, len(g) - 1, k).round().astype(int)))]
     return sorted(picked)
+
+
+def full_shard_list(root: str):
+    """All shards of the source dataset (manifest.json from prepare_data.py), else whatever is prepared."""
+    manifest = os.path.join(root, "manifest.json")
+    return json.load(open(manifest))["shards"] if os.path.exists(manifest) else list_shards(root)
+
+
+def select_shards(root: str, fraction: float):
+    """(train, val) shard names for a fraction of the FULL dataset; val shards do not depend on the fraction."""
+    present = list_shards(root)
+    train, val = split_shards(full_shard_list(root))
+    train = select_fraction(train, fraction)
+    missing = sorted(set(train + val) - set(present))
+    if missing:
+        raise SystemExit(f"{len(missing)} shards selected by --fraction {fraction} are not prepared in {root} "
+                         f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {fraction} + tokenize")
+    assert train, f"no prepared shards in {root}"
+    return train, val
 
 
 class ShardStore:

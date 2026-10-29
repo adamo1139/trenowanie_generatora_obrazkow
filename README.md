@@ -6,7 +6,8 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 
 - Architektura jest 1:1 z oryginałem: opublikowane wagi ładują się w trybie strict i dają identyczny output (`tests/check_model.py`).
 - Rozmiary: `--size 50m` (oryginał, 63M z text encoderem) i `--size 116m` (DiT 768×12, domyślny punkt startowy w planie).
-- Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
+- Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie) + **WSM** (uśrednianie checkpointów
+  zamiast wygaszania lr, `merge.py`). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
 - Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
   **Domyślnie pobieramy i trenujemy na 10%** (~39 GB), żeby najpierw sprawdzić pomysł; `--fraction 1` = całość.
 
@@ -44,8 +45,10 @@ python prepare_data.py tokenize --data data/aurora
 # Wznawia się sam z <out>/latest.pt (co 5k kroków); trwałe snap_<krok>.pt co 1/10 runu.
 torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m
 
-# eksport wag EMA do formatu diffusers + siatka próbek
-python export.py runs/aurora/latest.pt exports/aurora
+# WSM: zamiast wygaszać lr, uśredniamy checkpointy z końcówki treningu (schemat i okno wybierane na walidacji)
+python merge.py runs/aurora                                  # -> runs/aurora/merged.pt
+# eksport do formatu diffusers + siatka próbek
+python export.py runs/aurora/merged.pt exports/aurora
 python sample.py exports/aurora --out grid.png
 ```
 
@@ -58,6 +61,7 @@ python sample.py exports/aurora --out grid.png
 | `aurora/data.py` | dane przez mmap, deterministyczny i wznawialny strumień, hold-out |
 | `prepare_data.py` | `inspect` / `convert` / `tokenize` |
 | `train.py` | trening DDP: AdamW lub Muon, EMA, aux MLM, eval, checkpointy, wandb |
+| `merge.py` | WSM: ważone uśrednianie checkpointów z końcówki treningu |
 | `export.py` | checkpoint → katalog diffusers (działa z oryginalnym `pipeline.py`) |
 | `sample.py` | siatka 8 promptów z karty modelu |
 | `tests/` | zgodność z opublikowanymi wagami, poprawność Muona |

@@ -51,7 +51,8 @@ def main():
     cfg.update(ck["den_config"])  # our size, the reference's _class_name / _diffusers_version
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"exported step {ck['step']} ({'live' if args.no_ema else 'EMA'} weights) to {args.out}")
+    kind = "live" if args.no_ema else ("WSM-merged" if "wsm" in ck else "EMA")
+    print(f"exported step {ck['step']} ({kind} weights) to {args.out}")
 
 
 if __name__ == "__main__":
