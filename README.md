@@ -11,10 +11,27 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 
 Pełny plan, uzasadnienie hiperparametrów, szacunki czasu i pamięci: **[PLAN.md](PLAN.md)**.
 
+## Środowisko (osobny venv)
+
+Trenujemy w osobnym venv w katalogu repo (`.venv/`, ignorowany przez gita), żeby nie mieszać pakietów z systemowym
+Pythonem. Wymagany jest [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
+```bash
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128   # 3090 Ti (sm86) i nowsze karty
+uv pip install -r requirements.txt
+python -c "import torch; print(torch.__version__, torch.cuda.device_count(), 'GPU')"
+```
+
+Bez uv: `python3.11 -m venv .venv && source .venv/bin/activate && pip install torch --index-url
+https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszystkie dalsze komendy zakładają aktywny venv
+(albo wywołanie `.venv/bin/python` / `.venv/bin/torchrun`). Sprawdzone: torch 2.11.0+cu128, diffusers 0.42.1, Python 3.11.
+
 ## Szybki start
 
 ```bash
-pip install -r requirements.txt
+source .venv/bin/activate
 huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir AuroraIMG2-50M-Preview
 
 # dane: pobranie + konwersja do mmap .npy + tokenizacja

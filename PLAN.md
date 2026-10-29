@@ -104,6 +104,29 @@ to ~0.99998, czyli bardzo długie okno. Nasze 0.9995 (z oryginału) uśrednia ~2
 używa 0.9999. `val/loss` liczony na EMA pozwoli porównać oba warianty bez nowego treningu, jeśli zapiszemy kilka EMA naraz.
 Na razie zostaje 0.9995.
 
+### Wydajność: FlashAttention, TFLOPS, MFU
+`train.py` na starcie liczy dokładne FLOP-y kroku (`torch.utils.flop_counter`, fwd + bwd, uśrednione z krokami MLM)
+i w logu pokazuje `TFLOPS/GPU` oraz `MFU` (względem szczytu bf16 z akumulacją fp32: 3090 Ti = 80, 4090 = 165, 5080 = 113;
+`--peak-tflops` nadpisuje). Koszt na próbkę: **79 GFLOP (`50m`), 160 GFLOP (`116m`)**.
+
+Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**. Profil czasu kerneli w jednym kroku:
+
+| część | udział |
+|---|---|
+| matmule (cuBLAS, ~87% szczytu) | ~60% |
+| fuzje Triton z `torch.compile` (RMSNorm, RoPE, modulacja, SwiGLU) | ~17% |
+| optymalizator + clip + EMA | ~10–16% |
+| attention (SDPA) | ~7% |
+
+- **FlashAttention-2 już jest używany.** PyTorch SDPA sam wybiera wbudowany kernel FA2 (`pytorch_flash::flash_fwd/bwd`)
+  dla self-attention w DiT (bez maski, bf16, head_dim 64). Cross-attention i text encoder mają maskę paddingu, więc idą
+  przez kernel memory-efficient (cutlass), też fused. Osobny pakiet `flash-attn` mógłby przyspieszyć najwyżej część z tych ~7%,
+  więc nie warto go dokładać. FA3 działa tylko na Hopperze.
+- Matmule są już blisko szczytu, a resztę skleja `torch.compile`. Wyraźnie więcej dałyby tylko własne kernele, a to się nie opłaca
+  przy oczekiwanym zysku rzędu 10–15%.
+- Na 3090 Ti szczyt matmuli jest niższy (80 vs 113 TFLOPS), a przepustowość pamięci podobna (~1 TB/s), więc MFU powinno wyjść
+  podobne albo wyższe. Spodziewane ~45–55 TFLOPS/GPU, czyli ~300 img/s na kartę dla 116M (przed narzutem komunikacji DDP).
+
 ## 3. Szacunki
 
 - **Dysk** (maszyna treningowa): ~370 GB na przekonwertowane dane + ~10 GB captionów. `convert --download --delete-raw`
@@ -117,7 +140,9 @@ Na razie zostaje 0.9995.
 ## 4. Kroki
 
 ```bash
-pip install -r requirements.txt
+# osobny venv, szczegóły w README
+uv venv .venv --python 3.11 && source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128 && uv pip install -r requirements.txt
 # referencyjny model: tokenizer, dekoder FLUX.2, pipeline.py, wagi do porównania
 huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir AuroraIMG2-50M-Preview
 
@@ -181,8 +206,9 @@ Gdyby NCCL wisiał na starcie (częste na konsumenckich kartach z IOMMU/ACS): `N
 - ✅ eksport → eval-only daje ten sam val loss co EMA w treningu
 - ✅ Muon dzielony: zgodny ze zwykłym w granicach szumu bf16, identyczne wagi na 2 rankach
 - ✅ `--size 116m`: trening 1 GPU (Muon i AdamW), DDP 2 ranki z dzielonym Muonem, wznowienie, eksport z configiem 768×12
-- ⏳ nie testowane: prawdziwe shardy, NCCL na 8 kartach, `sample.py` (lokalny diffusers 0.35
-  nie ma `AutoencoderKLFlux2`, a xformers w środowisku jest zepsuty)
+- ✅ czysty venv (uv, torch 2.11.0+cu128, diffusers 0.42.1): testy, trening, eksport, `sample.py` na opublikowanych wagach
+  (siatka zgodna z kartą modelu) i na wyeksportowanym 116M
+- ⏳ nie testowane: prawdziwe shardy, NCCL na 8 kartach
 
 ## Źródła
 - Surjo-Image-Preview, karta modelu (przepis AdamW, batch 1024, lr 2e-4)

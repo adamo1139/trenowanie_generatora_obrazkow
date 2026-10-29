@@ -11,3 +11,4 @@ wandb/
 *.safetensors
 __pycache__/
 *.pyc
+.venv/

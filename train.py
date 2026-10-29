@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.flop_counter import FlopCounterMode
 
 from aurora.data import MASK_ID, ShardStore, TrainStream, list_shards, load_val, null_ids, split_shards
 from aurora.model import SIZES, DenoiserConfig, build_models
@@ -66,6 +67,8 @@ def get_args():
     p.add_argument("--eval-every", type=int, default=5000)
     p.add_argument("--ckpt-every", type=int, default=5000)
     p.add_argument("--val-samples", type=int, default=4096)
+    p.add_argument("--peak-tflops", type=float, default=0,
+                   help="GPU peak bf16 TFLOPS for MFU (default: looked up from the GPU name, 0 = unknown)")
     p.add_argument("--wandb", default="", help="wandb project name (empty = off)")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--load-hf", default="", help="init from a released AuroraIMG2 repo dir")
@@ -128,6 +131,33 @@ def param_groups(te, den, args):
     counts = {k: sum(p.numel() for p in v) for k, v in
               dict(hidden=muon, emb=emb, proj=proj, other=other).items()}
     return opts, counts
+
+
+# dense bf16 tensor-core peak with fp32 accumulation (what autocast matmuls use); GeForce runs this at half the fp16-acc rate
+PEAK_TFLOPS = {"3090 Ti": 80.0, "3090": 71.0, "4090": 165.2, "5080": 112.6, "5090": 209.5, "A100": 312.0, "H100": 989.0}
+
+
+def peak_tflops(name: str) -> float:
+    for key in sorted(PEAK_TFLOPS, key=len, reverse=True):
+        if key in name:
+            return PEAK_TFLOPS[key]
+    return 0.0
+
+
+def measure_flops(model, mb, device, mlm_every, mlm_prob):
+    """Exact training FLOPs (fwd + bwd) of one micro-batch, averaged over MLM / non-MLM steps."""
+    x0 = torch.randn(mb, 128, 16, 16, device=device)
+    ids = torch.randint(MASK_ID + 1, 8192, (mb, 64), device=device)
+    t = torch.rand(mb, device=device)
+    flops = []
+    for mlm in (False, True):
+        with FlopCounterMode(display=False) as fc:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _, _ = model(x0, ids, t, torch.randn_like(x0), *(make_mlm(ids, mlm_prob) if mlm else (None, None)))
+            loss.backward()
+        flops.append(fc.get_total_flops())
+    model.zero_grad(set_to_none=True)
+    return ((mlm_every - 1) * flops[0] + flops[1]) / mlm_every
 
 
 def lr_mult(step, total, warmup, schedule):
@@ -249,10 +279,14 @@ def main():
         log(f"resumed from {ckpt_path} at step {step}")
         del ck
 
+    model = FlowModel(te, den, args.mlm_weight)
+    flops_micro = measure_flops(model, mb, device, args.mlm_every, args.mlm_prob)  # before compile: eager is countable
     if not args.no_compile:
         te.compile()
         den.compile()
-    model = FlowModel(te, den, args.mlm_weight)
+    peak = args.peak_tflops or peak_tflops(torch.cuda.get_device_name(device))
+    log(f"{flops_micro / mb / 1e9:.1f} GFLOP per training sample; peak {peak or '?'} TFLOPS/GPU "
+        f"({torch.cuda.get_device_name(device)})")
     if distributed:
         model = DDP(model, device_ids=[local], bucket_cap_mb=64, gradient_as_bucket_view=True)
         if args.grad_comm == "bf16":
@@ -336,11 +370,12 @@ def main():
             dt = time.time() - t0
             stats = {"train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
                      "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
-                     "imgs_per_s": n * args.batch / dt}
+                     "imgs_per_s": n * args.batch / dt, "tflops_per_gpu": flops_micro * accum * n / dt / 1e12}
+            mfu = f" MFU {stats['tflops_per_gpu'] / peak:.0%}" if peak else ""
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | mlm {stats['train/loss_mlm']:.3f} | "
                 f"gn {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
-                f"{stats['imgs_per_s']:.0f} img/s | eta {eta_h:.1f} h", flush=True)
+                f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {eta_h:.1f} h", flush=True)
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
