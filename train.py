@@ -86,6 +86,11 @@ def get_args():
                         "gradients to low rank with error feedback (Vogels et al. 2019), ~50-100x less traffic. "
                         "Meant for --optimizer adamw (Muon orthogonalises the low-rank gradient)")
     p.add_argument("--powersgd-rank", type=int, default=8, help="PowerSGD approximation rank")
+    p.add_argument("--diloco", type=int, default=0,
+                   help="DiLoCo / MuLoCo: every GPU trains its own copy for H inner steps (no DDP, local Muon), then the "
+                        "averaged weight change is applied by an outer Nesterov-SGD step. H = this value, 0 = off (DDP)")
+    p.add_argument("--outer-lr", type=float, default=0.7, help="DiLoCo outer learning rate")
+    p.add_argument("--outer-momentum", type=float, default=0.9, help="DiLoCo outer Nesterov momentum")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
@@ -163,7 +168,8 @@ def param_groups(te, den, args):
     opts = []
     if args.optimizer == "muon":
         opts.append(Muon([dict(params=muon, base_lr=args.lr_muon)], lr=args.lr_muon, momentum=args.momentum,
-                         ns_steps=args.ns_steps, weight_decay=args.wd, compile_ns=not args.no_compile))
+                         ns_steps=args.ns_steps, weight_decay=args.wd, compile_ns=not args.no_compile,
+                         shard=not args.diloco))
     else:
         adam_groups.append(dict(params=muon, base_lr=args.lr_hidden * args.lr_scale, weight_decay=args.wd))
     for g in adam_groups:
@@ -313,7 +319,9 @@ def resolve_defaults(args):
     ref_ratio = args.batch / 256  # released recipe: batch 256, 247 805 steps (~11 epochs over the full data)
     if args.steps is None:
         args.steps = round(247_805 * args.fraction / ref_ratio)
-    args.lr_scale = 1.0 if args.no_lr_batch_scaling else math.sqrt(ref_ratio)
+    # DiLoCo: each GPU's inner optimizer only sees its own share of the batch, so lrs are scaled to that
+    lr_ratio = args.batch / int(os.environ.get("WORLD_SIZE", 1)) / 256 if args.diloco else ref_ratio
+    args.lr_scale = 1.0 if args.no_lr_batch_scaling else math.sqrt(lr_ratio)
     if args.ema is None:
         args.ema = 0.9995 ** ref_ratio
     if args.eval_every is None:
@@ -326,6 +334,10 @@ def resolve_defaults(args):
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
+    if args.diloco:  # evals, checkpoints and WSM saves happen right after an outer sync
+        up = lambda n: n and -(-n // args.diloco) * args.diloco
+        args.eval_every, args.ckpt_every = up(args.eval_every), up(args.ckpt_every)
+        args.merge_every, args.keep_every = up(args.merge_every), up(args.keep_every)
     return args
 
 
@@ -401,8 +413,11 @@ def main():
             for e, v in zip(ema, ck["ema"]):
                 e.copy_(v)
         step = ck["step"]
+        outer_state = ck.get("outer")
         log(f"resumed from {ckpt_path} at step {step}")
         del ck
+    else:
+        outer_state = None
 
     model = FlowModel(te, den, args.mlm_weight)
     flops_micro = measure_flops(model, mb, device, args.mlm_every, args.mlm_prob)  # before compile: eager is countable
@@ -412,7 +427,19 @@ def main():
     peak = args.peak_tflops or peak_tflops(torch.cuda.get_device_name(device))
     log(f"{flops_micro / mb / 1e9:.1f} GFLOP per training sample; peak {peak or '?'} TFLOPS/GPU "
         f"({torch.cuda.get_device_name(device)})")
-    if distributed:
+    ddp = distributed and not args.diloco
+    if args.diloco:
+        live = list(te.parameters()) + list(den.parameters())
+        if distributed:  # same starting point on every GPU (DDP would broadcast it)
+            for p in live:
+                dist.broadcast(p.data, 0)
+        global_params = [nn.Parameter(p.detach().clone().float(), requires_grad=False) for p in live]
+        outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum, nesterov=True)
+        if outer_state is not None:
+            outer_opt.load_state_dict(outer_state)
+        log(f"DiLoCo/MuLoCo: {world} workers, outer sync every {args.diloco} steps "
+            f"(outer Nesterov SGD lr {args.outer_lr}, momentum {args.outer_momentum}), inner {args.optimizer} unsharded")
+    if ddp:
         model = DDP(model, device_ids=[local], bucket_cap_mb=64, gradient_as_bucket_view=True)
         if args.grad_comm == "bf16":
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
@@ -450,7 +477,8 @@ def main():
         sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
         tmp = ckpt_path + ".tmp"
         torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
-                        ema=[e.cpu() for e in ema], args=vars(args)), tmp)
+                        ema=[e.cpu() for e in ema], args=vars(args),
+                        outer=outer_opt.state_dict() if args.diloco else None), tmp)
         os.replace(tmp, ckpt_path)
         if args.keep_every and step % args.keep_every == 0:
             torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
@@ -465,6 +493,21 @@ def main():
         torch.save(dict(step=step, total_steps=args.steps, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den)),
                    path + ".tmp")
         os.replace(path + ".tmp", path)
+
+    @torch.no_grad()
+    def outer_sync():
+        """DiLoCo outer step: pseudo-gradient = global - local weights, averaged over workers, applied with Nesterov
+        SGD to the global weights, which then replace every worker's local weights."""
+        deltas = [g - p.detach().float() for g, p in zip(global_params, live)]
+        flat = torch.cat([d.flatten() for d in deltas])
+        if distributed:
+            dist.all_reduce(flat)
+            flat /= world
+        for g, d in zip(global_params, flat.split([d.numel() for d in deltas])):
+            g.grad = d.view_as(g)
+        outer_opt.step()
+        outer_opt.zero_grad(set_to_none=True)
+        torch._foreach_copy_(live, global_params)
 
     @torch.no_grad()
     def ema_eval():
@@ -498,7 +541,7 @@ def main():
             drop = torch.rand(b, device=device) < args.cfg_drop
             cond_ids = torch.where(drop[:, None], null_row, ids)
             mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
-            sync = contextlib.nullcontext() if (not distributed or micro == accum - 1) else model.no_sync()
+            sync = contextlib.nullcontext() if (not ddp or micro == accum - 1) else model.no_sync()
             with sync:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     loss, l_fm, l_mlm = model(x0, cond_ids, t, eps, mlm_ids, mlm_labels)
@@ -515,10 +558,17 @@ def main():
                 g["lr"] = g["base_lr"] * mult
             o.step()
             o.zero_grad(set_to_none=True)
-        if master:
-            d = min(args.ema, (1 + step) / (10 + step))
-            torch._foreach_lerp_(ema, [p.detach() for p in list(te.parameters()) + list(den.parameters())], 1 - d)
         step += 1
+        if args.diloco:
+            if step % args.diloco == 0 or step == args.steps:
+                outer_sync()
+                if master:  # EMA of the global weights, same window in samples as the per-step EMA
+                    n = step // args.diloco
+                    d = min(args.ema ** args.diloco, (1 + n) / (10 + n))
+                    torch._foreach_lerp_(ema, [p.detach() for p in live], 1 - d)
+        elif master:
+            d = min(args.ema, (step) / (9 + step))
+            torch._foreach_lerp_(ema, [p.detach() for p in list(te.parameters()) + list(den.parameters())], 1 - d)
 
         if step % args.log_every == 0 or step == args.steps:
             if distributed:

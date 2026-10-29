@@ -40,10 +40,12 @@ def _all_gather(out: torch.Tensor, local: torch.Tensor):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, compile_ns=False):
+    def __init__(self, params, lr=1e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, compile_ns=False,
+                 shard=True):
         super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                                       weight_decay=weight_decay))
-        distributed = dist.is_available() and dist.is_initialized()
+        # shard=False: every rank orthogonalises everything locally (DiLoCo, where ranks hold different weights)
+        distributed = shard and dist.is_available() and dist.is_initialized()
         self.rank = dist.get_rank() if distributed else 0
         self.world = dist.get_world_size() if distributed else 1
         # same-shape buckets, in parameter order (identical on every rank); kept outside param_groups so they are not
