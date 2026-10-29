@@ -43,7 +43,7 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
   (1.9% vs 2.4%; z NS w fp32 różnica wynosi 0.13%). Wagi na wszystkich rankach są bit w bit identyczne.
 - **all-reduce w bf16** (`--grad-comm bf16`, domyślnie): 3090 Ti nie mają P2P, więc gradienty idą przez PCIe/host.
   bf16 zmniejsza ruch z ~252 MB do ~126 MB na krok. Przy podejrzeniu, że to szkodzi: `--grad-comm fp32`.
-- **Domyślnie: model `253m` (DiT 1024×16, 240.8M + TE 12.6M), batch 2048 = 8 GPU × 256 bez akumulacji.** Zamiast podbijać batch
+- **Domyślnie: model `253m` (DiT 1024×16, 240.8M + TE 12.6M), batch 2048 = 8 GPU × 128 × akumulacja 2.** (256 na kartę: OOM na 24 GB.) Zamiast podbijać batch
   do 8192 (ryzyko przekroczenia krytycznego batcha) inwestujemy w większy model. Komunikacja na próbkę jest taka sama jak przy
   64 × 4, szersze matmule powinny podnieść MFU, a lr macierzy ukrytych skaluje się μP-owo jak 1/szerokość względem 768
   (`1e-4 × 768/1024 = 7.5e-5` przy batchu 256, ×2.83 → 2.12e-4). 367 GFLOP na próbkę.
