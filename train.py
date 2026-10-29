@@ -344,6 +344,10 @@ def main():
     if args.eval_only:
         if val is not None:
             res = evaluate(te, den, val, device)
+            # same images, empty prompt: the gap shows how much the model actually uses the text
+            no_text = evaluate(te, den, (val[0], torch.from_numpy(null_ids()).expand_as(val[1]).clone()), device)
+            res.update({k.replace("val/", "val_no_text/"): v for k, v in no_text.items()})
+            res["text_gain"] = no_text["val/loss"] - res["val/loss"]
             log(json.dumps(res, indent=1))
         if distributed:
             dist.destroy_process_group()
