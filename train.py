@@ -81,8 +81,11 @@ def get_args():
     p.add_argument("--mlm-weight", type=float, default=0.05)
     p.add_argument("--mlm-every", type=int, default=4)
     p.add_argument("--mlm-prob", type=float, default=0.15)
-    p.add_argument("--grad-comm", choices=["fp32", "bf16"], default="bf16",
-                   help="bf16 halves DDP all-reduce traffic (PCIe-only 3090 Ti boxes)")
+    p.add_argument("--grad-comm", choices=["fp32", "bf16", "powersgd"], default="bf16",
+                   help="bf16 halves DDP all-reduce traffic (PCIe-only 3090 Ti boxes); powersgd compresses matrix "
+                        "gradients to low rank with error feedback (Vogels et al. 2019), ~50-100x less traffic. "
+                        "Meant for --optimizer adamw (Muon orthogonalises the low-rank gradient)")
+    p.add_argument("--powersgd-rank", type=int, default=8, help="PowerSGD approximation rank")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
@@ -414,6 +417,18 @@ def main():
         if args.grad_comm == "bf16":
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
+        elif args.grad_comm == "powersgd":
+            from torch.distributed.algorithms.ddp_comm_hooks import powerSGD_hook as psgd
+            # plain all-reduce until the lr warmup is over (recommended by the authors); the hook counts optimizer
+            # steps, and its error-feedback state is not checkpointed, so a resumed run restarts that count
+            start = max(2, int(args.warmup_frac * args.steps) - step)
+            state = psgd.PowerSGDState(process_group=None, matrix_approximation_rank=args.powersgd_rank,
+                                       start_powerSGD_iter=start, use_error_feedback=True, warm_start=True,
+                                       random_seed=args.seed)
+            model.register_comm_hook(state, psgd.powerSGD_hook)
+            log(f"PowerSGD rank {args.powersgd_rank}, full all-reduce for the first {start} steps")
+            if args.optimizer == "muon":
+                log("warning: PowerSGD with Muon - Muon orthogonalises the low-rank gradient, prefer --optimizer adamw")
     params = [p for p in model.parameters()]
 
     stream = TrainStream(store, mb, rank, world, args.seed, start_micro=step * accum)
