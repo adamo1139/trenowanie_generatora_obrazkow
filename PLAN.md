@@ -43,16 +43,21 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
   (1.9% vs 2.4%; z NS w fp32 różnica wynosi 0.13%). Wagi na wszystkich rankach są bit w bit identyczne.
 - **all-reduce w bf16** (`--grad-comm bf16`, domyślnie): 3090 Ti nie mają P2P, więc gradienty idą przez PCIe/host.
   bf16 zmniejsza ruch z ~252 MB do ~126 MB na krok. Przy podejrzeniu, że to szkodzi: `--grad-comm fp32`.
-- **Batch 2048 = 8 GPU × 64 × akumulacja 4 (domyślnie).** Pomiar na `adamo-rigga` (6 kart na PCIe 3.0 x4, 2 na x8):
+- **Batch 8192 = 8 GPU × 256 × akumulacja 4 (domyślnie).** Najpierw było 2048 = 8 × 64 × 4: 2292 img/s, 45.8 TFLOPS/GPU,
+  czyli MFU ~30% względem 153 TFLOPS (karty z odblokowaną akumulacją fp32). Pamięci zostawało dużo (11 GB przy mb 64), stąd
+  micro-batch 256. Ryzyko: 4× mniej kroków (7 744 na całości) i lr ×5.66. Wyżej niż typowy krytyczny batch małych DiT,
+  więc trzeba porównać `val/loss` z runem 2048 w funkcji `train/samples` (oś X w wandb). Jeśli wyjdzie gorzej: `--batch 2048
+  --micro-batch 256` (bez akumulacji, ta sama komunikacja na próbkę co przy 64 × 4, ale większy micro-batch).
+- Wcześniej, pomiar na `adamo-rigga` (6 kart na PCIe 3.0 x4, 2 na x8):
   przy oryginalnym batchu 256 (8 × 32, bez akumulacji) wymiana gradientów zajmowała ~2/3 kroku. Wychodziło 704 img/s
   na 8 kart, czyli 14 TFLOPS/GPU i MFU 18%, a jedna karta bez komunikacji daje ~360 img/s dla 116M. Z akumulacją ×4 all-reduce
   idzie raz na 256 próbek na kartę zamiast 32, więc jego udział spada ~8×.
 - Przy zmianie batcha przepis przeskalowuje się automatycznie względem oryginału (batch 256):
-  - **kroki**: `247 805 × fraction × 256 / batch`, czyli dalej ~11 epok (3 098 przy 10%, 30 976 przy całości);
+  - **kroki**: `247 805 × fraction × 256 / batch`, czyli dalej ~11 epok (przy 8192: 774 przy 10%, 7 744 przy całości);
   - **lr AdamW**: podawane „przy batchu 256” i mnożone przez `√(batch/256)` (reguła √ dla Adama, Malladi i in. 2022).
-    Przy 2048 to ×2.83: macierze ukryte 2.83e-4, embedding 1.4e-3, in/out 8.5e-4. Zgadza się to z Surjo (2e-4 przy 1024).
+    Przy 2048 to ×2.83 (ukryte 2.83e-4, spójne z Surjo: 2e-4 przy 1024), przy 8192 ×5.66 (ukryte 5.66e-4, embedding 2.8e-3).
     `--no-lr-batch-scaling` wyłącza. Lr Muona nie jest skalowany;
-  - **EMA**: `0.9995^(batch/256)` na krok (0.99601 przy 2048), czyli to samo okno w próbkach co w oryginale;
+  - **EMA**: `0.9995^(batch/256)` na krok (0.98412 przy 8192), czyli to samo okno w próbkach co w oryginale;
   - eval co 1/20 runu, `latest.pt` co 1/50, snapshoty co 1/10, WSM co 1/100.
   `--batch 256 --micro-batch 32` przywraca dokładnie oryginalny batch.
 - **Dane: zamiast „rotującej puli shardów w VRAM” robimy mmap z dysku.** Oryginał miał 96 GB VRAM, my mamy 24 GB na kartę.
@@ -144,8 +149,8 @@ Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**.
   Dane pobrane z `--fraction 0.1` i trening z `--fraction 0.1` trafiają więc w te same shardy, bez ryzyka „10% z 10%”.
 - 10% to **99 z ~1000 shardów treningowych + 3 walidacyjne: ~39 GB, ~0.57M obrazków**. Shardy są rozłożone równomiernie
   w każdym podzbiorze, więc proporcje danych są takie jak w całości.
-- **Liczba kroków** domyślnie skaluje się z ułamkiem i batchem: `247 805 × fraction × 256 / batch`. Przy 0.1 i batchu 2048 to
-  **3 098 kroków, ~11 epok** jak w oryginale
+- **Liczba kroków** domyślnie skaluje się z ułamkiem i batchem: `247 805 × fraction × 256 / batch`. Przy 0.1 to
+  **~11 epok** jak w oryginale: 774 kroki przy batchu 8192 (dla testów na 10% lepiej `--batch 2048 --micro-batch 64`: 3 098 kroków)
   (~6.3M próbek; dla 116M ~45 min na 8× 3090 Ti przy ~2.5k img/s). Log na starcie pokazuje liczbę epok. Przeuczenie widać
   jako rosnący `val/loss`, bo walidacja jest na shardach spoza treningu.
 - **Przejście na całość:** `convert --fraction 1` do **tego samego katalogu** (już skonwertowane shardy są pomijane, dociąga się
@@ -171,11 +176,11 @@ ważone uśrednienie ostatnich checkpointów: **WSM, Warmup-Stable-Merge** ([Tia
   WSM je bije.
 
 ### Checkpointy
-- Eval (`val/loss` na EMA) co `--eval-every` kroków, domyślnie **co 1/20 runu** (155 kroków przy 10% i batchu 2048).
-- `<out>/latest.pt` co `--ckpt-every` kroków (domyślnie **co 1/50 runu**: 61 kroków przy 10%, ~1 min; 619 przy całości).
+- Eval (`val/loss` na EMA) co `--eval-every` kroków, domyślnie **co 1/20 runu**.
+- `<out>/latest.pt` co `--ckpt-every` kroków (domyślnie **co 1/50 runu**, przy całości i batchu 8192 co 154 kroki).
   Pełny stan (wagi, optymalizator, EMA, krok), **nadpisywany** atomowo, służy do wznawiania: ten sam `torchrun` z tym samym `--out`.
   Rozmiar ~2.3 GB dla 116M.
-- `<out>/snap_<krok>.pt` co `--keep-every` kroków (domyślnie **co 1/10 runu**: 309 kroków przy 10%, 3 097 przy całości),
+- `<out>/snap_<krok>.pt` co `--keep-every` kroków (domyślnie **co 1/10 runu**),
   tylko wagi + EMA (~1 GB dla 116M), **nie są nadpisywane**. Każdy da się wyeksportować:
   `python export.py runs/x/snap_0001545.pt exports/x_half`.
   `--keep-every 0` wyłącza snapshoty.
@@ -196,7 +201,7 @@ ważone uśrednienie ostatnich checkpointów: **WSM, Warmup-Stable-Merge** ([Tia
 - **Dysk** (maszyna treningowa): ~370 GB na przekonwertowane dane + ~10 GB captionów. `convert --download --delete-raw`
   pobiera i konwertuje shard po shardzie, więc surowe `.npz` nie leżą na dysku jednocześnie. Ten komputer (73 GB wolne) się nie nadaje.
 - **RAM**: im więcej, tym lepiej dla page cache, ale nie jest to wymagane. Workerzy nie ładują danych do RAM, wszystko idzie przez mmap.
-- **VRAM**: 116M przy mb 32 to ~10 GB na 3090 Ti (pomiar), przy domyślnym mb 64 ~18–19 GB, więc mieści się w 24 GB.
+- **VRAM** (pomiar na 3090 Ti, 116M): ~10 GB przy mb 32, ~11 GB przy mb 64. Mb 256 szacunkowo ~17–18 GB, do sprawdzenia przy starcie.
 - **Czas (116M, AdamW)**: RTX 5080 daje ~383 img/s na kartę przy mb 32; 3090 Ti ma podobny throughput bf16 z akumulacją fp32.
   Przy skalowaniu ~80% wychodzi ~2.5k img/s na 8 kart, czyli **~6–7 h** na 63.4M próbek (247 805 kroków × 256).
   Z Muonem ~25% dłużej. Dla `50m` ~3.5–5 h. Prawdziwą liczbę pokaże pierwsze 1000 kroków (log `img/s`, `eta`).

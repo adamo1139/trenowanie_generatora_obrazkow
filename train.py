@@ -1,8 +1,8 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
-  # 8 GPUs, default global batch 2048 = 8 GPU x 64 x accum 4; 10% of the data, 3 098 steps (~11 epochs)
+  # 8 GPUs, default global batch 8192 = 8 GPU x 256 x accum 4; 10% of the data, 774 steps (~11 epochs)
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora
-  # full dataset, 30 976 steps
+  # full dataset, 7 744 steps
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora_full --fraction 1
   # the released recipe's batch (256 = 8 x 32, 24 780 steps at 10%); lr / steps / EMA rescale automatically
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/b256 --batch 256 --micro-batch 32
@@ -46,13 +46,13 @@ def get_args():
     p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
     p.add_argument("--steps", type=int, default=None,
                    help="default: 247805 x fraction, i.e. the released run's ~11 epochs over the chosen data")
-    p.add_argument("--batch", type=int, default=2048,
-                   help="global batch. 2048 (8 GPU x 64 x accum 4) keeps PCIe x4 all-reduce small relative to compute. "
+    p.add_argument("--batch", type=int, default=8192,
+                   help="global batch. 8192 (8 GPU x 256 x accum 4) keeps PCIe x4 all-reduce small relative to compute. "
                         "Steps, AdamW lrs and EMA decay are rescaled from the released recipe's batch 256")
     p.add_argument("--fraction", type=float, default=0.1,
                    help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
                         "--fraction); 1 = full dataset")
-    p.add_argument("--micro-batch", type=int, default=64, help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
+    p.add_argument("--micro-batch", type=int, default=256, help="per-GPU micro batch; accumulation = batch / (micro x GPUs)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
     p.add_argument("--lr-emb", type=float, default=5e-4)
@@ -161,8 +161,9 @@ def param_groups(te, den, args):
     return opts, counts
 
 
-# dense bf16 tensor-core peak with fp32 accumulation (what autocast matmuls use); GeForce runs this at half the fp16-acc rate
-PEAK_TFLOPS = {"3090 Ti": 80.0, "3090": 71.0, "4090": 165.2, "5080": 112.6, "5090": 209.5, "A100": 312.0, "H100": 989.0}
+# dense bf16 tensor-core peak with fp32 accumulation (what autocast matmuls use). Stock GeForce runs this at half the
+# fp16-acc rate; the 3090 Ti entry is for the unlocked cards on adamo-rigga (full rate, 153; stock would be 80).
+PEAK_TFLOPS = {"3090 Ti": 153.0, "3090": 71.0, "4090": 165.2, "5080": 112.6, "5090": 209.5, "A100": 312.0, "H100": 989.0}
 
 
 def peak_tflops(name: str) -> float:
@@ -370,7 +371,7 @@ def main():
 
     stream = TrainStream(store, mb, rank, world, args.seed, start_micro=step * accum)
     loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
-                                              pin_memory=True, prefetch_factor=4 if args.workers else None,
+                                              pin_memory=True, prefetch_factor=2 if args.workers else None,
                                               persistent_workers=args.workers > 0))
     null_row = torch.from_numpy(null_ids()).to(device)
 
@@ -463,7 +464,8 @@ def main():
                 acc /= world
             n = step - t_last
             dt = time.time() - t0
-            stats = {"train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
+            stats = {"train/samples": step * args.batch, "train/epoch": step * args.batch / len(store),
+                     "train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
                      "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
                      "imgs_per_s": n * args.batch / dt, "tflops_per_gpu": flops_micro * accum * n / dt / 1e12}
             mfu = ""
@@ -483,7 +485,7 @@ def main():
             res = ema_eval()
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
-                wb.log(res, step=step)
+                wb.log({**res, "train/samples": step * args.batch}, step=step)
         if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
             save()
         if master and args.merge_every and step >= args.merge_start * args.steps and (
