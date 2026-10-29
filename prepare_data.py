@@ -3,13 +3,14 @@
   # 0) look at one raw shard first (caption format check)
   python prepare_data.py inspect data/raw/fluxdb-imaginative-00127-of-00168.npz
 
-  # 1) download + convert shard by shard (raw .npz deleted after conversion, so peak disk ~ converted size + a few GB)
+  # 1) download + convert shard by shard (raw .npz deleted after conversion, so peak disk ~ converted size + a few GB).
+  #    Default --fraction 0.1: 10% of the training shards (~39 GB) + the held-out val shards.
   python prepare_data.py convert --out /data/aurora --download --delete-raw --workers 6
   #    or from already downloaded files:
   python prepare_data.py convert --out /data/aurora --src /data/raw
 
-  #    only part of the dataset (evenly spaced shards from every subset + the held-out val shards):
-  python prepare_data.py convert --out /data/aurora10 --download --delete-raw --fraction 0.1
+  #    the full dataset (~385 GB); already converted shards are skipped, so this tops up a 10% download:
+  python prepare_data.py convert --out /data/aurora --download --delete-raw --workers 6 --fraction 1
 
   # 2) tokenize captions (uses the released BPE tokenizer by default)
   python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
@@ -92,6 +93,12 @@ def download_and_convert(fname: str, raw: str, out: str, delete_raw: bool):
     return convert_one(path, out, delete_raw)
 
 
+def write_manifest(out, files):
+    """Full shard list of the source, so train.py --fraction picks the same shards whatever has been downloaded."""
+    with open(os.path.join(out, "manifest.json"), "w") as f:
+        json.dump({"shards": sorted(os.path.basename(x)[: -len(".npz")] for x in files)}, f, indent=0)
+
+
 def pick_fraction(files, fraction):
     """Training-shard fraction plus all held-out val shards, so val/loss stays comparable with full-data runs."""
     if fraction >= 1:
@@ -112,12 +119,14 @@ def cmd_convert(args):
         if args.include:
             files = [f for f in files if args.include in f]
         files = files[: args.limit] if args.limit else files
+        write_manifest(args.out, files)
         files = pick_fraction(files, args.fraction)
         todo = [f for f in files if not done(os.path.basename(f)[:-4])]
         raw = args.src or os.path.join(args.out, "_raw")
         jobs = [(download_and_convert, f, raw) for f in todo]
     else:
         files = sorted(glob.glob(os.path.join(args.src, "**", "*.npz"), recursive=True))
+        write_manifest(args.out, files)
         files = pick_fraction(files, args.fraction)
         todo = [f for f in files if not done(os.path.basename(f)[:-4])]
         jobs = [(convert_one, f) for f in todo]
@@ -175,8 +184,8 @@ def main():
     s.add_argument("--download", action="store_true")
     s.add_argument("--include", help="only shards whose path contains this string")
     s.add_argument("--limit", type=int, default=0, help="only the first N shards (for tests)")
-    s.add_argument("--fraction", type=float, default=1.0,
-                   help="download/convert only this fraction of training shards (+ val shards), e.g. 0.1")
+    s.add_argument("--fraction", type=float, default=0.1,
+                   help="fraction of the training shards to download/convert (+ val shards); 1 = full dataset")
     s.add_argument("--delete-raw", action="store_true")
     s.add_argument("--workers", type=int, default=4)
     s = sub.add_parser("tokenize")

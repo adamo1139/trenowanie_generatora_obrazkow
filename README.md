@@ -7,7 +7,8 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 - Architektura jest 1:1 z oryginałem: opublikowane wagi ładują się w trybie strict i dają identyczny output (`tests/check_model.py`).
 - Rozmiary: `--size 50m` (oryginał, 63M z text encoderem) i `--size 116m` (DiT 768×12, domyślny punkt startowy w planie).
 - Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
-- Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~384 GB).
+- Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
+  **Domyślnie pobieramy i trenujemy na 10%** (~39 GB), żeby najpierw sprawdzić pomysł; `--fraction 1` = całość.
 
 Pełny plan, uzasadnienie hiperparametrów, szacunki czasu i pamięci: **[PLAN.md](PLAN.md)**.
 
@@ -34,12 +35,13 @@ https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszy
 source .venv/bin/activate
 huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir AuroraIMG2-50M-Preview
 
-# dane: pobranie + konwersja do mmap .npy + tokenizacja
+# dane: pobranie + konwersja do mmap .npy + tokenizacja. Domyślnie 10% datasetu (~39 GB, ~0.57M obrazków);
+# całość (~385 GB): dodać --fraction 1 (już pobrane shardy są pomijane)
 python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6
-#   tylko 10% (~39 GB, ~0.57M obrazków; trenować wtedy z --steps 25000): dodać --fraction 0.1
 python prepare_data.py tokenize --data /data/aurora
 
-# trening na 8 GPU (wznawia się sam z <out>/latest.pt; latest.pt co 5k kroków, trwałe snap_<krok>.pt co 25k)
+# trening na 8 GPU. Domyślnie 10% danych, 24 780 kroków (~11 epok); całość: --fraction 1 (247 805 kroków).
+# Wznawia się sam z <out>/latest.pt (co 5k kroków); trwałe snap_<krok>.pt co 1/10 runu.
 torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m
 
 # eksport wag EMA do formatu diffusers + siatka próbek

@@ -1,7 +1,9 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
-  # 8 GPUs (global batch 256 = 8 x 32)
+  # 8 GPUs (global batch 256 = 8 x 32); default: 10% of the data, 24 780 steps (~11 epochs)
   torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora
+  # full dataset, 247 805 steps
+  torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora_full --fraction 1
 
   # 1 GPU smoke test (gradient accumulation keeps the global batch at 256)
   python train.py --data /data/aurora --out runs/test --micro-batch 64 --steps 200
@@ -40,10 +42,12 @@ def get_args():
     p.add_argument("--lr-hidden", type=float, default=1e-4,
                    help="AdamW peak lr for hidden matrices (--optimizer adamw), see PLAN.md for the derivation")
     p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
-    p.add_argument("--steps", type=int, default=247_805)
+    p.add_argument("--steps", type=int, default=None,
+                   help="default: 247805 x fraction, i.e. the released run's ~11 epochs over the chosen data")
     p.add_argument("--batch", type=int, default=256, help="global batch size")
-    p.add_argument("--train-fraction", type=float, default=1.0,
-                   help="train on this fraction of the prepared training shards (same pick as prepare_data --fraction)")
+    p.add_argument("--fraction", type=float, default=0.1,
+                   help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
+                        "--fraction); 1 = full dataset")
     p.add_argument("--micro-batch", type=int, default=0, help="per-GPU micro batch (default: batch / world)")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-muon", type=float, default=1e-2)
@@ -67,10 +71,10 @@ def get_args():
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--eval-every", type=int, default=5000)
+    p.add_argument("--eval-every", type=int, default=2500)
     p.add_argument("--ckpt-every", type=int, default=5000, help="overwrite <out>/latest.pt (full state, for resuming)")
-    p.add_argument("--keep-every", type=int, default=25000,
-                   help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); 0 = off")
+    p.add_argument("--keep-every", type=int, default=None,
+                   help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); default steps/10, 0 = off")
     p.add_argument("--val-samples", type=int, default=4096)
     p.add_argument("--peak-tflops", type=float, default=0,
                    help="GPU peak bf16 TFLOPS for MFU (default: looked up from the GPU name, 0 = unknown)")
@@ -217,6 +221,10 @@ def load_hf(te, den, repo):
 
 def main():
     args = get_args()
+    if args.steps is None:
+        args.steps = round(247_805 * args.fraction)
+    if args.keep_every is None:
+        args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
     distributed = "RANK" in os.environ
@@ -240,8 +248,15 @@ def main():
     assert mb * world * accum == args.batch, "batch must be divisible by micro_batch * world"
 
     # ---- data ----------------------------------------------------------------------------------
-    train_names, val_names = split_shards(list_shards(args.data))
-    train_names = select_fraction(train_names, args.train_fraction)
+    present = list_shards(args.data)
+    manifest = os.path.join(args.data, "manifest.json")
+    full = json.load(open(manifest))["shards"] if os.path.exists(manifest) else present
+    train_names, val_names = split_shards(full)
+    train_names = select_fraction(train_names, args.fraction)
+    missing = sorted(set(train_names + val_names) - set(present))
+    if missing:
+        raise SystemExit(f"{len(missing)} shards selected by --fraction {args.fraction} are not prepared in {args.data} "
+                         f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {args.fraction} + tokenize")
     assert train_names, f"no prepared shards in {args.data}"
     store = ShardStore(args.data, train_names)
     log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")

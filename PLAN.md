@@ -128,23 +128,27 @@ Pomiar na RTX 5080 (116M, mb 32, `torch.compile`): **~62 TFLOPS/GPU, MFU ~55%**.
 - Na 3090 Ti szczyt matmuli jest niższy (80 vs 113 TFLOPS), a przepustowość pamięci podobna (~1 TB/s), więc MFU powinno wyjść
   podobne albo wyższe. Spodziewane ~45–55 TFLOPS/GPU, czyli ~300 img/s na kartę dla 116M (przed narzutem komunikacji DDP).
 
-### Trening na części danych (np. 10%, żeby najpierw sprawdzić pomysł)
-- `prepare_data.py convert --fraction 0.1` pobiera **99 z ~1000 shardów treningowych + 3 walidacyjne: ~39 GB, ~0.57M obrazków**.
-  Shardy są rozłożone równomiernie w każdym podzbiorze, więc proporcje danych są takie jak w całości.
-- `train.py --train-fraction 0.1` robi ten sam wybór na już pobranym pełnym zbiorze (te same shardy co przy `--fraction 0.1`).
-  Na danych pobranych z `--fraction 0.1` **nie dawać** `--train-fraction`, bo to wzięłoby 10% z 10%.
-- **Liczba kroków:** domyślne 247 805 kroków na 10% danych to ~113 epok, czyli niemal na pewno przeuczenie. Oryginał robił
-  ~11 epok, więc na test pomysłu: **`--steps 25000`** (~6.4M próbek, ~11 epok; dla 116M ~45 min na 8× 3090 Ti przy ~2.5k img/s).
-  Log na starcie pokazuje liczbę epok. Przeuczenie widać jako rosnący `val/loss`, bo walidacja jest na shardach spoza treningu.
-- Potem pełny trening: pobrać resztę tym samym `convert --download` (bez `--fraction`) do **tego samego katalogu**.
-  Już skonwertowane shardy są pomijane, więc dociąga się tylko brakujące ~90%.
+### Trening na części danych: domyślnie 10%
+- `--fraction` (w `prepare_data.py convert` i w `train.py`) to zawsze **ułamek pełnego datasetu**, domyślnie **0.1**.
+  `convert` zapisuje w katalogu danych `manifest.json` z pełną listą shardów, a `train.py` wybiera z niej ten sam podzbiór.
+  Dane pobrane z `--fraction 0.1` i trening z `--fraction 0.1` trafiają więc w te same shardy, bez ryzyka „10% z 10%”.
+- 10% to **99 z ~1000 shardów treningowych + 3 walidacyjne: ~39 GB, ~0.57M obrazków**. Shardy są rozłożone równomiernie
+  w każdym podzbiorze, więc proporcje danych są takie jak w całości.
+- **Liczba kroków** domyślnie skaluje się z ułamkiem: `247 805 × fraction`. Przy 0.1 to **24 780 kroków, ~11 epok** jak w oryginale
+  (~6.3M próbek; dla 116M ~45 min na 8× 3090 Ti przy ~2.5k img/s). Log na starcie pokazuje liczbę epok. Przeuczenie widać
+  jako rosnący `val/loss`, bo walidacja jest na shardach spoza treningu.
+- **Przejście na całość:** `convert --fraction 1` do **tego samego katalogu** (już skonwertowane shardy są pomijane, dociąga się
+  tylko brakujące ~90%), potem `tokenize`, potem `train.py --fraction 1` (247 805 kroków). Gdy jakiegoś wybranego sharda brakuje,
+  `train.py` kończy się czytelnym błędem z podpowiedzią komendy.
 
 ### Checkpointy
+- Eval (`val/loss` na EMA) co `--eval-every` kroków, domyślnie **2500**.
 - `<out>/latest.pt` co `--ckpt-every` kroków (domyślnie **5000**, dla 116M na 8 kartach mniej więcej co 8–9 min).
   Pełny stan (wagi, optymalizator, EMA, krok), **nadpisywany** atomowo, służy do wznawiania: ten sam `torchrun` z tym samym `--out`.
   Rozmiar ~2.3 GB dla 116M.
-- `<out>/snap_<krok>.pt` co `--keep-every` kroków (domyślnie **25000**, ~10 snapshotów na pełny run), tylko wagi + EMA (~1 GB
-  dla 116M), **nie są nadpisywane**. Każdy da się wyeksportować: `python export.py runs/x/snap_0025000.pt exports/x_25k`.
+- `<out>/snap_<krok>.pt` co `--keep-every` kroków (domyślnie **co 1/10 runu**: 2 478 kroków przy 10%, 24 780 przy całości),
+  tylko wagi + EMA (~1 GB dla 116M), **nie są nadpisywane**. Każdy da się wyeksportować:
+  `python export.py runs/x/snap_0012390.pt exports/x_12k`.
   `--keep-every 0` wyłącza snapshoty.
 - Wszystko zapisuje rank 0. Na koniec treningu zapis jest zawsze.
 
@@ -171,8 +175,8 @@ huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir Au
 python prepare_data.py convert --out /data/aurora --download --limit 1
 python prepare_data.py inspect /data/aurora/_raw/data/<shard>.npz   # (albo pobrać ręcznie 1 shard bez --delete-raw)
 
-# 1. dane: najpierw 10% (~39 GB), żeby sprawdzić pomysł; potem ta sama komenda bez --fraction dociąga resztę
-python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6 --fraction 0.1
+# 1. dane: domyślnie 10% (~39 GB); później `--fraction 1` do tego samego katalogu dociąga resztę (~385 GB razem)
+python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6
 python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
 
 # 2. punkt odniesienia: val loss opublikowanych wag na naszym hold-oucie (to jest liczba do pobicia)
@@ -189,11 +193,11 @@ done
 # 3c. (opcjonalnie) A/B z Muonem, po ~20k kroków; porównać val/loss względem czasu zegarowego, nie kroków
 torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/ab_muon --size 116m --steps 20000 --eval-every 2000 --optimizer muon
 
-# 3a. test pomysłu na 10% danych (~11 epok)
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/p10 --size 116m --steps 25000 --eval-every 2500
+# 4. trening na 10% danych (domyślnie: 24 780 kroków, ~11 epok; wznawia się sam z runs/p10/latest.pt)
+torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/p10 --size 116m --lr-hidden <z 3b> --wandb aurora-repro
 
-# 4. pełny run na całości (wznawia się sam z runs/aurora/latest.pt po przerwaniu)
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --wandb aurora-repro
+# 4b. jeśli pomysł działa: całość (najpierw convert --fraction 1 + tokenize), 247 805 kroków
+torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1 --wandb aurora-repro
 
 # 5. eksport EMA do formatu HF + siatka 8 promptów z README
 python export.py runs/aurora/latest.pt exports/aurora
