@@ -172,32 +172,32 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cu128 && uv pi
 huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir AuroraIMG2-50M-Preview
 
 # 0. sprawdzić format captionów w prawdziwym shardzie (parser jest odporny na listy/dict/JSON, ale trzeba to zobaczyć)
-python prepare_data.py convert --out /data/aurora --download --limit 1
-python prepare_data.py inspect /data/aurora/_raw/data/<shard>.npz   # (albo pobrać ręcznie 1 shard bez --delete-raw)
+python prepare_data.py convert --out data/aurora --download --limit 1
+python prepare_data.py inspect data/aurora/_raw/data/<shard>.npz   # (albo pobrać ręcznie 1 shard bez --delete-raw)
 
 # 1. dane: domyślnie 10% (~39 GB); później `--fraction 1` do tego samego katalogu dociąga resztę (~385 GB razem)
-python prepare_data.py convert  --out /data/aurora --download --delete-raw --workers 6
-python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
+python prepare_data.py convert  --out data/aurora --download --delete-raw --workers 6
+python prepare_data.py tokenize --data data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
 
 # 2. punkt odniesienia: val loss opublikowanych wag na naszym hold-oucie (to jest liczba do pobicia)
-python train.py --data /data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
+python train.py --data data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
 
 # 3. krótki run kontrolny na 8 GPU (~2000 kroków): sprawdzić img/s, czy loss spada, czy nie ma NaN
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/try --size 116m --steps 2000 --eval-every 1000
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/try --size 116m --steps 2000 --eval-every 1000
 
 # 3b. sweep lr dla macierzy ukrytych: 5k kroków każdy (~10 min na 8 GPU), wybrać najniższy EMA val/loss
 for lr in 5e-5 1e-4 2e-4 4e-4; do
-  torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/lr_$lr --size 116m --steps 5000 \
+  torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/lr_$lr --size 116m --steps 5000 \
     --eval-every 1000 --ckpt-every 5000 --lr-hidden $lr
 done
 # 3c. (opcjonalnie) A/B z Muonem, po ~20k kroków; porównać val/loss względem czasu zegarowego, nie kroków
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/ab_muon --size 116m --steps 20000 --eval-every 2000 --optimizer muon
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/ab_muon --size 116m --steps 20000 --eval-every 2000 --optimizer muon
 
 # 4. trening na 10% danych (domyślnie: 24 780 kroków, ~11 epok; wznawia się sam z runs/p10/latest.pt)
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/p10 --size 116m --lr-hidden <z 3b> --wandb aurora-repro
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/p10 --size 116m --lr-hidden <z 3b> --wandb aurora-repro
 
 # 4b. jeśli pomysł działa: całość (najpierw convert --fraction 1 + tokenize), 247 805 kroków
-torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1 --wandb aurora-repro
+torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m --lr-hidden <z 3b> --fraction 1 --wandb aurora-repro
 
 # 5. eksport EMA do formatu HF + siatka 8 promptów z README
 python export.py runs/aurora/latest.pt exports/aurora

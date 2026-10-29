@@ -1,15 +1,15 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
   # 8 GPUs (global batch 256 = 8 x 32); default: 10% of the data, 24 780 steps (~11 epochs)
-  torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora
+  torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora
   # full dataset, 247 805 steps
-  torchrun --nproc_per_node 8 train.py --data /data/aurora --out runs/aurora_full --fraction 1
+  torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora_full --fraction 1
 
   # 1 GPU smoke test (gradient accumulation keeps the global batch at 256)
-  python train.py --data /data/aurora --out runs/test --micro-batch 64 --steps 200
+  python train.py --data data/aurora --out runs/test --micro-batch 64 --steps 200
 
   # reference: val loss of the released EMA weights on our held-out shards
-  python train.py --data /data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
+  python train.py --data data/aurora --out runs/ref --eval-only --load-hf AuroraIMG2-50M-Preview
 """
 import argparse
 import contextlib
@@ -34,7 +34,7 @@ from aurora.muon import Muon
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True)
+    p.add_argument("--data", default="data/aurora")
     p.add_argument("--out", required=True)
     p.add_argument("--size", choices=sorted(SIZES), default="50m", help="denoiser size preset (50m = released model)")
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",

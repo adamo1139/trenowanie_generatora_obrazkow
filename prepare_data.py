@@ -5,15 +5,15 @@
 
   # 1) download + convert shard by shard (raw .npz deleted after conversion, so peak disk ~ converted size + a few GB).
   #    Default --fraction 0.1: 10% of the training shards (~39 GB) + the held-out val shards.
-  python prepare_data.py convert --out /data/aurora --download --delete-raw --workers 6
+  python prepare_data.py convert --out data/aurora --download --delete-raw --workers 6
   #    or from already downloaded files:
-  python prepare_data.py convert --out /data/aurora --src /data/raw
+  python prepare_data.py convert --out data/aurora --src /data/raw
 
   #    the full dataset (~385 GB); already converted shards are skipped, so this tops up a 10% download:
-  python prepare_data.py convert --out /data/aurora --download --delete-raw --workers 6 --fraction 1
+  python prepare_data.py convert --out data/aurora --download --delete-raw --workers 6 --fraction 1
 
   # 2) tokenize captions (uses the released BPE tokenizer by default)
-  python prepare_data.py tokenize --data /data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
+  python prepare_data.py tokenize --data data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
 
 Only `lat` and `caps` are kept; `dino` (first 60 shards) and `clip` are dropped.
 """
@@ -179,7 +179,7 @@ def main():
     s = sub.add_parser("inspect")
     s.add_argument("file")
     s = sub.add_parser("convert")
-    s.add_argument("--out", required=True)
+    s.add_argument("--out", default="data/aurora")
     s.add_argument("--src", help="dir with raw .npz (or download dir with --download)")
     s.add_argument("--download", action="store_true")
     s.add_argument("--include", help="only shards whose path contains this string")
@@ -189,7 +189,7 @@ def main():
     s.add_argument("--delete-raw", action="store_true")
     s.add_argument("--workers", type=int, default=4)
     s = sub.add_parser("tokenize")
-    s.add_argument("--data", required=True)
+    s.add_argument("--data", default="data/aurora")
     s.add_argument("--tokenizer", default="AuroraIMG2-50M-Preview/tokenizer/tokenizer.json")
     s.add_argument("--workers", type=int, default=8)
     s.add_argument("--force", action="store_true")
