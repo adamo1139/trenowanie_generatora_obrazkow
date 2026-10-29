@@ -234,7 +234,11 @@ python sample.py exports/p10 --out grid.png
 python sample.py AuroraIMG2-50M-Preview --out grid_ref.png
 ```
 
-Gdyby NCCL wisiał na starcie (częste na konsumenckich kartach z IOMMU/ACS): `NCCL_P2P_DISABLE=1 torchrun ...`.
+Najpierw `torchrun --nproc_per_node 8 tests/check_nccl.py`: test samej komunikacji, z przepustowością i szacunkiem kosztu all-reduce
+na krok. Na `adamo-rigga` (zmodowany sterownik z P2P) trzeba **`NCCL_P2P_LEVEL=SYS`**. Bez tego NCCL nie używa P2P między kartami
+pod różnymi root portami, próbuje `/dev/shm` i pada z `Error while attaching to shared memory segment`. Szczegóły w README
+(sekcja „NCCL na kartach GeForce”). Z P2P komunikacja jest szybsza, niż zakładałem w szacunkach (tam było PCIe przez host),
+więc narzut DDP i all_gather Muona powinien być mniejszy.
 
 ## 5. Kryteria sukcesu
 1. `val/loss` EMA na końcu ≤ wartość z kroku 2 (opublikowane wagi 50M). Model 116M powinien ją pobić. To główna, tania metryka.

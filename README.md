@@ -53,6 +53,23 @@ python export.py runs/aurora/merged.pt exports/aurora
 python sample.py exports/aurora --out grid.png
 ```
 
+## NCCL na kartach GeForce
+
+Najpierw sprawdzić samą komunikację między kartami (kilka sekund, bez danych i modelu):
+
+```bash
+torchrun --nproc_per_node 8 tests/check_nccl.py
+```
+
+- **Sterownik z odblokowanym P2P** (np. łatka tinygrad na open-gpu-kernel-modules): NCCL domyślnie włącza P2P tylko dla kart
+  blisko siebie w topologii PCIe. Gdy ścieżka idzie przez CPU, trzeba to wymusić:
+  `NCCL_P2P_LEVEL=SYS torchrun ...`. Sprawdzenie: `python -c "import torch; print(torch.cuda.can_device_access_peer(0, 1))"`.
+- **Błąd `Error while attaching to shared memory segment /dev/shm/nccl-...`**: NCCL próbuje transportu przez `/dev/shm`.
+  Przy działającym P2P naprawia to `NCCL_P2P_LEVEL=SYS`. Bez P2P trzeba sprawdzić `df -h /dev/shm` (miejsce, uprawnienia
+  `drwxrwxrwt`), a w ostateczności `NCCL_SHM_DISABLE=1` (wolniejszy transport przez sockety).
+- `NCCL_DEBUG=INFO` pokazuje, którą drogę wybrało NCCL (`via P2P`, `via SHM`, `via NET`).
+- Te same zmienne środowiskowe daje się przed `torchrun ... train.py`.
+
 ## Struktura
 
 | plik | co robi |
