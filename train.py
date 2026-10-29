@@ -1,8 +1,9 @@
 """AuroraIMG2-50M replication: joint text-encoder + flow-matching DiT training on FLUX.2 latents.
 
-  # 8 GPUs, default global batch 8192 = 8 GPU x 256 x accum 4; 10% of the data, 774 steps (~11 epochs)
+  # 8 GPUs, defaults: 253m, global batch 2048 = 8 GPU x 256 (no accumulation); 10% of the data, 3 098 steps (~11 epochs)
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora
-  # full dataset, 7 744 steps
+  # out of memory: --micro-batch 128 (accumulation 2 is derived automatically, global batch stays 2048)
+  # full dataset, 30 976 steps
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora_full --fraction 1
   # the released recipe's batch (256 = 8 x 32, 24 780 steps at 10%); lr / steps / EMA rescale automatically
   torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/b256 --batch 256 --micro-batch 32
@@ -38,16 +39,18 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/aurora")
     p.add_argument("--out", required=True)
-    p.add_argument("--size", choices=sorted(SIZES), default="50m", help="denoiser size preset (50m = released model)")
+    p.add_argument("--size", choices=sorted(SIZES), default="253m",
+                   help="denoiser size preset (50m = released model; 116m / 253m = 768x12 / 1024x16)")
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
                    help="optimizer for the hidden matrices; everything else is always AdamW. muon = released recipe")
-    p.add_argument("--lr-hidden", type=float, default=1e-4,  # all AdamW lrs are given at batch 256
-                   help="AdamW peak lr for hidden matrices (--optimizer adamw), see PLAN.md for the derivation")
+    p.add_argument("--lr-hidden", type=float, default=None,  # all AdamW lrs are given at batch 256
+                   help="AdamW peak lr for hidden matrices (--optimizer adamw). Default 1e-4 x 768 / width "
+                        "(muP-style 1/width from the 768-wide 116m, see PLAN.md)")
     p.add_argument("--beta2", type=float, default=None, help="AdamW beta2 (default: 0.99 with adamw, 0.95 with muon)")
     p.add_argument("--steps", type=int, default=None,
                    help="default: 247805 x fraction, i.e. the released run's ~11 epochs over the chosen data")
-    p.add_argument("--batch", type=int, default=8192,
-                   help="global batch. 8192 (8 GPU x 256 x accum 4) keeps PCIe x4 all-reduce small relative to compute. "
+    p.add_argument("--batch", type=int, default=2048,
+                   help="global batch. 2048 (8 GPU x 256) keeps PCIe x4 all-reduce small relative to compute. "
                         "Steps, AdamW lrs and EMA decay are rescaled from the released recipe's batch 256")
     p.add_argument("--fraction", type=float, default=0.1,
                    help="fraction of the FULL dataset's training shards to train on (same pick as prepare_data "
@@ -273,6 +276,8 @@ def init_wandb(args):
 
 def main():
     args = get_args()
+    if args.lr_hidden is None:
+        args.lr_hidden = 1e-4 * 768 / (SIZES[args.size].dim if not args.load_hf else 768)
     ref_ratio = args.batch / 256  # released recipe: batch 256, 247 805 steps (~11 epochs over the full data)
     if args.steps is None:
         args.steps = round(247_805 * args.fraction / ref_ratio)

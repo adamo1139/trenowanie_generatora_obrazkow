@@ -43,7 +43,11 @@ Wersja `--size 50m` to dokładnie opublikowany model, przydatna do porównania 1
   (1.9% vs 2.4%; z NS w fp32 różnica wynosi 0.13%). Wagi na wszystkich rankach są bit w bit identyczne.
 - **all-reduce w bf16** (`--grad-comm bf16`, domyślnie): 3090 Ti nie mają P2P, więc gradienty idą przez PCIe/host.
   bf16 zmniejsza ruch z ~252 MB do ~126 MB na krok. Przy podejrzeniu, że to szkodzi: `--grad-comm fp32`.
-- **Batch 8192 = 8 GPU × 256 × akumulacja 4 (domyślnie).** Najpierw było 2048 = 8 × 64 × 4: 2292 img/s, 45.8 TFLOPS/GPU,
+- **Domyślnie: model `253m` (DiT 1024×16, 240.8M + TE 12.6M), batch 2048 = 8 GPU × 256 bez akumulacji.** Zamiast podbijać batch
+  do 8192 (ryzyko przekroczenia krytycznego batcha) inwestujemy w większy model. Komunikacja na próbkę jest taka sama jak przy
+  64 × 4, szersze matmule powinny podnieść MFU, a lr macierzy ukrytych skaluje się μP-owo jak 1/szerokość względem 768
+  (`1e-4 × 768/1024 = 7.5e-5` przy batchu 256, ×2.83 → 2.12e-4). 367 GFLOP na próbkę.
+- Rozważane wcześniej: **batch 8192 = 8 GPU × 256 × akumulacja 4**. Najpierw było 2048 = 8 × 64 × 4: 2292 img/s, 45.8 TFLOPS/GPU,
   czyli MFU ~30% względem 153 TFLOPS (karty z odblokowaną akumulacją fp32). Pamięci zostawało dużo (11 GB przy mb 64), stąd
   micro-batch 256. Ryzyko: 4× mniej kroków (7 744 na całości) i lr ×5.66. Wyżej niż typowy krytyczny batch małych DiT,
   więc trzeba porównać `val/loss` z runem 2048 w funkcji `train/samples` (oś X w wandb). Jeśli wyjdzie gorzej: `--batch 2048

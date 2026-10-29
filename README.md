@@ -5,7 +5,7 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 (rectified flow) z DiT-em, text encoderem trenowanym razem z nim i zamrożonym dekoderem FLUX.2. Celujemy w 8× RTX 3090 Ti.
 
 - Architektura jest 1:1 z oryginałem: opublikowane wagi ładują się w trybie strict i dają identyczny output (`tests/check_model.py`).
-- Rozmiary: `--size 50m` (oryginał, 63M z text encoderem) i `--size 116m` (DiT 768×12, domyślny punkt startowy w planie).
+- Rozmiary: `--size 50m` (oryginał, 63M z text encoderem), `--size 116m` (DiT 768×12) i `--size 253m` (DiT 1024×16, domyślny).
 - Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie) + **WSM** (uśrednianie checkpointów
   zamiast wygaszania lr, `merge.py`). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
 - Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
@@ -41,8 +41,8 @@ huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir Au
 python prepare_data.py convert  --out data/aurora --download --delete-raw --workers 6
 python prepare_data.py tokenize --data data/aurora
 
-# trening na 8 GPU. Domyślnie 10% danych, batch 8192 (8 GPU x 256 x akumulacja 4), 774 kroki (~11 epok);
-# całość: --fraction 1 (7 744 kroki). Testy na 10% lepiej z --batch 2048 --micro-batch 64 (3 098 kroków). Kroki, lr i EMA przeskalowują się z batchem względem oryginału (256).
+# trening na 8 GPU. Domyślnie model 253m, 10% danych, batch 2048 (8 GPU x 256, bez akumulacji), 3 098 kroków (~11 epok);
+# całość: --fraction 1 (30 976 kroków). OOM: --micro-batch 128 (akumulacja 2 liczy się sama). Kroki, lr i EMA przeskalowują się z batchem względem oryginału (256).
 # Wznawia się sam z <out>/latest.pt (co 1/50 runu); trwałe snap_<krok>.pt co 1/10 runu.
 # wandb włącza się sam, jeśli jest zalogowany (`wandb login`); projekt trenowanie_generatora_obrazkow, --no-wandb wyłącza.
 torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m

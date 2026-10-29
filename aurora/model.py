@@ -283,6 +283,7 @@ class Denoiser(nn.Module):
 SIZES = {
     "50m": DenoiserConfig(),
     "116m": DenoiserConfig(dim=768, depth=12, heads=12, mlp_hidden=1792),
+    "253m": DenoiserConfig(dim=1024, depth=16, heads=16, mlp_hidden=2432),
 }
 
 
