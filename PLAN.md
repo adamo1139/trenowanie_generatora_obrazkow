@@ -89,7 +89,23 @@ Pomiary bez `torch.compile`, przeliczone na 24 GB:
 Komunikacja DDP nie jest tu ograniczeniem: ruch i obliczenia rosną liniowo z liczbą parametrów, więc ich proporcja się nie zmienia.
 Ograniczeniem jest pamięć (~16 B/parametr plus aktywacje).
 
-### Optymalizator: domyślnie AdamW (`--optimizer adamw`)
+### Optymalizator: domyślnie Muon (`--optimizer muon`), wynik sweepu
+Sweep na `50m`, 20% pełnego zbioru, batch 2048, stały lr, 400 kroków (EMA `val/loss` na 4 shardach walidacyjnych):
+
+| optymalizator macierzy ukrytych | lr (przy batchu 256; AdamW ×2.83) | val/loss @ 400 |
+|---|---|---|
+| AdamW | 1e-5 / 5e-5 / **1e-4** / 1e-3 / 1e-2 | 1.298 / 1.273 / **1.245** / 1.687 / 1.764 |
+| **Muon** | 5e-3 / **1e-2** / 2e-2 / 4e-2 | 1.158 / **1.147** / 1.155 / 1.209 |
+
+- Muon z lr 1e-2 (jak w oryginale) jest o 0.10 lepszy od najlepszego AdamW. To więcej, niż AdamW zyskuje na całym zakresie
+  lr 1e-5–1e-4. Przy AdamW macierze ukryte prawie się nie uczą: postęp robią głównie embedding, projekcje i modulacja,
+  a wyższy lr rozjeżdża trening. Prawdopodobna przyczyna to bramki adaLN startujące od zera.
+- Muon jest ~10–20% wolniejszy na krok (podział Newtona-Schulza między karty + all_gather), co przy tej różnicy się opłaca.
+- Run `p10` (116M, AdamW 2.8e-4, 3 098 kroków) dawał obrazki bez struktury. Przyczyną był optymalizator, a nie błąd w kodzie:
+  dotrenowanie wag Aurory tą samą pętlą trzymało `val/loss` ~0.69.
+- Lr Muona nie jest skalowany z batchem (1e-2 wygrało przy 2048). WD 0.01, beta2 grup AdamW 0.95, jak w oryginale.
+
+### Wcześniejsza wersja: AdamW (`--optimizer adamw`)
 Wszystkie parametry idą przez AdamW. Grupy zostają jak w oryginale: embedding 5e-4, in/out projekcje i normy 3e-4.
 Te wartości to AdamW z oryginału **przy tym samym batchu 256**, więc przenoszą się bez zmian. Nowa jest tylko grupa
 macierzy ukrytych (dotąd Muon): `--lr-hidden`, domyślnie **1e-4**, `beta2` 0.99.

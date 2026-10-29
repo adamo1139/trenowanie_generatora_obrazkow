@@ -8,8 +8,8 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
 - Rozmiary DiT: `--size 50m` (oryginał), `116m` (768×12), `253m` (1024×16, domyślny). Text encoder: `--te-size 13m`
   (oryginał, 384×6) albo `27m` (512×8, domyślny). Domyślnie razem ~272M (DiT 245M z szerszym cross-attention + TE 26.7M).
   Odtworzenie oryginału: `--size 50m --te-size 13m`.
-- Domyślnie AdamW (lr 1e-4 dla macierzy ukrytych, WD 0.1, stały lr po warmupie) + **WSM** (uśrednianie checkpointów
-  zamiast wygaszania lr, `merge.py`). Oryginalny przepis z Muonem: `--optimizer muon --schedule cosine`.
+- Domyślnie **Muon** (lr 1e-2, WD 0.01, jak w oryginale) dla macierzy ukrytych, AdamW dla reszty, stały lr po warmupie
+  + **WSM** (uśrednianie checkpointów zamiast wygaszania lr, `merge.py`). AdamW dla wszystkiego: `--optimizer adamw`.
 - Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
   **Domyślnie pobieramy i trenujemy na 10%** (~39 GB), żeby najpierw sprawdzić pomysł; `--fraction 1` = całość.
 

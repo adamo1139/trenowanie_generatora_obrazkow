@@ -43,8 +43,9 @@ def get_args():
                    help="denoiser size preset (50m = released model; 116m / 253m = 768x12 / 1024x16)")
     p.add_argument("--te-size", choices=sorted(TE_SIZES), default="27m",
                    help="text encoder size preset (13m = released 384x6, 27m = 512x8)")
-    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
-                   help="optimizer for the hidden matrices; everything else is always AdamW. muon = released recipe")
+    p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon",
+                   help="optimizer for the hidden matrices; everything else is always AdamW. Muon (lr 1e-2, as in the "
+                        "released recipe) won the 50m sweep: val/loss 1.147 vs 1.245 for the best AdamW at 400 steps")
     p.add_argument("--lr-hidden", type=float, default=None,  # all AdamW lrs are given at batch 256
                    help="AdamW peak lr for hidden matrices (--optimizer adamw). Default 1e-4 x 768 / width "
                         "(muP-style 1/width from the 768-wide 116m, see PLAN.md)")
