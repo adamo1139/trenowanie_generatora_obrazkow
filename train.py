@@ -91,6 +91,8 @@ def get_args():
                         "averaged weight change is applied by an outer Nesterov-SGD step. H = this value, 0 = off (DDP)")
     p.add_argument("--outer-lr", type=float, default=0.7, help="DiLoCo outer learning rate")
     p.add_argument("--outer-momentum", type=float, default=0.9, help="DiLoCo outer Nesterov momentum")
+    p.add_argument("--outer-comm", choices=["bf16", "fp32"], default="bf16",
+                   help="precision of the averaged weight change sent at each sync (bf16 halves the traffic)")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
@@ -510,7 +512,12 @@ def main():
         deltas = [g - p.detach().float() for g, p in zip(global_params, live)]
         flat = torch.cat([d.flatten() for d in deltas])
         if distributed:
-            dist.all_reduce(flat)
+            if args.outer_comm == "bf16":
+                flat_c = flat.bfloat16()
+                dist.all_reduce(flat_c)
+                flat = flat_c.float()
+            else:
+                dist.all_reduce(flat)
             flat /= world
         for g, d in zip(global_params, flat.split([d.numel() for d in deltas])):
             g.grad = d.view_as(g)
