@@ -312,6 +312,15 @@ def init_wandb(args):
     return wb
 
 
+def load_opt_state(opt, state):
+    """Restore optimizer state (momenta etc.) but keep the hyperparameters from the current command line:
+    torch's load_state_dict would silently bring back the checkpoint's lr / momentum / weight decay."""
+    fresh = [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+    opt.load_state_dict(state)
+    for g, f in zip(opt.param_groups, fresh):
+        g.update(f)
+
+
 def resolve_defaults(args):
     """Defaults that depend on other arguments (size, batch, fraction)."""
     if args.lr_hidden is None:
@@ -408,7 +417,7 @@ def main():
         assert ck_te == asdict(te_cfg), f"checkpoint was trained with text encoder {ck_te} (see --te-size)"
         te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
         for o, s in zip(opts, ck["opts"]):
-            o.load_state_dict(s)
+            load_opt_state(o, s)
         if master:
             for e, v in zip(ema, ck["ema"]):
                 e.copy_(v)
@@ -436,7 +445,7 @@ def main():
         global_params = [nn.Parameter(p.detach().clone().float(), requires_grad=False) for p in live]
         outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum, nesterov=True)
         if outer_state is not None:
-            outer_opt.load_state_dict(outer_state)
+            load_opt_state(outer_opt, outer_state)
         log(f"DiLoCo/MuLoCo: {world} workers, outer sync every {args.diloco} steps "
             f"(outer Nesterov SGD lr {args.outer_lr}, momentum {args.outer_momentum}), inner {args.optimizer} unsharded")
     if ddp:
