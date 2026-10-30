@@ -445,7 +445,8 @@ def main():
             for p in live:
                 dist.broadcast(p.data, 0)
         global_params = [nn.Parameter(p.detach().clone().float(), requires_grad=False) for p in live]
-        outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum, nesterov=True)
+        outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum,
+                                    nesterov=args.outer_momentum > 0)  # momentum 0 + lr 1 = plain averaging
         if outer_state is not None:
             load_opt_state(outer_opt, outer_state)
         log(f"DiLoCo/MuLoCo: {world} workers, outer sync every {args.diloco} steps "
