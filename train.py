@@ -603,7 +603,7 @@ def main():
                 mfu = f" MFU {stats['mfu']:.0%}"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | mlm {stats['train/loss_mlm']:.3f} | "
-                f"gn {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
+                f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
                 f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {eta_h:.1f} h", flush=True)
             if wb:
                 wb.log(stats, step=step)
