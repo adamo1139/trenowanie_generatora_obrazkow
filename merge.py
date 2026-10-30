@@ -80,9 +80,10 @@ def main():
                 for key in keys:
                     cb["acc"][key].add_(tensors[key], alpha=cj)
 
-    val = load_val(args.data, split_shards(full_shard_list(args.data))[1], args.val_samples)
     te, den = build_models(*configs_from_ckpt(meta[0]))
     te.to(dev), den.to(dev)
+    val = load_val(args.data, split_shards(full_shard_list(args.data))[1], args.val_samples,
+                   getattr(te.config, "tok_suffix", ""), te.null_ids())
 
     def score(te_sd, den_sd):
         te.load_state_dict(te_sd), den.load_state_dict(den_sd)

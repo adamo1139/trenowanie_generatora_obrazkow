@@ -1,11 +1,13 @@
-# torch is installed separately, from the CUDA wheel index (see README):
-#   uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+# torch AND torchvision are installed separately, from the CUDA wheel index (see README):
+#   uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+# (installing timm first would pull a newer torch/torchvision from PyPI)
 # tested: torch 2.11.0+cu128, diffusers 0.42.1, Python 3.11
 numpy
 safetensors
 tokenizers
 huggingface_hub     # prepare_data.py --download, model download
 wandb               # optional (--wandb)
+timm                # REPA target encoder (Meta PE-Spatial-B16 via timm)
 # sample.py only (FLUX.2 small decoder needs AutoencoderKLFlux2):
 diffusers>=0.39
 transformers

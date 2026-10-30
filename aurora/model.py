@@ -189,6 +189,23 @@ class TextEncoderConfig:
 
 
 @dataclass
+class LMEncoderConfig:
+    """Frozen pretrained LM (aurora/slayer.py) + trainable refiner."""
+    kind: str = "lm"
+    repo: str = "SlayerLab/Slayer149"
+    tok_suffix: str = "slayer149"  # captions in <shard>.tok_slayer149.npy (prepare_data.py tokenize --encoder slayer149)
+    lm_dim: int = 768
+    skip_last: int = 1  # use the residual stream before the last LM block
+    dim: int = 768      # refiner width = denoiser text_dim
+    depth: int = 2
+    heads: int = 12
+    kv_heads: int = 4
+    head_dim: int = 64
+    mlp_hidden: int = 2048
+    max_tokens: int = 96
+
+
+@dataclass
 class DenoiserConfig:
     latent_channels: int = 128
     latent_size: int = 16
@@ -213,6 +230,10 @@ class TextEncoder(nn.Module):
         cos, sin = build_rope_1d(cfg.max_tokens, cfg.head_dim)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
+
+    def null_ids(self):
+        from aurora.data import null_ids
+        return null_ids()
 
     def forward(self, ids: torch.Tensor):
         valid = ids.ne(self.config.pad_id)
@@ -250,15 +271,21 @@ class Denoiser(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor, text: torch.Tensor, text_valid: torch.Tensor):
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor, text: torch.Tensor, text_valid: torch.Tensor,
+                hidden_at: int = 0):
+        """hidden_at > 0: also return the token states after that many blocks (for the REPA loss)."""
         b, c, h, w = z_t.shape
         dim = self.config.dim
         x = self.patch_in(z_t.flatten(2).transpose(1, 2))
         t_emb = self.time_mlp(timestep_embedding(t, 256))
         t6 = self.ada(F.silu(t_emb)).view(b, 6, dim)
-        for block in self.blocks:
+        hidden = None
+        for i, block in enumerate(self.blocks):
             x = block(x, t6, text, text_valid, self.rope_cos, self.rope_sin)
-        return self.patch_out(self.norm(x)).transpose(1, 2).reshape(b, c, h, w)
+            if i + 1 == hidden_at:
+                hidden = x
+        out = self.patch_out(self.norm(x)).transpose(1, 2).reshape(b, c, h, w)
+        return out if not hidden_at else (out, hidden)
 
     @torch.no_grad()
     def init_weights(self):
@@ -293,6 +320,7 @@ SIZES = {
 TE_SIZES = {
     "13m": TextEncoderConfig(),
     "27m": TextEncoderConfig(dim=512, depth=8, heads=8, kv_heads=2, head_dim=64, mlp_hidden=1408),
+    "slayer149": LMEncoderConfig(),  # frozen SlayerLab/Slayer149 + 2-block refiner (~12M trainable)
 }
 
 
@@ -301,14 +329,23 @@ def make_configs(size: str, te_size: str):
     return replace(SIZES[size], text_dim=te_cfg.dim), te_cfg
 
 
+def te_config_from_dict(d):
+    """Checkpoints from before te_config existed used the released text encoder."""
+    return LMEncoderConfig(**d) if d.get("kind") == "lm" else TextEncoderConfig(**d)
+
+
 def configs_from_ckpt(ck):
-    """Configs stored in a checkpoint; checkpoints from before te_config existed used the released text encoder."""
-    return DenoiserConfig(**ck["den_config"]), TextEncoderConfig(**ck.get("te_config", {}))
+    return DenoiserConfig(**ck["den_config"]), te_config_from_dict(ck.get("te_config", {}))
 
 
-def build_models(den_cfg: DenoiserConfig = DenoiserConfig(), te_cfg: TextEncoderConfig = TextEncoderConfig()):
+def build_models(den_cfg: DenoiserConfig = DenoiserConfig(), te_cfg=TextEncoderConfig()):
     assert den_cfg.text_dim == te_cfg.dim, f"denoiser text_dim {den_cfg.text_dim} != text encoder dim {te_cfg.dim}"
-    te, den = TextEncoder(te_cfg), Denoiser(den_cfg)
+    if isinstance(te_cfg, LMEncoderConfig):
+        from aurora.slayer import LMTextEncoder
+        te = LMTextEncoder(te_cfg)
+    else:
+        te = TextEncoder(te_cfg)
+    den = Denoiser(den_cfg)
     te.init_weights()
     den.init_weights()
     return te, den

@@ -31,6 +31,9 @@ def main():
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     den_cfg, te_cfg = configs_from_ckpt(ck)
+    if getattr(te_cfg, "kind", "") == "lm":
+        raise SystemExit("export of models with a frozen-LM text encoder (--te-size slayer149) is not implemented yet: "
+                         "the AuroraIMG2 pipeline only knows its own text encoder")
     te, den = build_models(den_cfg, te_cfg)
     te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
     if not args.no_ema:

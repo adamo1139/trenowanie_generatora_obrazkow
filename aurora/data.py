@@ -3,6 +3,8 @@
   <name>.lat.npy   float16 [N, 128, 16, 16]   latents, already BatchNorm-normalised + 2x2 packed by the dataset
   <name>.tok.npy   uint16  [C, 64]            tokenised captions: [BOS] ids[:62] [EOS] [PAD]...
   <name>.off.npy   int64   [N + 1]            captions of image i are tok[off[i]:off[i+1]]
+  <name>.tok_<enc>.npy  uint16 [C, L]          the same captions for another text encoder (e.g. tok_slayer149,
+                                             L = 96, PAD = 65535); same order, so .off.npy is shared
 
 Everything is opened with mmap, so the page cache is shared by all ranks and loader workers on a node.
 """
@@ -65,15 +67,21 @@ def full_shard_list(root: str):
     return json.load(open(manifest))["shards"] if os.path.exists(manifest) else list_shards(root)
 
 
-def select_shards(root: str, fraction: float):
+def tok_kind(suffix: str = "") -> str:
+    return f"tok_{suffix}" if suffix else "tok"
+
+
+def select_shards(root: str, fraction: float, tok_suffix: str = ""):
     """(train, val) shard names for a fraction of the FULL dataset; val shards do not depend on the fraction."""
-    present = list_shards(root)
+    kind = tok_kind(tok_suffix)
+    present = [n for n in list_shards(root) if os.path.exists(os.path.join(root, f"{n}.{kind}.npy"))]
     train, val = split_shards(full_shard_list(root))
     train = select_fraction(train, fraction)
     missing = sorted(set(train + val) - set(present))
     if missing:
         raise SystemExit(f"{len(missing)} shards selected by --fraction {fraction} are not prepared in {root} "
-                         f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {fraction} + tokenize")
+                         f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {fraction} + tokenize"
+                         + (f" --encoder {tok_suffix}" if tok_suffix else ""))
     assert train, f"no prepared shards in {root}"
     return train, val
 
@@ -92,8 +100,10 @@ def ensure_open_files(needed: int):
 
 
 class ShardStore:
-    def __init__(self, root: str, names):
+    def __init__(self, root: str, names, tok_suffix: str = "", null_row=None):
         self.root, self.names = root, list(names)
+        self.tok = tok_kind(tok_suffix)
+        self.null_row = null_ids() if null_row is None else np.asarray(null_row, dtype=np.int64)
         ensure_open_files(2 * len(self.names) + 512)
         self.offs = [np.load(self._p(n, "off")) for n in self.names]
         self.sizes = np.array([len(o) - 1 for o in self.offs], dtype=np.int64)
@@ -109,20 +119,20 @@ class ShardStore:
     def _open(self):  # lazily, so every DataLoader worker gets its own handles
         if self._lat is None:
             self._lat = [np.load(self._p(n, "lat"), mmap_mode="r") for n in self.names]
-            self._tok = [np.load(self._p(n, "tok"), mmap_mode="r") for n in self.names]
+            self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
 
     def fetch(self, indices: np.ndarray, rng: np.random.Generator | None):
         """Latents + one caption per image (random if rng is given, else the first one)."""
         self._open()
         lat = np.empty((len(indices), 128, 16, 16), dtype=np.float16)
-        ids = np.empty((len(indices), MAX_TOKENS), dtype=np.int64)
+        ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         shard = np.searchsorted(self.starts, indices, side="right") - 1
         for j, (s, gi) in enumerate(zip(shard, indices)):
             i = gi - self.starts[s]
             lat[j] = self._lat[s][i]
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
             if hi == lo:
-                ids[j] = null_ids()
+                ids[j] = self.null_row
             else:
                 ids[j] = self._tok[s][lo if rng is None else rng.integers(lo, hi)]
         return lat, ids
@@ -158,9 +168,9 @@ class TrainStream(IterableDataset):
             m += nw
 
 
-def load_val(root: str, names, n: int):
+def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None):
     """First n images of the held-out shards (round-robin across shards), first caption each."""
-    store = ShardStore(root, names)
+    store = ShardStore(root, names, tok_suffix, null_row)
     per = -(-n // len(names))
     idx = np.concatenate([store.starts[s] + np.arange(min(per, store.sizes[s])) for s in range(len(names))])[:n]
     lat, ids = store.fetch(idx, None)

@@ -32,7 +32,8 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from aurora.data import (MASK_ID, ShardStore, TrainStream, full_shard_list, list_shards, load_val, null_ids,
                          select_shards, split_shards)
-from aurora.model import SIZES, TE_SIZES, DenoiserConfig, TextEncoderConfig, build_models, make_configs
+from aurora.model import (SIZES, TE_SIZES, DenoiserConfig, LMEncoderConfig, TextEncoderConfig, build_models,
+                          make_configs, te_config_from_dict)
 from aurora.muon import Muon
 
 
@@ -42,8 +43,19 @@ def get_args():
     p.add_argument("--out", required=True)
     p.add_argument("--size", choices=sorted(SIZES), default="253m",
                    help="denoiser size preset (50m = released model; 116m / 253m = 768x12 / 1024x16)")
-    p.add_argument("--te-size", choices=sorted(TE_SIZES), default="27m",
-                   help="text encoder size preset (13m = released 384x6, 27m = 512x8)")
+    p.add_argument("--te-size", choices=sorted(TE_SIZES), default="slayer149",
+                   help="text encoder: 13m = released 384x6, 27m = 512x8 (both trained from scratch, with MLM), "
+                        "slayer149 = frozen SlayerLab/Slayer149 + trainable refiner (needs prepare_data.py tokenize "
+                        "--encoder slayer149)")
+    p.add_argument("--repa-weight", type=float, default=0.5, help="REPA loss weight (0 = off)")
+    p.add_argument("--repa-encoder", default="vit_pe_spatial_base_patch16_512.fb",
+                   help="timm vision encoder for REPA targets (default: Meta PE-Spatial-B16)")
+    p.add_argument("--repa-layer", type=int, default=None, help="align the DiT state after this many blocks "
+                                                                 "(default: 30%% of the depth, e.g. 5 of 16)")
+    p.add_argument("--repa-frac", type=float, default=0.25,
+                   help="fraction of each micro-batch that gets a REPA target (the latent decoder is expensive)")
+    p.add_argument("--repa-until", type=float, default=0.4, help="switch REPA off after this fraction of training")
+    p.add_argument("--vae", default="AuroraIMG2-50M-Preview/vae", help="FLUX.2 decoder dir, for REPA targets")
     p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon",
                    help="optimizer for the hidden matrices; everything else is always AdamW. Muon (lr 1e-2, as in the "
                         "released recipe) won the 50m sweep: val/loss 1.147 vs 1.245 for the best AdamW at 400 steps")
@@ -123,24 +135,36 @@ def get_args():
 
 
 class FlowModel(nn.Module):
-    """Both trainable nets in one module so DDP buckets and syncs them together."""
+    """All trainable nets in one module so DDP buckets and syncs them together."""
 
-    def __init__(self, te, den, mlm_weight):
+    def __init__(self, te, den, mlm_weight, repa_proj=None, repa_layer=0, repa_weight=0.0):
         super().__init__()
         self.te, self.den, self.mlm_weight = te, den, mlm_weight
+        self.repa_proj, self.repa_layer, self.repa_weight = repa_proj, repa_layer, repa_weight
 
-    def forward(self, x0, ids, t, eps, mlm_ids=None, mlm_labels=None):
+    def forward(self, x0, ids, t, eps, mlm_ids=None, mlm_labels=None, repa_target=None):
+        """Returns (loss, fm, mlm or None, repa or None). repa_target: (n, 256, D) features for the first n samples."""
         text, valid = self.te(ids)
         tt = t.view(-1, 1, 1, 1)
         z_t = (1 - tt) * x0 + tt * eps
-        v = self.den(z_t, t, text, valid)
+        loss_repa = None
+        if repa_target is not None:
+            v, h = self.den(z_t, t, text, valid, hidden_at=self.repa_layer)
+            pred = self.repa_proj(h[: repa_target.shape[0]])
+            loss_repa = -F.cosine_similarity(pred.float(), repa_target, dim=-1).mean()
+        else:
+            v = self.den(z_t, t, text, valid)
         loss_fm = F.mse_loss(v.float(), eps - x0)
+        loss = loss_fm
+        if loss_repa is not None:
+            loss = loss + self.repa_weight * loss_repa
+            loss_repa = loss_repa.detach()
         if mlm_ids is None:
-            return loss_fm, loss_fm.detach(), None
+            return loss, loss_fm.detach(), None, loss_repa
         h, _ = self.te(mlm_ids)
         logits = h @ self.te.token_embedding.weight.to(h.dtype).T  # MLM head tied to the token embedding
         loss_mlm = F.cross_entropy(logits.float().flatten(0, 1), mlm_labels.flatten(), ignore_index=-100)
-        return loss_fm + self.mlm_weight * loss_mlm, loss_fm.detach(), loss_mlm.detach()
+        return loss + self.mlm_weight * loss_mlm, loss_fm.detach(), loss_mlm.detach(), loss_repa
 
 
 def make_mlm(ids, prob):
@@ -149,14 +173,17 @@ def make_mlm(ids, prob):
     return ids.masked_fill(m, MASK_ID), ids.masked_fill(~m, -100)
 
 
-def param_groups(te, den, args):
+def param_groups(te, den, args, extra=()):
+    """extra: (prefix, module) pairs of additional trainable modules, e.g. the REPA projector (AdamW)."""
     muon, emb, proj, other = [], [], [], []
-    for prefix, mod in (("te", te), ("den", den)):
+    for prefix, mod in (("te", te), ("den", den), *extra):
         for name, p in mod.named_parameters():
+            if not p.requires_grad:
+                continue
             full = f"{prefix}.{name}"
             if full == "te.token_embedding.weight":
                 emb.append(p)
-            elif ".blocks." in f".{name}" and p.ndim == 2 and not name.endswith("mod_table"):
+            elif prefix in ("te", "den") and ".blocks." in f".{name}" and p.ndim == 2 and not name.endswith("mod_table"):
                 muon.append(p)  # hidden matrices: attention, cross-attention, MLP
             elif p.ndim == 2 and not name.endswith("mod_table"):
                 proj.append(p)  # patch_in / patch_out / time_mlp / ada
@@ -174,6 +201,7 @@ def param_groups(te, den, args):
                          shard=not args.diloco))
     else:
         adam_groups.append(dict(params=muon, base_lr=args.lr_hidden * args.lr_scale, weight_decay=args.wd))
+    adam_groups = [g for g in adam_groups if g["params"]]  # e.g. no token embedding with a frozen-LM encoder
     for g in adam_groups:
         g["lr"] = g["base_lr"]
     beta2 = args.beta2 if args.beta2 is not None else (0.99 if args.optimizer == "adamw" else 0.95)
@@ -199,13 +227,13 @@ def measure_flops(model, mb, device, mlm_every, mlm_prob, probe=4):
     """Exact training FLOPs (fwd + bwd) of one micro-batch, averaged over MLM / non-MLM steps. Counted eagerly on a
     `probe`-sample batch (eager needs far more memory than the compiled step) and scaled: FLOPs are linear in batch."""
     x0 = torch.randn(probe, 128, 16, 16, device=device)
-    ids = torch.randint(MASK_ID + 1, 8192, (probe, 64), device=device)
+    ids = torch.randint(MASK_ID + 1, 8192, (probe, model.te.config.max_tokens), device=device)
     t = torch.rand(probe, device=device)
     flops = []
-    for mlm in (False, True):
+    for mlm in ((False, True) if model.mlm_weight > 0 else (False, False)):
         with FlopCounterMode(display=False) as fc:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, _, _ = model(x0, ids, t, torch.randn_like(x0), *(make_mlm(ids, mlm_prob) if mlm else (None, None)))
+                loss = model(x0, ids, t, torch.randn_like(x0), *(make_mlm(ids, mlm_prob) if mlm else (None, None)))[0]
             loss.backward()
         flops.append(fc.get_total_flops())
     model.zero_grad(set_to_none=True)
@@ -271,9 +299,9 @@ def eval_per_shard(te, den, args, device, log):
         if name not in present:
             log(f"{name:45s} {split:5s}  (not prepared)")
             continue
-        lat, ids = load_val(args.data, [name], args.per_shard)
+        lat, ids = load_val(args.data, [name], args.per_shard, getattr(te.config, "tok_suffix", ""), te.null_ids())
         a = evaluate(te, den, (lat, ids), device)["val/loss"]
-        b = evaluate(te, den, (lat, torch.from_numpy(null_ids()).expand_as(ids).clone()), device)["val/loss"]
+        b = evaluate(te, den, (lat, torch.from_numpy(te.null_ids()).expand_as(ids).clone()), device)["val/loss"]
         log(f"{name:45s} {split:5s} {a:7.4f} {b:8.4f} {b - a:6.3f}")
 
 
@@ -345,6 +373,10 @@ def resolve_defaults(args):
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
+    if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf:
+        args.mlm_weight = 0.0  # frozen LM: nothing to train with MLM
+    if args.repa_layer is None:
+        args.repa_layer = max(1, round(0.3 * SIZES[args.size].depth))
     if args.diloco:  # evals, checkpoints and WSM saves happen right after an outer sync
         up = lambda n: n and -(-n // args.diloco) * args.diloco
         args.eval_every, args.ckpt_every = up(args.eval_every), up(args.ckpt_every)
@@ -374,27 +406,30 @@ def main():
     accum = args.batch // (mb * world)
     assert mb * world * accum == args.batch, "batch must be divisible by micro_batch * world"
 
-    # ---- data ----------------------------------------------------------------------------------
-    train_names, val_names = select_shards(args.data, args.fraction)
-    store = ShardStore(args.data, train_names)
-    log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
-    log(f"{args.steps} steps x {args.batch} = {args.steps * args.batch / len(store):.1f} epochs over the training set")
-    val = load_val(args.data, val_names, args.val_samples) if (master and val_names) else None
-
     # ---- model ---------------------------------------------------------------------------------
     den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)
     te.to(device), den.to(device)
-    log(f"params: text encoder {sum(p.numel() for p in te.parameters()) / 1e6:.2f}M, "
+    frozen = f" + frozen {te_cfg.repo} ({sum(p.numel() for p in te.lm.parameters()) / 1e6:.1f}M)" \
+        if isinstance(te_cfg, LMEncoderConfig) else ""
+    log(f"params: text encoder {sum(p.numel() for p in te.parameters()) / 1e6:.2f}M trainable{frozen}, "
         f"denoiser {sum(p.numel() for p in den.parameters()) / 1e6:.2f}M")
+
+    # ---- data ----------------------------------------------------------------------------------
+    tok_suffix = getattr(te_cfg, "tok_suffix", "")
+    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix)
+    store = ShardStore(args.data, train_names, tok_suffix, te.null_ids())
+    log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
+    log(f"{args.steps} steps x {args.batch} = {args.steps * args.batch / len(store):.1f} epochs over the training set")
+    val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids()) if (master and val_names) else None
 
     if args.eval_only:
         if val is not None:
             res = evaluate(te, den, val, device)
             # same images, empty prompt: the gap shows how much the model actually uses the text
-            no_text = evaluate(te, den, (val[0], torch.from_numpy(null_ids()).expand_as(val[1]).clone()), device)
+            no_text = evaluate(te, den, (val[0], torch.from_numpy(te.null_ids()).expand_as(val[1]).clone()), device)
             res.update({k.replace("val/", "val_no_text/"): v for k, v in no_text.items()})
             res["text_gain"] = no_text["val/loss"] - res["val/loss"]
             log(json.dumps(res, indent=1))
@@ -404,9 +439,19 @@ def main():
             dist.destroy_process_group()
         return
 
-    opts, counts = param_groups(te, den, args)
+    repa_target, repa_proj = None, None
+    if args.repa_weight > 0:
+        from aurora.repa import REPATarget, make_projector
+        repa_target = REPATarget(args.vae, args.repa_encoder, device)
+        repa_proj = make_projector(den_cfg.dim, repa_target.dim).to(device)
+        log(f"REPA: {args.repa_encoder} ({repa_target.dim}-d) <- DiT block {args.repa_layer}/{den_cfg.depth}, "
+            f"weight {args.repa_weight}, {args.repa_frac:.0%} of each micro-batch, until step "
+            f"{int(args.repa_until * args.steps)}")
+    extra = [("repa_proj", repa_proj)] if repa_proj is not None else []
+    opts, counts = param_groups(te, den, args, extra)
     log(f"optimizer: {args.optimizer} for hidden matrices; split (params): {counts}")
-    ema = [p.detach().clone().float() for p in list(te.parameters()) + list(den.parameters())] if master else None
+    ema_params = list(te.parameters()) + list(den.parameters())  # what EMA / eval / export use
+    ema = [p.detach().clone().float() for p in ema_params] if master else None
 
     # ---- resume --------------------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
@@ -415,9 +460,11 @@ def main():
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         assert ck["den_config"] == asdict(den_cfg), f"checkpoint was trained with {ck['den_config']}"
-        ck_te = ck.get("te_config", asdict(TextEncoderConfig()))
+        ck_te = asdict(te_config_from_dict(ck.get("te_config", {})))
         assert ck_te == asdict(te_cfg), f"checkpoint was trained with text encoder {ck_te} (see --te-size)"
         te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
+        if repa_proj is not None and ck.get("repa_proj"):
+            repa_proj.load_state_dict(ck["repa_proj"])
         for o, s in zip(opts, ck["opts"]):
             load_opt_state(o, s)
         if master:
@@ -430,7 +477,7 @@ def main():
     else:
         outer_state = None
 
-    model = FlowModel(te, den, args.mlm_weight)
+    model = FlowModel(te, den, args.mlm_weight, repa_proj, args.repa_layer, args.repa_weight)
     flops_micro = measure_flops(model, mb, device, args.mlm_every, args.mlm_prob)  # before compile: eager is countable
     if not args.no_compile:
         te.compile()
@@ -440,7 +487,7 @@ def main():
         f"({torch.cuda.get_device_name(device)})")
     ddp = distributed and not args.diloco
     if args.diloco:
-        live = list(te.parameters()) + list(den.parameters())
+        live = [p for p in model.parameters() if p.requires_grad]  # incl. the REPA projector
         if distributed:  # same starting point on every GPU (DDP would broadcast it)
             for p in live:
                 dist.broadcast(p.data, 0)
@@ -452,7 +499,8 @@ def main():
         log(f"DiLoCo/MuLoCo: {world} workers, outer sync every {args.diloco} steps "
             f"(outer Nesterov SGD lr {args.outer_lr}, momentum {args.outer_momentum}), inner {args.optimizer} unsharded")
     if ddp:
-        model = DDP(model, device_ids=[local], bucket_cap_mb=64, gradient_as_bucket_view=True)
+        model = DDP(model, device_ids=[local], bucket_cap_mb=64, gradient_as_bucket_view=True,
+                    find_unused_parameters=repa_proj is not None)  # the projector is idle once REPA switches off
         if args.grad_comm == "bf16":
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             model.register_comm_hook(None, default_hooks.bf16_compress_hook)
@@ -468,13 +516,13 @@ def main():
             log(f"PowerSGD rank {args.powersgd_rank}, full all-reduce for the first {start} steps")
             if args.optimizer == "muon":
                 log("warning: PowerSGD with Muon - Muon orthogonalises the low-rank gradient, prefer --optimizer adamw")
-    params = [p for p in model.parameters()]
+    params = [p for p in model.parameters() if p.requires_grad]
 
     stream = TrainStream(store, mb, rank, world, args.seed, start_micro=step * accum)
     loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                               pin_memory=True, prefetch_factor=2 if args.workers else None,
                                               persistent_workers=args.workers > 0))
-    null_row = torch.from_numpy(null_ids()).to(device)
+    null_row = torch.from_numpy(te.null_ids()).to(device)
 
     wb = None
     if master and args.wandb and not args.no_wandb:
@@ -490,7 +538,8 @@ def main():
         tmp = ckpt_path + ".tmp"
         torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
                         ema=[e.cpu() for e in ema], args=vars(args),
-                        outer=outer_opt.state_dict() if args.diloco else None), tmp)
+                        outer=outer_opt.state_dict() if args.diloco else None,
+                        repa_proj=sd(repa_proj) if repa_proj is not None else None), tmp)
         os.replace(tmp, ckpt_path)
         if args.keep_every and step % args.keep_every == 0:
             torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
@@ -529,10 +578,10 @@ def main():
     @torch.no_grad()
     def ema_eval():
         """Copy EMA weights into the live modules, evaluate, restore."""
-        live = [p.detach().clone() for p in list(te.parameters()) + list(den.parameters())]
-        torch._foreach_copy_(list(te.parameters()) + list(den.parameters()), ema)
+        live_w = [p.detach().clone() for p in ema_params]
+        torch._foreach_copy_(ema_params, ema)
         res = evaluate(te, den, val, device)
-        torch._foreach_copy_(list(te.parameters()) + list(den.parameters()), live)
+        torch._foreach_copy_(ema_params, live_w)
         return res
 
     warmup = max(1, int(args.warmup_frac * args.steps))
@@ -544,7 +593,8 @@ def main():
         log(f"WSM: raw weights to {args.out}/merge/ every {args.merge_every} steps from step "
             f"{math.ceil(args.merge_start * args.steps)} (~{int((1 - args.merge_start) * args.steps / args.merge_every)} files)")
     log(f"global batch {args.batch} = {world} GPU x {mb} x accum {accum}; {args.steps} steps, warmup {warmup}")
-    acc = torch.zeros(3, device=device)  # sum fm, sum mlm, n mlm
+    acc = torch.zeros(5, device=device)  # sum fm, sum mlm, n mlm, sum repa, n repa
+    repa_steps = int(args.repa_until * args.steps) if repa_target is not None else 0
     t0, t_last = time.time(), step
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
@@ -558,15 +608,19 @@ def main():
             drop = torch.rand(b, device=device) < args.cfg_drop
             cond_ids = torch.where(drop[:, None], null_row, ids)
             mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
+            target = repa_target(x0[: max(1, round(args.repa_frac * b))]) if step < repa_steps else None
             sync = contextlib.nullcontext() if (not ddp or micro == accum - 1) else model.no_sync()
             with sync:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss, l_fm, l_mlm = model(x0, cond_ids, t, eps, mlm_ids, mlm_labels)
+                    loss, l_fm, l_mlm, l_repa = model(x0, cond_ids, t, eps, mlm_ids, mlm_labels, target)
                 (loss / accum).backward()
             acc[0] += l_fm / accum
             if l_mlm is not None:
                 acc[1] += l_mlm / accum
                 acc[2] += 1 / accum
+            if l_repa is not None:
+                acc[3] += l_repa / accum
+                acc[4] += 1 / accum
 
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.clip)
         mult = lr_mult(step, args.steps, warmup, args.schedule)
@@ -582,10 +636,10 @@ def main():
                 if master:  # EMA of the global weights, same window in samples as the per-step EMA
                     n = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n) / (10 + n))
-                    torch._foreach_lerp_(ema, [p.detach() for p in live], 1 - d)
+                    torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
         elif master:
             d = min(args.ema, (step) / (9 + step))
-            torch._foreach_lerp_(ema, [p.detach() for p in list(te.parameters()) + list(den.parameters())], 1 - d)
+            torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
 
         if step % args.log_every == 0 or step == args.steps:
             if distributed:
@@ -595,6 +649,7 @@ def main():
             dt = time.time() - t0
             stats = {"train/samples": step * args.batch, "train/epoch": step * args.batch / len(store),
                      "train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
+                     "train/loss_repa": (acc[3] / acc[4].clamp(min=1e-9)).item(),
                      "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
                      "imgs_per_s": n * args.batch / dt, "tflops_per_gpu": flops_micro * accum * n / dt / 1e12}
             mfu = ""
@@ -602,7 +657,9 @@ def main():
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
-            log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | mlm {stats['train/loss_mlm']:.3f} | "
+            aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
+                (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
+            log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {aux}"
                 f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
                 f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {eta_h:.1f} h", flush=True)
             if wb:

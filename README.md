@@ -23,7 +23,7 @@ Pythonem. Wymagany jest [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://as
 ```bash
 uv venv .venv --python 3.11
 source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128   # 3090 Ti (sm86) i nowsze karty
+uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128  # najpierw!
 uv pip install -r requirements.txt
 python -c "import torch; print(torch.__version__, torch.cuda.device_count(), 'GPU')"
 ```
@@ -31,6 +31,18 @@ python -c "import torch; print(torch.__version__, torch.cuda.device_count(), 'GP
 Bez uv: `python3.11 -m venv .venv && source .venv/bin/activate && pip install torch --index-url
 https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszystkie dalsze komendy zakładają aktywny venv
 (albo wywołanie `.venv/bin/python` / `.venv/bin/torchrun`). Sprawdzone: torch 2.11.0+cu128, diffusers 0.42.1, Python 3.11.
+
+## Text encoder: Slayer149 (zamrożony) + REPA z PE-Spatial-B16 (domyślnie)
+
+- `--te-size slayer149` (domyślnie): zamrożony [SlayerLab/Slayer149](https://huggingface.co/SlayerLab/Slayer149) (149M,
+  angielski) + trenowany 2-blokowy refiner (~12M). Wymaga osobnej tokenizacji captionów (obok istniejącej):
+  `python prepare_data.py tokenize --data data/aurora_full --encoder slayer149`.
+  `--te-size 13m` / `27m` to dawne enkodery trenowane od zera (z MLM).
+- **REPA** (`--repa-weight 0.5`, domyślnie): stan DiT po ~30% głębokości jest dopasowywany (cosinus, przez MLP) do cech
+  [PE-Spatial-B16](https://huggingface.co/facebook/PE-Spatial-B16-512) (Apache-2.0) z obrazka zdekodowanego z latentu.
+  Dekoder jest drogi, więc REPA liczy się tylko dla 25% każdego micro-batcha (`--repa-frac`) i przez pierwsze 40%
+  treningu (`--repa-until`). `--repa-weight 0` wyłącza.
+- Eksport modeli z enkoderem Slayer149 do formatu diffusers nie jest jeszcze zaimplementowany.
 
 ## Szybki start
 

@@ -159,33 +159,58 @@ def cmd_convert(args):
     print(f"done, {total} images converted in this run")
 
 
-def tokenize_one(name: str, data: str, tokenizer_path: str):
+# text encoders with their own caption tokenisation (stored next to the default .tok.npy)
+ENCODERS = {
+    # frozen LM: [<|endoftext|>] ids[:95], right-padded with 65535 (see aurora/slayer.py)
+    "slayer149": dict(repo="SlayerLab/Slayer149", width=96, bos=12285, pad=65535, leading_space=False),
+}
+
+
+def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = ""):
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(tokenizer_path)
+    enc_cfg = ENCODERS.get(encoder)
+    lead = " " if enc_cfg is None else ("" if not enc_cfg["leading_space"] else " ")
     with open(os.path.join(data, name + ".caps.json")) as f:
         caps = json.load(f)
     flat, off = [], np.zeros(len(caps) + 1, dtype=np.int64)
     for i, cs in enumerate(caps):
-        # identical to AuroraIMG2Pipeline._tokenize: collapse whitespace, explicit leading space
-        flat += [" " + " ".join(c.split()) for c in cs if c.split()]
+        # Aurora tokenizer: identical to AuroraIMG2Pipeline._tokenize (collapsed whitespace, explicit leading space)
+        flat += [lead + " ".join(c.split()) for c in cs if c.split()]
         off[i + 1] = len(flat)
-    rows = np.full((len(flat), MAX_TOKENS), PAD_ID, dtype=np.uint16)
-    for j, enc in enumerate(tok.encode_batch(flat, add_special_tokens=False)):
-        ids = enc.ids[: MAX_TOKENS - 2]
-        rows[j, 0] = BOS_ID
-        rows[j, 1:1 + len(ids)] = ids
-        rows[j, 1 + len(ids)] = EOS_ID
-    save_npy(os.path.join(data, name + ".tok.npy"), rows)
+    encoded = tok.encode_batch(flat, add_special_tokens=False)
+    if enc_cfg is None:
+        rows = np.full((len(flat), MAX_TOKENS), PAD_ID, dtype=np.uint16)
+        for j, e in enumerate(encoded):
+            ids = e.ids[: MAX_TOKENS - 2]
+            rows[j, 0] = BOS_ID
+            rows[j, 1:1 + len(ids)] = ids
+            rows[j, 1 + len(ids)] = EOS_ID
+        out = name + ".tok.npy"
+    else:
+        w = enc_cfg["width"]
+        rows = np.full((len(flat), w), enc_cfg["pad"], dtype=np.uint16)
+        for j, e in enumerate(encoded):
+            ids = e.ids[: w - 1]
+            rows[j, 0] = enc_cfg["bos"]
+            rows[j, 1:1 + len(ids)] = ids
+        out = f"{name}.tok_{encoder}.npy"
+    save_npy(os.path.join(data, out), rows)
     save_npy(os.path.join(data, name + ".off.npy"), off)  # .off.npy written last = shard tokenised
     return name, len(caps), len(flat)
 
 
 def cmd_tokenize(args):
     names = sorted(os.path.basename(p)[: -len(".caps.json")] for p in glob.glob(os.path.join(args.data, "*.caps.json")))
-    todo = [n for n in names if args.force or not os.path.exists(os.path.join(args.data, n + ".off.npy"))]
-    print(f"{len(names)} shards, {len(todo)} to tokenise")
+    tokenizer = args.tokenizer
+    if args.encoder:
+        from huggingface_hub import hf_hub_download
+        tokenizer = hf_hub_download(ENCODERS[args.encoder]["repo"], "tokenizer.json")
+    done = lambda n: os.path.exists(os.path.join(args.data, f"{n}.tok_{args.encoder}.npy" if args.encoder else n + ".off.npy"))
+    todo = [n for n in names if args.force or not done(n)]
+    print(f"{len(names)} shards, {len(todo)} to tokenise" + (f" for {args.encoder}" if args.encoder else ""))
     with ProcessPoolExecutor(args.workers) as ex:
-        futs = [ex.submit(tokenize_one, n, args.data, args.tokenizer) for n in todo]
+        futs = [ex.submit(tokenize_one, n, args.data, tokenizer, args.encoder) for n in todo]
         for i, fut in enumerate(as_completed(futs)):
             name, n, c = fut.result()
             print(f"[{i + 1}/{len(futs)}] {name}: {n} images, {c} captions", flush=True)
@@ -209,6 +234,8 @@ def main():
     s = sub.add_parser("tokenize")
     s.add_argument("--data", default="data/aurora")
     s.add_argument("--tokenizer", default="AuroraIMG2-50M-Preview/tokenizer/tokenizer.json")
+    s.add_argument("--encoder", choices=[""] + sorted(ENCODERS), default="",
+                   help="tokenise for another text encoder (writes <shard>.tok_<encoder>.npy, keeps .tok.npy)")
     s.add_argument("--workers", type=int, default=8)
     s.add_argument("--force", action="store_true")
     args = p.parse_args()
