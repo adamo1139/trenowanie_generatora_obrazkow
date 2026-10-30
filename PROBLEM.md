@@ -1,6 +1,14 @@
 # PROBLEM: from-scratch training plateaus at val/loss ~1.09, the released AuroraIMG2-50M reaches 0.693
 
-## TL;DR, likely root cause (found 2026-10-30, not yet fixed)
+## Status: FIXED in code (2026-10-30), needs a re-run
+
+`aurora/model.py` now uses proper adaLN-Zero: gates (`ada`, `mod_table`) zero, gated output projections (`attn.out`,
+`mlp.out_proj`) normal init. `tests/check_grads.py` asserts every parameter gets a nonzero gradient after a few steps.
+It passes on the fixed code and fails on the old code. The old code also listed `time_mlp.*` and `ada.*` as dead: the
+timestep embedding only reaches the network through the gates, so **the old model never received the noise level t at all**.
+The released-weights test (`tests/check_model.py`) still passes (forward pass unchanged). All runs listed below must be repeated.
+
+## TL;DR, root cause
 
 **In every denoiser block, self-attention and the MLP are dead from step 0 and never train.**
 `Denoiser.init_weights()` in `aurora/model.py` zero-initialises both:

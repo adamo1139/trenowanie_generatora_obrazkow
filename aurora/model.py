@@ -266,16 +266,18 @@ class Denoiser(nn.Module):
         for lin in (self.time_mlp[0], self.time_mlp[2]):
             nn.init.normal_(lin.weight, std=0.02)
             nn.init.zeros_(lin.bias)
-        # adaLN-single: zero time projection + zero tables -> all gates 0, every block starts as the identity
+        # adaLN-Zero (single): zero time projection + zero tables -> all gates 0, every block starts as the identity.
+        # Only ONE factor of each gated product may be zero: the gated output projections (attn.out, mlp.out_proj)
+        # get a normal init. Zeroing both the gate and the projection makes each one's gradient proportional to the
+        # other, so self-attention and the MLP would never train (the bug behind the ~1.09 plateau, see PROBLEM.md).
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
         for block in self.blocks:
-            for lin in (block.attn.qkv, block.cross.q, block.cross.kv, block.mlp.in_proj):
+            for lin in (block.attn.qkv, block.attn.out, block.cross.q, block.cross.kv, block.mlp.in_proj,
+                        block.mlp.out_proj):
                 nn.init.normal_(lin.weight, std=lin.in_features ** -0.5)
             nn.init.zeros_(block.mod_table)
-            nn.init.zeros_(block.attn.out.weight)
-            nn.init.zeros_(block.cross.out.weight)  # cross-attn is ungated, so zero its output for identity init
-            nn.init.zeros_(block.mlp.out_proj.weight)
+            nn.init.zeros_(block.cross.out.weight)  # cross-attn is ungated: its zero output still gets a gradient
         nn.init.zeros_(self.patch_out.weight)
 
 
