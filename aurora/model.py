@@ -346,8 +346,17 @@ TE_SIZES = {
 }
 
 
-def make_configs(size: str, te_size: str):
+def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None):
+    """te_dim / te_depth resize the trainable refiner of an LM text encoder (heads of 64, GQA, SwiGLU 8/3 x dim)."""
     te_cfg = TE_SIZES[te_size]
+    if te_dim or te_depth:
+        assert isinstance(te_cfg, LMEncoderConfig), "--te-dim / --te-depth only apply to LM text encoders"
+        dim = te_dim or te_cfg.dim
+        assert dim % 64 == 0, "refiner width must be a multiple of 64 (heads of 64)"
+        heads = dim // 64
+        kv_heads = max(d for d in range(1, max(1, heads // 3) + 1) if heads % d == 0)  # GQA, >= 3 q heads per kv
+        te_cfg = replace(te_cfg, dim=dim, depth=te_depth or te_cfg.depth, heads=heads, kv_heads=kv_heads,
+                         mlp_hidden=-(-dim * 8 // 3 // 128) * 128)
     return replace(SIZES[size], text_dim=te_cfg.dim), te_cfg
 
 

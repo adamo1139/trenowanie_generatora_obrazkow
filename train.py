@@ -47,6 +47,10 @@ def build_parser():
                    help="text encoder: 13m = released 384x6, 27m = 512x8 (both trained from scratch, with MLM), "
                         "slayer149 = frozen SlayerLab/Slayer149 + trainable refiner (needs prepare_data.py tokenize "
                         "--encoder slayer149)")
+    p.add_argument("--te-dim", type=int, default=None,
+                   help="LM text encoder: refiner width (default: the denoiser width; 768 + --te-depth 2 = the "
+                        "original ~13M refiner, needed to resume older runs)")
+    p.add_argument("--te-depth", type=int, default=None, help="LM text encoder: refiner blocks (default 2)")
     p.add_argument("--repa-weight", type=float, default=0.5, help="REPA loss weight (0 = off)")
     p.add_argument("--repa-encoder", default="vit_base_patch14_reg4_dinov2.lvd142m",
                    help="timm vision encoder for REPA targets (default: DINOv2-B/14 with registers, Apache-2.0; "
@@ -387,6 +391,8 @@ def resolve_defaults(args):
         args.keep_every = max(1, args.steps // 10)
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
+    if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf and args.te_dim is None:
+        args.te_dim = SIZES[args.size].dim  # refiner at the denoiser width (Lumina-2 / Z-Image style context refiner)
     if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf:
         args.mlm_weight = 0.0  # frozen LM: nothing to train with MLM
     if args.repa_layer is None:
@@ -421,7 +427,8 @@ def main():
     assert mb * world * accum == args.batch, "batch must be divisible by micro_batch * world"
 
     # ---- model ---------------------------------------------------------------------------------
-    den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size)
+    den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size,
+                                                                                      args.te_dim, args.te_depth)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)

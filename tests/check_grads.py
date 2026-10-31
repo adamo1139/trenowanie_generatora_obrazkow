@@ -13,9 +13,11 @@ from aurora.model import SIZES, TE_SIZES, build_models, make_configs
 from train import FlowModel, make_mlm
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
-for size, te_size in (("50m", "13m"), ("253m", "27m"), ("50m", "slayer149")):
+# slayer149 with the default refiner (denoiser width, 2 blocks) and the original 768-wide one
+for size, te_size, te_dim in (("50m", "13m", None), ("253m", "27m", None), ("50m", "slayer149", 640),
+                              ("50m", "slayer149", 768)):
     torch.manual_seed(0)
-    te, den = build_models(*make_configs(size, te_size))
+    te, den = build_models(*make_configs(size, te_size, te_dim))
     te.to(dev), den.to(dev)
     lm = te_size == "slayer149"
     model = FlowModel(te, den, 0.0 if lm else 0.05)

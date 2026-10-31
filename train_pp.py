@@ -193,7 +193,7 @@ def main():
     args.mlm_weight = 0.0
 
     # ---- model: a meta skeleton everywhere, only this stage's parts are materialised -------------------------------
-    den_cfg, te_cfg = make_configs(args.size, args.te_size)
+    den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth)
     assert den_cfg.depth >= pp, f"{den_cfg.depth} blocks can't fill {pp} stages"
     ranges = stage_ranges(den_cfg.depth, pp)
     lo, hi = ranges[s]
