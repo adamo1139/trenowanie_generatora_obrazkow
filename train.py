@@ -120,6 +120,9 @@ def build_parser():
                         "averaged weight change is applied by an outer Nesterov-SGD step. H = this value, 0 = off (DDP)")
     p.add_argument("--outer-lr", type=float, default=0.7, help="DiLoCo outer learning rate")
     p.add_argument("--outer-momentum", type=float, default=0.9, help="DiLoCo outer Nesterov momentum")
+    p.add_argument("--offload", action="store_true",
+                   help="with --diloco: keep the global weights (pinned) and the EMA in CPU memory instead of on the "
+                        "GPU (~2 x 4 bytes/param less GPU memory); they are only touched at the outer syncs")
     p.add_argument("--outer-comm", choices=["bf16", "fp32"], default="bf16",
                    help="precision of the averaged weight change sent at each sync (bf16 halves the traffic)")
     p.add_argument("--no-compile", action="store_true")
@@ -332,7 +335,9 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
             out.append(idx)
             idx = []
     for chunk in out:
-        flat = torch.cat([(global_params[i] - live[i].detach().float()).flatten() for i in chunk])
+        dev = live[chunk[0]].device  # global weights may live in (pinned) CPU memory: compute on the GPU per bucket
+        flat = torch.cat([(global_params[i].to(dev, non_blocking=True) - live[i].detach().float()).flatten()
+                          for i in chunk])
         if dist.is_initialized() and n > 1:
             if comm == "bf16":
                 flat_c = flat.bfloat16()
@@ -342,12 +347,14 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
             else:
                 dist.all_reduce(flat, group=group)
             flat /= n
+        flat = flat.to(global_params[chunk[0]].device)
         for i, d in zip(chunk, flat.split([global_params[i].numel() for i in chunk])):
             global_params[i].grad = d.view_as(global_params[i])
         outer_opt.step()  # params without a grad (other buckets) are skipped
         outer_opt.zero_grad(set_to_none=True)
         del flat
-        torch._foreach_copy_([live[i] for i in chunk], [global_params[i] for i in chunk])
+        for i in chunk:
+            live[i].copy_(global_params[i], non_blocking=True)
 
 
 @torch.no_grad()
@@ -563,7 +570,9 @@ def main():
                        if args.muon_period > 1 else ""]) if args.optimizer == "muon" else ""
     log(f"optimizer: {args.optimizer}{variant} for hidden matrices; split (params): {counts}")
     ema_params = list(te.parameters()) + list(den.parameters())  # what EMA / eval / export use
-    ema = [p.detach().clone().float() for p in ema_params] if master else None
+    assert not args.offload or args.diloco, "--offload needs --diloco (it updates the EMA only at the outer syncs)"
+    ema_dev = "cpu" if args.offload else device
+    ema = [p.detach().float().to(ema_dev, copy=True) for p in ema_params] if master else None
 
     # ---- resume --------------------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
@@ -603,7 +612,11 @@ def main():
         if distributed:  # same starting point on every GPU (DDP would broadcast it)
             for p in live:
                 dist.broadcast(p.data, 0)
-        global_params = [nn.Parameter(p.detach().clone().float(), requires_grad=False) for p in live]
+        global_params = [nn.Parameter(p.detach().float().cpu().pin_memory() if args.offload else
+                                      p.detach().clone().float(), requires_grad=False) for p in live]
+        if args.offload and master:  # EMA sources: the (CPU) global weights; frozen params never change
+            gidx = {id(p): i for i, p in enumerate(live)}
+            ema_src = [global_params[gidx[id(p)]] if id(p) in gidx else e.clone() for p, e in zip(ema_params, ema)]
         outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum,
                                     nesterov=args.outer_momentum > 0)  # momentum 0 + lr 1 = plain averaging
         if outer_state is not None:
@@ -672,7 +685,7 @@ def main():
     @torch.no_grad()
     def ema_eval():
         """Copy EMA weights into the live modules, evaluate, restore."""
-        live_w = [p.detach().clone() for p in ema_params]
+        live_w = [p.detach().to(ema_dev, copy=True) for p in ema_params]
         torch._foreach_copy_(ema_params, ema)
         res = evaluate(te, den, val, device)
         torch._foreach_copy_(ema_params, live_w)
@@ -731,7 +744,11 @@ def main():
                 if master:  # EMA of the global weights, same window in samples as the per-step EMA
                     n = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n) / (10 + n))
-                    torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
+                    if args.offload:
+                        torch.cuda.synchronize(device)  # the global weights' H2D copies are non-blocking
+                        torch._foreach_lerp_(ema, ema_src, 1 - d)
+                    else:
+                        torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
         elif master:
             d = min(args.ema, (step) / (9 + step))
             torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
