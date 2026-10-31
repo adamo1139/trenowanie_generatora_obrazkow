@@ -62,6 +62,7 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
     if args.only and not any(o in name for o in args.only):
         continue
     text_dim = dim // 2
+    torch._dynamo.reset()  # every shape compiles DenoiserBlock.forward again; don't hit the recompile limit
     torch.manual_seed(0)
     blk = DenoiserBlock(dim, heads, text_dim, mlp).to(dev)
     with torch.no_grad():
