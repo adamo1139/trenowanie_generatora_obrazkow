@@ -807,9 +807,11 @@ def main():
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
-            stats.update(wrms_stats(weight_sq(wrms_named, device)))  # this rank's weights (MuLoCo: worker 0's)
             w_every = args.gns_every or 1024  # weight RMS in the log line this often (always in wandb)
-            gns_s = f" | w_rms {stats['weights/rms_hidden']:.4f}" if step // w_every != t_last // w_every else ""
+            gns_s = ""
+            if step // w_every != t_last // w_every:  # this rank's weights (MuLoCo: worker 0's)
+                stats.update(wrms_stats(weight_sq(wrms_named, device)))
+                gns_s = f" | w_rms {stats['weights/rms_hidden']:.4f}"
             if gns["new"]:  # only on the log line right after a measurement
                 gns["new"] = False
                 b_noise = gns["s"] / gns["g2"] if gns["g2"] > 0 else float("nan")
