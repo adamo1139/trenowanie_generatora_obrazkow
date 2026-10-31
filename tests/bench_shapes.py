@@ -6,6 +6,7 @@ the activations / text tokens (and their gradients) over the inter-GPU link, ass
   python tests/bench_shapes.py --mb 16 --gbps 6     # x8 links
   python tests/bench_shapes.py --size 1.6b 1b --pp 4   # presets from aurora/model.py SIZES
   python tests/bench_shapes.py --pp 1 --size 750m 750m-w2048 750m-w1792 750m-w1536 750m-w1280   # train.py, no pipeline
+  python tests/bench_shapes.py --sweep              # train.py: widths x micro-batches, depth / memory for a param budget
 
 Depths are 8k - 1 (stage 0 also runs the text encoder, ~1 block); text_dim = width / 2 (train.py's default refiner).
 --pp 1 = plain train.py (whole model per GPU): no link cost, stage = the whole stack.
@@ -42,6 +43,15 @@ p.add_argument("--gbps", type=float, default=3.0, help="effective GPU-to-GPU ban
 p.add_argument("--peak", type=float, default=153.0, help="GPU peak TFLOPS, for MFU (3090 Ti, fp32-acc unlocked)")
 p.add_argument("--only", nargs="*", default=None, help="substrings of shape names to run")
 p.add_argument("--size", nargs="+", choices=sorted(SIZES), default=None, help="benchmark these presets instead")
+p.add_argument("--sweep", action="store_true",
+               help="train.py sweep: every width x micro-batch (block speed + activation memory), then the depth that "
+                    "hits each --params budget and whether it fits in --mem-gb with --offload")
+p.add_argument("--widths", type=int, nargs="+", default=[1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072])
+p.add_argument("--sweep-mb", type=int, nargs="+", default=[8, 16, 24, 32, 48, 64])
+p.add_argument("--params", type=float, nargs="+", default=[0.6, 0.75], help="denoiser budgets in B")
+p.add_argument("--mem-gb", type=float, default=24.0)
+p.add_argument("--overhead-gb", type=float, default=3.5,
+               help="CUDA context, frozen LM + refiner, iREPA decoder + DINOv2, compile buffers, allocator slack")
 args = p.parse_args()
 if args.size:
     SHAPES = {f"{s} ({SIZES[s].dim}x{SIZES[s].depth})": (SIZES[s].dim, SIZES[s].heads, SIZES[s].mlp_hidden,
@@ -56,6 +66,8 @@ def block_flops(dim, heads, mlp, text_dim, mb):
     return 3 * mb * (2 * img * T + 2 * txt * Tt + attn)  # fwd + bwd = 3x fwd
 
 
+if args.sweep:
+    SHAPES = {}  # the sweep (below) replaces the shape table
 print(f"GPU {torch.cuda.get_device_name()}, pp {args.pp}, link {args.gbps} GB/s, peak {args.peak} TFLOPS\n")
 print(f"{'shape':<20} {'params':>7} {'blk/st':>6} {'mb':>3} {'block ms':>9} {'block TF':>9} {'comm ms':>8} {'stage TF':>9} {'MFU':>5}")
 for name, (dim, heads, mlp, depth) in SHAPES.items():
@@ -103,3 +115,72 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
               f"{stage_tf:9.1f} {stage_tf / args.peak:5.0%}", flush=True)
     del blk, cblk
     torch.cuda.empty_cache()
+
+
+def sweep():
+    """train.py (one model per GPU, MuLoCo + --offload): GPU memory = weights + grads + Muon momentum (3 x 4 B/param)
+    + activations (depth x measured per block, x1.1 for the backward peak) + overhead."""
+    print(f"\nsweep: GPU {torch.cuda.get_device_name()}, budget {args.mem_gb} GB, overhead {args.overhead_gb} GB, "
+          f"state 12 B/param (--offload)\n")
+    hdr = f"{'width':>5} {'heads':>5} {'mlp':>5} {'mb':>3} {'block ms':>8} {'TFLOPS':>7} {'MFU':>4} {'act/blk':>8}"
+    for b_ in args.params:
+        hdr += f" | {b_:.2f}B: {'depth':>5} {'ratio':>5} {'GB':>5} fit"
+    print(hdr)
+    for dim in args.widths:
+        heads = dim // 128
+        mlp = -(-dim * 8 // 3 // 128) * 128
+        text_dim = dim // 2
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        blk = DenoiserBlock(dim, heads, text_dim, mlp).to(dev)
+        with torch.no_grad():
+            for q in blk.parameters():
+                q.normal_(0, 0.02)
+        n_block = sum(q.numel() for q in blk.parameters())
+        cblk = torch.compile(blk, dynamic=False)
+        cos, sin = (u.to(dev) for u in build_rope_2d(16, dim // heads))
+        for mb in args.sweep_mb:
+            x = torch.randn(mb, T, dim, device=dev, dtype=torch.bfloat16, requires_grad=True)
+            t6 = torch.randn(mb, 6, dim, device=dev, dtype=torch.bfloat16)
+            text = torch.randn(mb, Tt, text_dim, device=dev, dtype=torch.bfloat16)
+            valid = torch.ones(mb, Tt, dtype=torch.bool, device=dev)
+            valid[:, 50:] = False
+
+            def fwd():
+                with torch.autocast("cuda", torch.bfloat16):
+                    return cblk(x, t6, text, valid, cos, sin)
+            try:
+                for _ in range(3):
+                    fwd().float().square().mean().backward()
+                torch.cuda.synchronize()
+                base = torch.cuda.memory_allocated()
+                y = fwd()
+                torch.cuda.synchronize()
+                act = (torch.cuda.memory_allocated() - base) / 2**30  # saved for backward, per block
+                y.float().square().mean().backward()
+                del y
+                torch.cuda.synchronize()
+                t0 = time.time()
+                for _ in range(10):
+                    fwd().float().square().mean().backward()
+                torch.cuda.synchronize()
+            except torch.OutOfMemoryError:
+                print(f"{dim:>5} {heads:>5} {mlp:>5} {mb:>3}  OOM")
+                torch.cuda.empty_cache()
+                continue
+            ms = (time.time() - t0) / 10 * 1000
+            tf = block_flops(dim, heads, mlp, text_dim, mb) / ms / 1e9
+            row = f"{dim:>5} {heads:>5} {mlp:>5} {mb:>3} {ms:8.1f} {tf:7.1f} {tf / args.peak:4.0%} {act * 1024:6.0f}MB"
+            for b_ in args.params:
+                depth = max(1, round(b_ * 1e9 / n_block))
+                gb = depth * n_block * 12 / 2**30 + depth * act * 1.1 + args.overhead_gb
+                row += f" | {'':>7}{depth:>5} {dim / depth:5.0f} {gb:5.1f} {'yes' if gb <= args.mem_gb else 'NO':>3}"
+            print(row, flush=True)
+            del x, t6, text
+        del blk, cblk
+        torch.cuda.empty_cache()
+
+
+if args.sweep:
+    sweep()
+    sys.exit()
