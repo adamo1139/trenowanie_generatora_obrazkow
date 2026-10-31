@@ -258,13 +258,24 @@ def main():
                 mine = ([("te", n) for n, _ in te.named_parameters()] if first else []) + [("den", n) for n in den_names]
                 for e, key in zip(ema, mine):
                     e.copy_(lookup[key])
-        os_ck = torch.load(opt_path, map_location=device, weights_only=True)
-        assert os_ck["step"] == ck["step"], f"{opt_path} is from step {os_ck['step']}, latest.pt from {ck['step']}"
-        for o, st in zip(opts, os_ck["opts"]):
-            load_opt_state(o, st)
-        if repa_proj is not None and os_ck.get("repa_proj"):
-            repa_proj.load_state_dict(os_ck["repa_proj"])
-        outer_state, step = os_ck.get("outer"), ck["step"]
+        # the weights in latest.pt are complete (any --pp works); optimizer state is per stage, so it is only reused
+        # when the stage layout is the same as when it was saved
+        os_ck = torch.load(opt_path, map_location=device, weights_only=True) if os.path.exists(opt_path) else None
+        same = os_ck is not None and os_ck.get("ranges", [list(r) for r in ranges]) == [list(r) for r in ranges] \
+            and len(os_ck["opts"]) == len(opts) and all(
+                [len(g["params"]) for g in st["param_groups"]] == [len(g["params"]) for g in o.param_groups]
+                for o, st in zip(opts, os_ck["opts"]))
+        if same:
+            assert os_ck["step"] == ck["step"], f"{opt_path} is from step {os_ck['step']}, latest.pt from {ck['step']}"
+            for o, st in zip(opts, os_ck["opts"]):
+                load_opt_state(o, st)
+            if repa_proj is not None and os_ck.get("repa_proj"):
+                repa_proj.load_state_dict(os_ck["repa_proj"])
+            outer_state = os_ck.get("outer")
+        else:
+            print(f"rank {rank}: WARNING {opt_path} missing or saved with a different stage layout; weights resumed, "
+                  f"optimizer state starts fresh", flush=True)
+        step = ck["step"]
         log(f"resumed from {ckpt_path} at step {step}")
         del ck
 
@@ -381,7 +392,7 @@ def main():
         if merge_only:
             return
         if replica == 0:  # per-stage optimizer state first, then latest.pt (the step marker) on rank 0
-            torch.save(dict(step=step, opts=[o.state_dict() for o in opts],
+            torch.save(dict(step=step, ranges=[list(r) for r in ranges], opts=[o.state_dict() for o in opts],
                             outer=outer_opt.state_dict() if outer_opt is not None else None,
                             repa_proj={k: v.cpu() for k, v in repa_proj.state_dict().items()} if repa_proj else None),
                        opt_path + ".tmp")
