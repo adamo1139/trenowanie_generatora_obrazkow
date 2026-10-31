@@ -20,6 +20,7 @@ merge.py and tests/check_export.py work unchanged; per-stage optimizer state goe
 MLM is not supported here (use --te-size slayer149, the default).
 """
 import functools
+import logging
 import math
 import os
 import time
@@ -305,6 +306,8 @@ def main():
         import torch._inductor.config as inductor_config
         inductor_config.split_reductions = False
         if args.act_checkpoint:  # compile through the checkpoint so the selective policy applies inside the graph
+            # silence torch's one-time "context_fn ... make sure there are no in-place ops" notice (there are none)
+            logging.getLogger("torch._higher_order_ops.wrap").setLevel(logging.ERROR)
             stage_mod.block_fns = [torch.compile(f, dynamic=False) for f in stage_mod.block_fns]
         else:
             for blk in stage_mod.blocks:
