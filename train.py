@@ -43,6 +43,7 @@ def build_parser():
     p.add_argument("--out", required=True)
     p.add_argument("--size", choices=sorted(SIZES), default="253m",
                    help="denoiser size preset (50m = released model; 116m / 253m = 768x12 / 1024x16)")
+    p.add_argument("--depth", type=int, default=None, help="override the preset's number of denoiser blocks")
     p.add_argument("--te-size", choices=sorted(TE_SIZES), default="slayer149",
                    help="text encoder: 13m = released 384x6, 27m = 512x8 (both trained from scratch, with MLM), "
                         "slayer149 = frozen SlayerLab/Slayer149 + trainable refiner (needs prepare_data.py tokenize "
@@ -426,7 +427,7 @@ def resolve_defaults(args):
     if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf:
         args.mlm_weight = 0.0  # frozen LM: nothing to train with MLM
     if args.repa_layer is None:
-        args.repa_layer = max(1, round(0.3 * SIZES[args.size].depth))
+        args.repa_layer = max(1, round(0.3 * (args.depth or SIZES[args.size].depth)))
     if args.diloco:  # evals, checkpoints and WSM saves happen right after an outer sync
         up = lambda n: n and -(-n // args.diloco) * args.diloco
         args.eval_every, args.ckpt_every = up(args.eval_every), up(args.ckpt_every)
@@ -458,7 +459,8 @@ def main():
 
     # ---- model ---------------------------------------------------------------------------------
     den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size,
-                                                                                      args.te_dim, args.te_depth)
+                                                                                      args.te_dim, args.te_depth,
+                                                                                      args.depth)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)

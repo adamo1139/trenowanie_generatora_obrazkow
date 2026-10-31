@@ -222,7 +222,7 @@ def main():
     args.mlm_weight = 0.0
 
     # ---- model: a meta skeleton everywhere, only this stage's parts are materialised -------------------------------
-    den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth)
+    den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth)
     assert M >= pp, f"need at least {pp} micro-batches"
     ranges = stage_ranges(den_cfg.depth, pp, args.te_cost if pp > 1 else 0.0)
     lo, hi = ranges[s]

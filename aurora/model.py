@@ -352,7 +352,7 @@ TE_SIZES = {
 }
 
 
-def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None):
+def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None, depth: int = None):
     """te_dim / te_depth resize the trainable refiner of an LM text encoder (heads of 64, GQA, SwiGLU 8/3 x dim)."""
     te_cfg = TE_SIZES[te_size]
     if te_dim or te_depth:
@@ -363,7 +363,8 @@ def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = No
         kv_heads = max(d for d in range(1, max(1, heads // 3) + 1) if heads % d == 0)  # GQA, >= 3 q heads per kv
         te_cfg = replace(te_cfg, dim=dim, depth=te_depth or te_cfg.depth, heads=heads, kv_heads=kv_heads,
                          mlp_hidden=-(-dim * 8 // 3 // 128) * 128)
-    return replace(SIZES[size], text_dim=te_cfg.dim), te_cfg
+    den_cfg = replace(SIZES[size], text_dim=te_cfg.dim)
+    return (replace(den_cfg, depth=depth) if depth else den_cfg), te_cfg
 
 
 def te_config_from_dict(d):
