@@ -96,6 +96,13 @@ def build_parser():
                    help="after warmup: constant lr, or cosine to 0 (released recipe)")
     p.add_argument("--momentum", type=float, default=0.95)
     p.add_argument("--ns-steps", type=int, default=5)
+    p.add_argument("--cmuon", action="store_true",
+                   help="CMuon (arXiv:2608.02502): orthogonalise the blocks of fused matrices (qkv, cross-attention kv, "
+                        "SwiGLU gate/up) separately")
+    p.add_argument("--muon-period", type=int, default=1,
+                   help="periodic row-wise Muon (arXiv:2608.20818): Newton-Schulz every K-th step, row-normalised "
+                        "momentum in between (paper: 3; 1 = plain Muon)")
+    p.add_argument("--muon-gamma", type=float, default=0.15, help="scale of the row-wise steps (paper: 0.15)")
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--ema", type=float, default=None,
                    help="EMA decay per step; default 0.9995 ** (batch / 256), i.e. the released recipe's window in samples")
@@ -187,6 +194,26 @@ def make_mlm(ids, prob):
     return ids.masked_fill(m, MASK_ID), ids.masked_fill(~m, -100)
 
 
+def muon_splits(named):
+    """CMuon row blocks of the fused matrices: {param: [sizes]} from (prefix, name, param) triples."""
+    out = {}
+    for _, name, p in named:
+        if p.ndim != 2:
+            continue
+        rows, cols = p.shape
+        if name.endswith("attn.qkv.weight") and (rows - cols) > 0 and (rows - cols) % 2 == 0:
+            out[p] = [cols, (rows - cols) // 2, (rows - cols) // 2]  # q (heads x head_dim = width), k, v (GQA ok)
+        elif name.endswith(("cross.kv.weight", "mlp.in_proj.weight")) and rows % 2 == 0:
+            out[p] = [rows // 2, rows // 2]  # k / v, SwiGLU gate / up
+    return out
+
+
+def make_muon(params, args, named, shard):
+    return Muon(params, lr=args.lr_muon, momentum=args.momentum, ns_steps=args.ns_steps, weight_decay=args.wd,
+                compile_ns=not args.no_compile, shard=shard, splits=muon_splits(named) if args.cmuon else None,
+                period=args.muon_period, gamma=args.muon_gamma)
+
+
 def param_groups(te, den, args, extra=(), named=None):
     """extra: (prefix, module) pairs of additional trainable modules, e.g. the REPA projector (AdamW).
     named: optional list of (prefix, name, param) to group instead of walking the modules (pipeline stages)."""
@@ -213,9 +240,7 @@ def param_groups(te, den, args, extra=(), named=None):
     ]
     opts = []
     if args.optimizer == "muon":
-        opts.append(Muon([dict(params=muon, base_lr=args.lr_muon)], lr=args.lr_muon, momentum=args.momentum,
-                         ns_steps=args.ns_steps, weight_decay=args.wd, compile_ns=not args.no_compile,
-                         shard=not args.diloco))
+        opts.append(make_muon([dict(params=muon, base_lr=args.lr_muon)], args, named, shard=not args.diloco))
     else:
         adam_groups.append(dict(params=muon, base_lr=args.lr_hidden * args.lr_scale, weight_decay=args.wd))
     adam_groups = [g for g in adam_groups if g["params"]]  # e.g. no token embedding with a frozen-LM encoder
@@ -502,7 +527,10 @@ def main():
             f"every {args.repa_every} step(s), until step {int(args.repa_until * args.steps)}")
     extra = [("repa_proj", repa_proj)] if repa_proj is not None else []
     opts, counts = param_groups(te, den, args, extra)
-    log(f"optimizer: {args.optimizer} for hidden matrices; split (params): {counts}")
+    variant = "".join([" (CMuon: fused matrices split)" if args.cmuon else "",
+                       f" (periodic row-wise: Newton-Schulz every {args.muon_period} steps, gamma {args.muon_gamma})"
+                       if args.muon_period > 1 else ""]) if args.optimizer == "muon" else ""
+    log(f"optimizer: {args.optimizer}{variant} for hidden matrices; split (params): {counts}")
     ema_params = list(te.parameters()) + list(den.parameters())  # what EMA / eval / export use
     ema = [p.detach().clone().float() for p in ema_params] if master else None
 

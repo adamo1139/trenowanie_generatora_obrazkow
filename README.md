@@ -10,6 +10,9 @@ Trening od zera małego modelu text-to-image 256×256 według przepisu
   Odtworzenie oryginału: `--size 50m --te-size 13m`.
 - Domyślnie **Muon** (lr 1e-2, WD 0.01, jak w oryginale) dla macierzy ukrytych, AdamW dla reszty, stały lr po warmupie
   + **WSM** (uśrednianie checkpointów zamiast wygaszania lr, `merge.py`). AdamW dla wszystkiego: `--optimizer adamw`.
+  Warianty Muona pod DiT: `--cmuon` ([CMuon](https://arxiv.org/abs/2608.02502): osobna ortogonalizacja bloków
+  macierzy złączonych - q/k/v, k/v cross-attention, gate/up SwiGLU) i `--muon-period 3` ([periodic row-wise
+  Muon](https://arxiv.org/abs/2608.20818): Newton-Schulz co 3. krok, pomiędzy znormalizowane wiersze momentum × 0.15).
 - Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
   **Domyślnie pobieramy i trenujemy na 10%** (~39 GB), żeby najpierw sprawdzić pomysł; `--fraction 1` = całość.
 

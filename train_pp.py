@@ -38,8 +38,8 @@ from aurora.data import ShardStore, TrainStream, load_val, select_shards
 from aurora.model import (Denoiser, LMEncoderConfig, TextEncoder, build_rope_2d, make_configs,
                           te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
-from train import (build_parser, evaluate, outer_sync, init_wandb, load_opt_state, lr_mult, param_groups, peak_tflops,
-                   resolve_defaults, wandb_logged_in)
+from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
+                   peak_tflops, resolve_defaults, wandb_logged_in)
 
 
 def get_args():
@@ -290,9 +290,7 @@ def main():
             dist.broadcast(p.data, s, group=stage_group)
 
     opts, counts = param_groups(None, None, args, named=named)
-    opts = [o if not isinstance(o, Muon) else Muon(o.param_groups, lr=args.lr_muon, momentum=args.momentum,
-                                                   ns_steps=args.ns_steps, weight_decay=args.wd,
-                                                   compile_ns=not args.no_compile, shard=False) for o in opts]
+    opts = [o if not isinstance(o, Muon) else make_muon(o.param_groups, args, named, shard=False) for o in opts]
     keep_ema = replica == 0
     ema = [p.detach().clone().float() for p in model_params] if keep_ema else None
 
