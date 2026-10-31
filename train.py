@@ -735,7 +735,7 @@ def main():
     acc = torch.zeros(5, device=device)  # sum fm, sum mlm, n mlm, sum repa, n repa
     repa_steps = int(args.repa_until * args.steps) if repa_target is not None else 0
     t0, t_last = time.time(), step
-    gns = dict(g2=None, s=None, raw=None)  # gradient noise scale estimates
+    gns = dict(g2=None, s=None, step=None)  # latest gradient noise scale measurement
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
         for micro in range(accum):
@@ -767,9 +767,7 @@ def main():
             # first step after a sync: every worker's gradient is taken at the same weights
             small_sq, big_sq = grad_sq_norms([p.grad for p in params if p.grad is not None], world)
             g2, s = noise_scale(small_sq.item(), big_sq.item(), args.batch // world, args.batch)
-            gns["g2"] = g2 if gns["g2"] is None else 0.7 * gns["g2"] + 0.3 * g2  # ratio of smoothed terms
-            gns["s"] = s if gns["s"] is None else 0.7 * gns["s"] + 0.3 * s
-            gns["raw"] = s / g2 if g2 > 0 else float("nan")
+            gns.update(g2=g2, s=s, step=step)  # latest measurement only, no smoothing
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.clip)
         mult = lr_mult(step, args.steps, warmup, args.schedule)
         for o in opts:
@@ -813,9 +811,9 @@ def main():
             gns_s = ""
             if gns["g2"] is not None:
                 b_noise = gns["s"] / gns["g2"] if gns["g2"] > 0 else float("nan")
-                stats.update({"gns/b_noise": b_noise, "gns/b_noise_raw": gns["raw"], "gns/grad_sq": gns["g2"],
-                              "gns/trace_cov": gns["s"]})
-                gns_s = f" | B_noise ~{b_noise:.0f}"
+                stats.update({"gns/b_noise": b_noise, "gns/grad_sq": gns["g2"], "gns/trace_cov": gns["s"],
+                              "gns/measured_at": gns["step"]})
+                gns_s = f" | B_noise {b_noise:.0f} (step {gns['step']})"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
                 (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
