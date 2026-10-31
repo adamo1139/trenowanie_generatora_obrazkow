@@ -4,6 +4,7 @@ the activations / text tokens (and their gradients) over the inter-GPU link, ass
 
   python tests/bench_shapes.py                      # defaults: --pp 8, --mb 8 16, --gbps 3.0 (PCIe 3.0 x4)
   python tests/bench_shapes.py --mb 16 --gbps 6     # x8 links
+  python tests/bench_shapes.py --size 1.6b 1b --pp 4   # presets from aurora/model.py SIZES
 
 Depths are 8k - 1 (stage 0 also runs the text encoder, ~1 block); text_dim = width (train.py's default refiner).
 """
@@ -17,12 +18,15 @@ sys.path.insert(0, ".")
 import torch._inductor.config as ic
 
 ic.split_reductions = False
-from aurora.model import DenoiserBlock, build_rope_2d
+from aurora.model import SIZES, DenoiserBlock, build_rope_2d
 
 # name: (dim, heads, mlp_hidden, depth)
 SHAPES = {
     "2048x31 hd64 (2b)": (2048, 32, 4864, 31),
     "2048x31 hd128": (2048, 16, 4864, 31),
+    "2048x15 hd64 (1b)": (2048, 32, 4864, 15),
+    "2560x7 hd128": (2560, 20, 6912, 7),
+    "2560x15 hd128": (2560, 20, 6912, 15),
     "2560x23 hd128": (2560, 20, 6912, 23),
     "2560x31 hd128": (2560, 20, 6912, 31),
     "3072x15 hd128": (3072, 24, 8192, 15),
@@ -35,7 +39,11 @@ p.add_argument("--mb", type=int, nargs="+", default=[8, 16])
 p.add_argument("--gbps", type=float, default=3.0, help="effective GPU-to-GPU bandwidth per direction, GB/s")
 p.add_argument("--peak", type=float, default=153.0, help="GPU peak TFLOPS, for MFU (3090 Ti, fp32-acc unlocked)")
 p.add_argument("--only", nargs="*", default=None, help="substrings of shape names to run")
+p.add_argument("--size", nargs="+", choices=sorted(SIZES), default=None, help="benchmark these presets instead")
 args = p.parse_args()
+if args.size:
+    SHAPES = {f"{s} ({SIZES[s].dim}x{SIZES[s].depth})": (SIZES[s].dim, SIZES[s].heads, SIZES[s].mlp_hidden,
+                                                          SIZES[s].depth) for s in args.size}
 dev, T, Tt = "cuda", 256, 96
 
 
@@ -47,7 +55,7 @@ def block_flops(dim, heads, mlp, text_dim, mb):
 
 
 print(f"GPU {torch.cuda.get_device_name()}, pp {args.pp}, link {args.gbps} GB/s, peak {args.peak} TFLOPS\n")
-print(f"{'shape':<20} {'params':>7} {'mb':>3} {'block ms':>9} {'block TF':>9} {'comm ms':>8} {'stage TF':>9} {'MFU':>5}")
+print(f"{'shape':<20} {'params':>7} {'blk/st':>6} {'mb':>3} {'block ms':>9} {'block TF':>9} {'comm ms':>8} {'stage TF':>9} {'MFU':>5}")
 for name, (dim, heads, mlp, depth) in SHAPES.items():
     if args.only and not any(o in name for o in args.only):
         continue
@@ -60,7 +68,7 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
     n_block = sum(q.numel() for q in blk.parameters())
     cblk = torch.compile(blk, dynamic=False)
     cos, sin = (u.to(dev) for u in build_rope_2d(16, dim // heads))
-    bps = (depth + 1) // args.pp  # blocks per stage (stage 0: one fewer + text encoder)
+    bps = max(1, (depth + 1) // args.pp)  # blocks per stage (stage 0: one fewer + text encoder)
     for mb in args.mb:
         x = torch.randn(mb, T, dim, device=dev, dtype=torch.bfloat16, requires_grad=True)
         t6 = torch.randn(mb, 6, dim, device=dev, dtype=torch.bfloat16)
@@ -88,7 +96,7 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
         # per hop: x, t6, text, mask forward + their gradients back, bf16
         comm = 2 * 2 * mb * (T * dim + 6 * dim + Tt * text_dim + Tt) / (args.gbps * 1e9) * 1000
         stage_tf = bps * fl / ((bps * ms + comm) / 1000) / 1e12
-        print(f"{name:<20} {n_block * depth / 1e9:6.2f}B {mb:>3} {ms:9.1f} {fl / ms / 1e9:9.1f} {comm:8.1f} "
+        print(f"{name:<20} {n_block * depth / 1e9:6.2f}B {bps:>6} {mb:>3} {ms:9.1f} {fl / ms / 1e9:9.1f} {comm:8.1f} "
               f"{stage_tf:9.1f} {stage_tf / args.peak:5.0%}", flush=True)
     del blk, cblk
     torch.cuda.empty_cache()
