@@ -37,7 +37,7 @@ from aurora.model import (SIZES, TE_SIZES, DenoiserConfig, LMEncoderConfig, Text
 from aurora.muon import Muon
 
 
-def get_args():
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/aurora")
     p.add_argument("--out", required=True)
@@ -131,7 +131,11 @@ def get_args():
     p.add_argument("--per-shard", type=int, default=0,
                    help="--eval-only: also report loss per shard (N samples each) for the val shards and for the first "
                         "and a middle training shard of every subset, to tell generalisation from memorisation")
-    return p.parse_args()
+    return p
+
+
+def get_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 class FlowModel(nn.Module):
@@ -173,22 +177,25 @@ def make_mlm(ids, prob):
     return ids.masked_fill(m, MASK_ID), ids.masked_fill(~m, -100)
 
 
-def param_groups(te, den, args, extra=()):
-    """extra: (prefix, module) pairs of additional trainable modules, e.g. the REPA projector (AdamW)."""
+def param_groups(te, den, args, extra=(), named=None):
+    """extra: (prefix, module) pairs of additional trainable modules, e.g. the REPA projector (AdamW).
+    named: optional list of (prefix, name, param) to group instead of walking the modules (pipeline stages)."""
     muon, emb, proj, other = [], [], [], []
-    for prefix, mod in (("te", te), ("den", den), *extra):
-        for name, p in mod.named_parameters():
-            if not p.requires_grad:
-                continue
-            full = f"{prefix}.{name}"
-            if full == "te.token_embedding.weight":
-                emb.append(p)
-            elif prefix in ("te", "den") and ".blocks." in f".{name}" and p.ndim == 2 and not name.endswith("mod_table"):
-                muon.append(p)  # hidden matrices: attention, cross-attention, MLP
-            elif p.ndim == 2 and not name.endswith("mod_table"):
-                proj.append(p)  # patch_in / patch_out / time_mlp / ada
-            else:
-                other.append(p)  # norms, mod tables, biases
+    if named is None:
+        named = [(prefix, name, p) for prefix, mod in (("te", te), ("den", den), *extra)
+                 for name, p in mod.named_parameters()]
+    for prefix, name, p in named:
+        if not p.requires_grad:
+            continue
+        full = f"{prefix}.{name}"
+        if full == "te.token_embedding.weight":
+            emb.append(p)
+        elif prefix in ("te", "den") and ".blocks." in f".{name}" and p.ndim == 2 and not name.endswith("mod_table"):
+            muon.append(p)  # hidden matrices: attention, cross-attention, MLP
+        elif p.ndim == 2 and not name.endswith("mod_table"):
+            proj.append(p)  # patch_in / patch_out / time_mlp / ada
+        else:
+            other.append(p)  # norms, mod tables, biases
     adam_groups = [
         dict(params=emb, base_lr=args.lr_emb * args.lr_scale, weight_decay=0.0),
         dict(params=proj, base_lr=args.lr_adam * args.lr_scale, weight_decay=args.wd),

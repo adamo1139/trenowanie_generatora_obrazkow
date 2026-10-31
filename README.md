@@ -69,6 +69,23 @@ python export.py runs/aurora/merged.pt exports/aurora
 python sample.py exports/aurora --out grid.png
 ```
 
+## Duże modele: pipeline parallel (1F1B), `train_pp.py`
+
+Bloki DiT dzielone na `--pp` kart (Schedule1F1B z `torch.distributed.pipelining`). Stage 0 ma też text encoder, projekcję
+czasu i `patch_in`, ostatni stage `norm`, `patch_out` i stratę. Między kartami idą stany tokenów, modulacja czasu, tokeny
+tekstu i maska (oraz ich gradienty), REPA liczy się w stage'u z wybranym blokiem. Presety: `--size 1b / 1.5b / 2b`
+(szerokość 2048, 16/24/32 bloki). Checkpointy są zbierane na rank 0 w tym samym formacie co z `train.py`, więc `export.py`,
+`merge.py` i `tests/check_export.py` działają bez zmian; stan optymalizatora per stage w `<out>/opt_stage<s>.pt`.
+
+```bash
+NCCL_P2P_LEVEL=SYS torchrun --nproc_per_node 8 train_pp.py --data data/aurora_full --fraction 1 --size 1.5b \
+  --pp 8 --batch 512 --microbatches 32 --out runs/1p5b
+# OOM: --act-checkpoint albo więcej mikro-batchy (--microbatches 64); 2 potoki po 4 karty: --pp 4 (+ --diloco H)
+```
+
+`tests/check_pp.py` (CPU, gloo, `torchrun --nproc_per_node 1/2/4`) sprawdza, że straty i gradienty (z REPA) są identyczne
+jak w niepodzielonym modelu.
+
 ## NCCL na kartach GeForce
 
 Najpierw sprawdzić samą komunikację między kartami (kilka sekund, bez danych i modelu):

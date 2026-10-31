@@ -289,6 +289,14 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        self.init_stem()
+        for block in self.blocks:
+            self.init_block(block)
+        self.init_head()
+
+    # split so that pipeline stages can initialise only the parts they own (train_pp.py)
+    @torch.no_grad()
+    def init_stem(self):
         nn.init.normal_(self.patch_in.weight, std=self.patch_in.in_features ** -0.5)
         for lin in (self.time_mlp[0], self.time_mlp[2]):
             nn.init.normal_(lin.weight, std=0.02)
@@ -299,12 +307,21 @@ class Denoiser(nn.Module):
         # other, so self-attention and the MLP would never train (the bug behind the ~1.09 plateau, see PROBLEM.md).
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
-        for block in self.blocks:
-            for lin in (block.attn.qkv, block.attn.out, block.cross.q, block.cross.kv, block.mlp.in_proj,
-                        block.mlp.out_proj):
-                nn.init.normal_(lin.weight, std=lin.in_features ** -0.5)
-            nn.init.zeros_(block.mod_table)
-            nn.init.zeros_(block.cross.out.weight)  # cross-attn is ungated: its zero output still gets a gradient
+
+    @staticmethod
+    @torch.no_grad()
+    def init_block(block):
+        for lin in (block.attn.qkv, block.attn.out, block.cross.q, block.cross.kv, block.mlp.in_proj,
+                    block.mlp.out_proj):
+            nn.init.normal_(lin.weight, std=lin.in_features ** -0.5)
+        for norm in (block.norm1, block.norm2, block.norm3, block.attn.q_norm, block.attn.k_norm):
+            nn.init.ones_(norm.weight)
+        nn.init.zeros_(block.mod_table)
+        nn.init.zeros_(block.cross.out.weight)  # cross-attn is ungated: its zero output still gets a gradient
+
+    @torch.no_grad()
+    def init_head(self):
+        nn.init.ones_(self.norm.weight)
         nn.init.zeros_(self.patch_out.weight)
 
 
@@ -313,6 +330,11 @@ SIZES = {
     "50m": DenoiserConfig(),
     "116m": DenoiserConfig(dim=768, depth=12, heads=12, mlp_hidden=1792),
     "253m": DenoiserConfig(dim=1024, depth=16, heads=16, mlp_hidden=2432),
+    # wide models for pipeline-parallel training (train_pp.py): width 2048, 32 heads of 64, MLP 2.375x
+    # (~58M params per block with a 768-wide text encoder)
+    "1b": DenoiserConfig(dim=2048, depth=16, heads=32, mlp_hidden=4864),
+    "1.5b": DenoiserConfig(dim=2048, depth=24, heads=32, mlp_hidden=4864),
+    "2b": DenoiserConfig(dim=2048, depth=32, heads=32, mlp_hidden=4864),
 }
 
 
