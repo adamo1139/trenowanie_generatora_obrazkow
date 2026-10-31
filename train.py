@@ -607,7 +607,7 @@ def main():
     # ---- resume --------------------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
     ckpt_path = os.path.join(args.out, "latest.pt")
-    step = 0
+    step = samples = 0  # samples: images seen, so a resume with another --batch continues at the same data position
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         assert ck["den_config"] == asdict(den_cfg), f"checkpoint was trained with {ck['den_config']}"
@@ -622,8 +622,10 @@ def main():
             for e, v in zip(ema, ck["ema"]):
                 e.copy_(v)
         step = ck["step"]
+        samples = ck.get("samples", step * (ck.get("args") or {}).get("batch", args.batch))
         outer_state = ck.get("outer")
-        log(f"resumed from {ckpt_path} at step {step}")
+        log(f"resumed from {ckpt_path} at step {step}, {samples:,} images seen (continuing the data stream from "
+            f"there; with --batch {args.batch} each further image budget N takes N / {args.batch} steps)")
         del ck
     else:
         outer_state = None
@@ -673,7 +675,7 @@ def main():
                 log("warning: PowerSGD with Muon - Muon orthogonalises the low-rank gradient, prefer --optimizer adamw")
     params = [p for p in model.parameters() if p.requires_grad]
 
-    stream = TrainStream(store, mb, rank, world, args.seed, start_micro=step * accum)
+    stream = TrainStream(store, mb, rank, world, args.seed, start_micro=samples // (mb * world))
     loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                               pin_memory=True, prefetch_factor=2 if args.workers else None,
                                               persistent_workers=args.workers > 0))
@@ -691,7 +693,7 @@ def main():
             return
         sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
         tmp = ckpt_path + ".tmp"
-        torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
+        torch.save(dict(step=step, samples=samples, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
                         ema=[e.cpu() for e in ema], args=vars(args),
                         outer=outer_opt.state_dict() if args.diloco else None,
                         repa_proj=sd(repa_proj) if repa_proj is not None else None), tmp)
@@ -776,6 +778,7 @@ def main():
             o.step()
             o.zero_grad(set_to_none=True)
         step += 1
+        samples += args.batch
         if args.diloco:
             if step % args.diloco == 0 or step == args.steps:
                 outer_sync(global_params, live, outer_opt, world if distributed else 1, args.outer_comm)
@@ -797,7 +800,7 @@ def main():
                 acc /= world
             n = step - t_last
             dt = time.time() - t0
-            stats = {"train/samples": step * args.batch, "train/epoch": step * args.batch / len(store),
+            stats = {"train/samples": samples, "train/epoch": samples / len(store),
                      "train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),
                      "train/loss_repa": (acc[3] / acc[4].clamp(min=1e-9)).item(),
                      "train/grad_norm": gnorm.item(), "lr_mult": mult, "steps_per_s": n / dt,
@@ -829,7 +832,7 @@ def main():
             res = ema_eval()
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
-                wb.log({**res, "train/samples": step * args.batch}, step=step)
+                wb.log({**res, "train/samples": samples}, step=step)
         if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
             save()
         if master and args.merge_every and step >= args.merge_start * args.steps and (
