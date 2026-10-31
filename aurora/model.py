@@ -339,6 +339,11 @@ SIZES = {
     "2b": DenoiserConfig(dim=2048, depth=31, heads=32, mlp_hidden=4864),
     # width 2560 (head dim 128): bigger GEMMs, best TFLOPS per stage on the 3090 Ti PCIe box (tests/bench_shapes.py)
     "750m": DenoiserConfig(dim=2560, depth=7, heads=20, mlp_hidden=6912),  # fits one GPU: train.py + MuLoCo
+    # ~0.75B at less extreme width / depth ratios (head dim 128, SwiGLU 8/3 x width); 2560x7 above is 366
+    "750m-w2048": DenoiserConfig(dim=2048, depth=11, heads=16, mlp_hidden=5504),  # ratio 186
+    "750m-w1792": DenoiserConfig(dim=1792, depth=15, heads=14, mlp_hidden=4864),  # ratio 119
+    "750m-w1536": DenoiserConfig(dim=1536, depth=20, heads=12, mlp_hidden=4096),  # ratio 77 (like 253m)
+    "750m-w1280": DenoiserConfig(dim=1280, depth=30, heads=10, mlp_hidden=3456),  # ratio 43 (like DiT-XL)
     "1.6b": DenoiserConfig(dim=2560, depth=15, heads=20, mlp_hidden=6912),
     "2.4b": DenoiserConfig(dim=2560, depth=23, heads=20, mlp_hidden=6912),
 }

@@ -5,8 +5,10 @@ the activations / text tokens (and their gradients) over the inter-GPU link, ass
   python tests/bench_shapes.py                      # defaults: --pp 8, --mb 8 16, --gbps 3.0 (PCIe 3.0 x4)
   python tests/bench_shapes.py --mb 16 --gbps 6     # x8 links
   python tests/bench_shapes.py --size 1.6b 1b --pp 4   # presets from aurora/model.py SIZES
+  python tests/bench_shapes.py --pp 1 --size 750m 750m-w2048 750m-w1792 750m-w1536 750m-w1280   # train.py, no pipeline
 
-Depths are 8k - 1 (stage 0 also runs the text encoder, ~1 block); text_dim = width (train.py's default refiner).
+Depths are 8k - 1 (stage 0 also runs the text encoder, ~1 block); text_dim = width / 2 (train.py's default refiner).
+--pp 1 = plain train.py (whole model per GPU): no link cost, stage = the whole stack.
 """
 import argparse
 import sys
@@ -59,7 +61,7 @@ print(f"{'shape':<20} {'params':>7} {'blk/st':>6} {'mb':>3} {'block ms':>9} {'bl
 for name, (dim, heads, mlp, depth) in SHAPES.items():
     if args.only and not any(o in name for o in args.only):
         continue
-    text_dim = dim
+    text_dim = dim // 2
     torch.manual_seed(0)
     blk = DenoiserBlock(dim, heads, text_dim, mlp).to(dev)
     with torch.no_grad():
@@ -68,7 +70,7 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
     n_block = sum(q.numel() for q in blk.parameters())
     cblk = torch.compile(blk, dynamic=False)
     cos, sin = (u.to(dev) for u in build_rope_2d(16, dim // heads))
-    bps = max(1, (depth + 1) // args.pp)  # blocks per stage (stage 0: one fewer + text encoder)
+    bps = depth if args.pp == 1 else max(1, (depth + 1) // args.pp)  # blocks per stage (stage 0: one fewer + TE)
     for mb in args.mb:
         x = torch.randn(mb, T, dim, device=dev, dtype=torch.bfloat16, requires_grad=True)
         t6 = torch.randn(mb, 6, dim, device=dev, dtype=torch.bfloat16)
@@ -94,7 +96,7 @@ for name, (dim, heads, mlp, depth) in SHAPES.items():
         ms = (time.time() - t0) / 10 * 1000
         fl = block_flops(dim, heads, mlp, text_dim, mb)
         # per hop: x, t6, text, mask forward + their gradients back, bf16
-        comm = 2 * 2 * mb * (T * dim + 6 * dim + Tt * text_dim + Tt) / (args.gbps * 1e9) * 1000
+        comm = 0.0 if args.pp == 1 else 2 * 2 * mb * (T * dim + 6 * dim + Tt * text_dim + Tt) / (args.gbps * 1e9) * 1000
         stage_tf = bps * fl / ((bps * ms + comm) / 1000) / 1e12
         print(f"{name:<20} {n_block * depth / 1e9:6.2f}B {bps:>6} {mb:>3} {ms:9.1f} {fl / ms / 1e9:9.1f} {comm:8.1f} "
               f"{stage_tf:9.1f} {stage_tf / args.peak:5.0%}", flush=True)
