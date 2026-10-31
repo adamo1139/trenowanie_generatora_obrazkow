@@ -822,7 +822,7 @@ def main():
             aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
                 (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {aux}"
-                f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
+                f"grad_norm {stats['train/grad_norm']:.3f} | {f'lr x{mult:.3f} | ' if mult != 1.0 else ''}"
                 f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | "
                 f"eta {eta_h:.1f} h{gns_s}", flush=True)
             if wb:

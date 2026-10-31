@@ -601,7 +601,7 @@ def main():
                 stats.update({"mem_peak_gb": all_mem[worst, 0].item(), "alloc_retries": retries})
                 mem_s = f" | mem {all_mem[worst, 0]:.1f} GB (GPU {worst}){f', ALLOC RETRIES {retries}' if retries else ''}"
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
-                f"lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s {stats['imgs_per_s']:.0f} img/s | "
+                f"{f'lr x{mult:.3f} | ' if mult != 1.0 else ''}{stats['imgs_per_s']:.0f} img/s | "
                 f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
                 flush=True)
             if wb:
