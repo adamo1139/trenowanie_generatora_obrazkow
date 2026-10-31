@@ -42,7 +42,8 @@ https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszy
   [PE-Spatial-B16](https://huggingface.co/facebook/PE-Spatial-B16-512) (Apache-2.0) z obrazka zdekodowanego z latentu.
   Dekoder jest drogi, więc REPA liczy się tylko dla 25% każdego micro-batcha (`--repa-frac`) i przez pierwsze 40%
   treningu (`--repa-until`). `--repa-weight 0` wyłącza.
-- Eksport modeli z enkoderem Slayer149 do formatu diffusers nie jest jeszcze zaimplementowany.
+- Eksport (`export.py`) pakuje użyte warstwy Slayer149 i jego tokenizer do repo, a `pipeline.py` (`aurora/hf_pipeline.py`)
+  obsługuje oba enkodery; `tests/check_export.py` sprawdza zgodność z modułami treningowymi.
 
 ## Szybki start
 
