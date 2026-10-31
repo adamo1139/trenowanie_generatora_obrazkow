@@ -13,6 +13,12 @@ Theorem 3.1 of the paper: merging checkpoints theta_0..theta_k (theta_0 = start 
 c_0 = 1 - w_1, c_j = w_j - w_{j+1}, c_k = w_k is equivalent to having scaled the gradient updates between them by the
 non-increasing decay coefficients w_1..w_k. The paper finds 1-sqrt best, mean (= linear decay) close, EMA clearly worse,
 and the window length (merge duration) the most important knob.
+
+QAM (Quadratic-Accurate checkpoint Merging, arXiv:2609.35168) uses the same checkpoints and the same update profile
+W_j (= the decay coefficient w_j above), but builds the weights from the polynomial
+  Q_W(t) = prod_j (1 - W_j + W_j t) = sum_i q_i t^i,   theta = sum_i q_i theta_i,
+which matches the sequential (decayed) run to second order instead of first. The paper reports it beating WSM mostly on
+intermediate / long windows (>= ~10 checkpoints); on short windows the two are close. `--methods` picks which to try.
 """
 import argparse
 import glob
@@ -32,13 +38,26 @@ DECAYS = {  # lr multiplier as a function of progress p in (0, 1) through the wi
 }
 
 
-def merge_weights(scheme: str, n_ckpts: int):
-    """Weights c_0..c_k (k = n_ckpts - 1) for checkpoints ordered old -> new."""
+def profile(scheme: str, k: int):
+    """Update strength of each of the k intervals between k + 1 checkpoints (non-increasing, in [0, 1])."""
+    return [DECAYS[scheme](i / (k + 1)) for i in range(1, k + 1)]
+
+
+def merge_weights(scheme: str, n_ckpts: int, method: str = "wsm"):
+    """Weights for checkpoints ordered old -> new; non-negative, sum to 1."""
     k = n_ckpts - 1
     if k == 0:
         return [1.0]
-    w = [DECAYS[scheme](i / (k + 1)) for i in range(1, k + 1)]  # decay coefficient of interval i
-    c = [1 - w[0]] + [w[j] - w[j + 1] for j in range(k - 1)] + [w[-1]]
+    w = profile(scheme, k)
+    if method == "wsm":  # Theorem 3.1 of the WSM paper
+        c = [1 - w[0]] + [w[j] - w[j + 1] for j in range(k - 1)] + [w[-1]]
+    elif method == "qam":  # coefficients of prod_j (1 - W_j + W_j t)
+        c = [1.0]
+        for wj in w:
+            c = [(1 - wj) * (c[i] if i < len(c) else 0.0) + wj * (c[i - 1] if i > 0 else 0.0)
+                 for i in range(len(c) + 1)]
+    else:
+        raise ValueError(method)
     assert all(x >= -1e-9 for x in c) and abs(sum(c) - 1) < 1e-6
     return c
 
@@ -47,6 +66,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("run", help="training output dir (contains merge/ and latest.pt)")
     p.add_argument("--schemes", default="1-sqrt,mean,cosine")
+    p.add_argument("--methods", default="wsm,qam", help="wsm (first-order) and/or qam (second-order, arXiv:2609.35168)")
     p.add_argument("--windows", default="0.04,0.08,0.12,0.2",
                    help="merge durations as fractions of the whole training run (counted back from the last step)")
     p.add_argument("--data", default="data/aurora")
@@ -65,7 +85,9 @@ def main():
     for window in (float(x) for x in args.windows.split(",")):
         idx = [i for i, s in enumerate(steps) if s >= last - window * total]
         for scheme in args.schemes.split(","):
-            combos.append(dict(scheme=scheme, window=window, idx=idx, c=merge_weights(scheme, len(idx))))
+            for method in args.methods.split(","):
+                combos.append(dict(method=method, scheme=scheme, window=window, idx=idx,
+                                   c=merge_weights(scheme, len(idx), method)))
 
     # stream checkpoints once, accumulating every combination (fp32, on GPU)
     dev = "cuda"
@@ -104,7 +126,7 @@ def main():
         den_sd = {k: v for (part, k), v in cb["acc"].items() if part == "den"}
         loss = score(te_sd, den_sd)
         results.append((loss, cb, te_sd, den_sd))
-        label = f"WSM {cb['scheme']:7s} window {cb['window']:.0%} ({len(cb['idx'])} ckpt)"
+        label = f"{cb['method'].upper()} {cb['scheme']:7s} window {cb['window']:.0%} ({len(cb['idx'])} ckpt)"
         print(f"{label:34s} val/loss {loss:.5f}")
 
     loss, cb, te_sd, den_sd = min(results, key=lambda r: r[0])
@@ -114,9 +136,9 @@ def main():
     # same layout as a training checkpoint; "ema" holds the merged weights too, so export.py picks them by default
     torch.save(dict(step=last, den_config=meta[0]["den_config"], te_config=meta[0].get("te_config", {}), te=te_sd, den=den_sd,
                     ema=list(te_sd.values()) + list(den_sd.values()),
-                    wsm=dict(scheme=cb["scheme"], window=cb["window"], steps=[steps[i] for i in cb["idx"]],
+                    wsm=dict(method=cb["method"], scheme=cb["scheme"], window=cb["window"], steps=[steps[i] for i in cb["idx"]],
                              weights=cb["c"], val_loss=loss)), out)
-    print(f"best: {cb['scheme']} window {cb['window']:.0%} val/loss {loss:.5f} -> {out}")
+    print(f"best: {cb['method'].upper()} {cb['scheme']} window {cb['window']:.0%} val/loss {loss:.5f} -> {out}")
 
 
 if __name__ == "__main__":
