@@ -108,7 +108,7 @@ def build_parser():
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--log-every", type=int, default=None, help="default: steps / 40, at most 100")
     p.add_argument("--eval-every", type=int, default=None, help="default: steps / 20")
     p.add_argument("--ckpt-every", type=int, default=None,
                    help="overwrite <out>/latest.pt (full state, for resuming); default: steps / 50")
@@ -370,6 +370,8 @@ def resolve_defaults(args):
     args.lr_scale = 1.0 if args.no_lr_batch_scaling else math.sqrt(lr_ratio)
     if args.ema is None:
         args.ema = 0.9995 ** ref_ratio
+    if args.log_every is None:
+        args.log_every = min(100, max(1, args.steps // 40))
     if args.eval_every is None:
         args.eval_every = max(1, args.steps // 20)
     if args.ckpt_every is None:
