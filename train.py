@@ -48,7 +48,7 @@ def build_parser():
                         "slayer149 = frozen SlayerLab/Slayer149 + trainable refiner (needs prepare_data.py tokenize "
                         "--encoder slayer149)")
     p.add_argument("--te-dim", type=int, default=None,
-                   help="LM text encoder: refiner width (default: the denoiser width; 768 + --te-depth 2 = the "
+                   help="LM text encoder: refiner width (default: half the denoiser width; 768 + --te-depth 2 = the "
                         "original ~13M refiner, needed to resume older runs)")
     p.add_argument("--te-depth", type=int, default=None, help="LM text encoder: refiner blocks (default 2)")
     p.add_argument("--repa-weight", type=float, default=0.5, help="REPA loss weight (0 = off)")
@@ -392,7 +392,7 @@ def resolve_defaults(args):
     if args.wd is None:
         args.wd = 0.1 if args.optimizer == "adamw" else 0.01
     if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf and args.te_dim is None:
-        args.te_dim = SIZES[args.size].dim  # refiner at the denoiser width (Lumina-2 / Z-Image style context refiner)
+        args.te_dim = SIZES[args.size].dim // 2  # refiner at half the denoiser width (2b: 1024, 750m: 1280)
     if isinstance(TE_SIZES[args.te_size], LMEncoderConfig) and not args.load_hf:
         args.mlm_weight = 0.0  # frozen LM: nothing to train with MLM
     if args.repa_layer is None:

@@ -35,8 +35,8 @@ https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszy
 ## Text encoder: Slayer149 (zamrożony) + REPA z DINOv2-B/14 (domyślnie)
 
 - `--te-size slayer149` (domyślnie): zamrożony [SlayerLab/Slayer149](https://huggingface.co/SlayerLab/Slayer149) (149M,
-  angielski) + trenowany refiner: domyślnie 2 bloki o szerokości denoisera (dla 2B ~90M; w PP siedzi na stage'u 0,
-  więc większy go spowalnia), `--te-dim` / `--te-depth` zmieniają rozmiar, `--te-dim 768 --te-depth 2` = dawny ~13M
+  angielski) + trenowany refiner: domyślnie 2 bloki o połowie szerokości denoisera (2B: 1024, ~25M; 750m:
+  1280, ~36M; w PP siedzi na stage'u 0, więc większy go spowalnia), `--te-dim` / `--te-depth` zmieniają rozmiar, `--te-dim 768 --te-depth 2` = dawny ~13M
   (potrzebne do wznowienia starszych runów). Wymaga osobnej tokenizacji captionów (obok istniejącej):
   `python prepare_data.py tokenize --data data/aurora_full --encoder slayer149`.
   `--te-size 13m` / `27m` to dawne enkodery trenowane od zera (z MLM).
