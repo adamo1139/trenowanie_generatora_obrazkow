@@ -265,6 +265,36 @@ def lr_mult(step, total, warmup, schedule):
 
 
 @torch.no_grad()
+def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucket=64 * 2**20):
+    """DiLoCo / MuLoCo outer step: pseudo-gradient = global - local weights, averaged over the n workers of `group`,
+    applied by `outer_opt` (elementwise SGD) to the global weights, which then replace the local ones. Done in buckets
+    of ~`bucket` elements so the extra memory is a few hundred MB instead of several copies of the whole model."""
+    idx, out = [], []
+    for i, g in enumerate(global_params):
+        idx.append(i)
+        if sum(global_params[j].numel() for j in idx) >= bucket or i == len(global_params) - 1:
+            out.append(idx)
+            idx = []
+    for chunk in out:
+        flat = torch.cat([(global_params[i] - live[i].detach().float()).flatten() for i in chunk])
+        if dist.is_initialized() and n > 1:
+            if comm == "bf16":
+                flat_c = flat.bfloat16()
+                dist.all_reduce(flat_c, group=group)
+                flat.copy_(flat_c)
+                del flat_c
+            else:
+                dist.all_reduce(flat, group=group)
+            flat /= n
+        for i, d in zip(chunk, flat.split([global_params[i].numel() for i in chunk])):
+            global_params[i].grad = d.view_as(global_params[i])
+        outer_opt.step()  # params without a grad (other buckets) are skipped
+        outer_opt.zero_grad(set_to_none=True)
+        del flat
+        torch._foreach_copy_([live[i] for i in chunk], [global_params[i] for i in chunk])
+
+
+@torch.no_grad()
 def evaluate(te, den, val, device, seed=1234, chunk=256):
     """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs."""
     lat, ids = val
@@ -577,24 +607,6 @@ def main():
         os.replace(path + ".tmp", path)
 
     @torch.no_grad()
-    def outer_sync():
-        """DiLoCo outer step: pseudo-gradient = global - local weights, averaged over workers, applied with Nesterov
-        SGD to the global weights, which then replace every worker's local weights."""
-        deltas = [g - p.detach().float() for g, p in zip(global_params, live)]
-        flat = torch.cat([d.flatten() for d in deltas])
-        if distributed:
-            if args.outer_comm == "bf16":
-                flat_c = flat.bfloat16()
-                dist.all_reduce(flat_c)
-                flat = flat_c.float()
-            else:
-                dist.all_reduce(flat)
-            flat /= world
-        for g, d in zip(global_params, flat.split([d.numel() for d in deltas])):
-            g.grad = d.view_as(g)
-        outer_opt.step()
-        outer_opt.zero_grad(set_to_none=True)
-        torch._foreach_copy_(live, global_params)
 
     @torch.no_grad()
     def ema_eval():
@@ -654,7 +666,7 @@ def main():
         step += 1
         if args.diloco:
             if step % args.diloco == 0 or step == args.steps:
-                outer_sync()
+                outer_sync(global_params, live, outer_opt, world if distributed else 1, args.outer_comm)
                 if master:  # EMA of the global weights, same window in samples as the per-step EMA
                     n = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n) / (10 + n))

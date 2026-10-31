@@ -38,7 +38,7 @@ from aurora.data import ShardStore, TrainStream, load_val, select_shards
 from aurora.model import (Denoiser, LMEncoderConfig, TextEncoder, build_rope_2d, make_configs,
                           te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
-from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, param_groups, peak_tflops,
+from train import (build_parser, evaluate, outer_sync, init_wandb, load_opt_state, lr_mult, param_groups, peak_tflops,
                    resolve_defaults, wandb_logged_in)
 
 
@@ -487,23 +487,6 @@ def main():
             torch.cuda.empty_cache()
         return res
 
-    @torch.no_grad()
-    def outer_sync():
-        deltas = [g - p.detach().float() for g, p in zip(global_params, params)]
-        flat = torch.cat([d.flatten() for d in deltas])
-        if args.outer_comm == "bf16":
-            flat_c = flat.bfloat16()
-            dist.all_reduce(flat_c, group=stage_group)
-            flat = flat_c.float()
-        else:
-            dist.all_reduce(flat, group=stage_group)
-        flat /= replicas
-        for g, d in zip(global_params, flat.split([d.numel() for d in deltas])):
-            g.grad = d.view_as(g)
-        outer_opt.step()
-        outer_opt.zero_grad(set_to_none=True)
-        torch._foreach_copy_(params, global_params)
-
     warmup = max(1, int(args.warmup_frac * args.steps))
     repa_steps = int(args.repa_until * args.steps) if args.repa_weight > 0 else 0
     if args.repa_weight > 0:
@@ -581,7 +564,7 @@ def main():
         step += 1
         if outer_opt is not None:
             if step % args.diloco == 0 or step == args.steps:
-                outer_sync()
+                outer_sync(global_params, params, outer_opt, replicas, args.outer_comm, stage_group)
                 if keep_ema:
                     n_sync = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n_sync) / (10 + n_sync))
