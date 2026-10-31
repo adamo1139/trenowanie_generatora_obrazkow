@@ -735,7 +735,7 @@ def main():
     acc = torch.zeros(5, device=device)  # sum fm, sum mlm, n mlm, sum repa, n repa
     repa_steps = int(args.repa_until * args.steps) if repa_target is not None else 0
     t0, t_last = time.time(), step
-    gns = dict(g2=None, s=None, step=None)  # latest gradient noise scale measurement
+    gns = dict(g2=None, s=None, step=None, new=False)  # latest gradient noise scale measurement
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
         for micro in range(accum):
@@ -767,7 +767,7 @@ def main():
             # first step after a sync: every worker's gradient is taken at the same weights
             small_sq, big_sq = grad_sq_norms([p.grad for p in params if p.grad is not None], world)
             g2, s = noise_scale(small_sq.item(), big_sq.item(), args.batch // world, args.batch)
-            gns.update(g2=g2, s=s, step=step)  # latest measurement only, no smoothing
+            gns.update(g2=g2, s=s, step=step, new=True)  # latest measurement only, no smoothing
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.clip)
         mult = lr_mult(step, args.steps, warmup, args.schedule)
         for o in opts:
@@ -809,7 +809,8 @@ def main():
                 mfu = f" MFU {stats['mfu']:.0%}"
             stats.update(wrms_stats(weight_sq(wrms_named, device)))  # this rank's weights (MuLoCo: worker 0's)
             gns_s = ""
-            if gns["g2"] is not None:
+            if gns["new"]:  # only on the log line right after a measurement
+                gns["new"] = False
                 b_noise = gns["s"] / gns["g2"] if gns["g2"] > 0 else float("nan")
                 stats.update({"gns/b_noise": b_noise, "gns/grad_sq": gns["g2"], "gns/trace_cov": gns["s"],
                               "gns/measured_at": gns["step"]})
