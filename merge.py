@@ -89,18 +89,22 @@ def main():
                 combos.append(dict(method=method, scheme=scheme, window=window, idx=idx,
                                    c=merge_weights(scheme, len(idx), method)))
 
-    # stream checkpoints once, accumulating every combination (fp32, on GPU)
+    # checkpoints used by any combination go to the GPU once (bf16 copies would lose the small differences between
+    # neighbouring checkpoints, so fp32); every combination is then built in ONE reused buffer, scored, and only the
+    # best one is kept (on the CPU). GPU memory: (#checkpoints + 2) model copies, independent of #combinations.
     dev = "cuda"
     keys = [("te", k) for k in meta[0]["te"]] + [("den", k) for k in meta[0]["den"]]
-    for cb in combos:
-        cb["acc"] = {key: torch.zeros_like(meta[0][key[0]][key[1]], dtype=torch.float32, device=dev) for key in keys}
-    for i, m in enumerate(meta):
-        tensors = {key: m[key[0]][key[1]].to(dev, torch.float32) for key in keys}
-        for cb in combos:
-            if i in cb["idx"]:
-                cj = cb["c"][cb["idx"].index(i)]
-                for key in keys:
-                    cb["acc"][key].add_(tensors[key], alpha=cj)
+    used = sorted({i for cb in combos for i in cb["idx"]})
+    ckpts = {i: [meta[i][part][k].to(dev, torch.float32) for part, k in keys] for i in used}
+    buf = [torch.empty_like(t) for t in ckpts[used[0]]]
+
+    def build(cb):
+        torch._foreach_zero_(buf)
+        for cj, i in zip(cb["c"], cb["idx"]):
+            torch._foreach_add_(buf, ckpts[i], alpha=cj)
+        te_sd = {k: t for (part, k), t in zip(keys, buf) if part == "te"}
+        den_sd = {k: t for (part, k), t in zip(keys, buf) if part == "den"}
+        return te_sd, den_sd
 
     te, den = build_models(*configs_from_ckpt(meta[0]))
     te.to(dev), den.to(dev)
@@ -111,7 +115,6 @@ def main():
         te.load_state_dict(te_sd), den.load_state_dict(den_sd)
         return evaluate(te, den, val, dev)["val/loss"]
 
-    results = []
     raw = score(*({k: v.to(dev) for k, v in meta[-1][part].items()} for part in ("te", "den")))
     print(f"{'raw weights @ last step':34s} val/loss {raw:.5f}")
     latest = os.path.join(args.run, "latest.pt")
@@ -121,18 +124,17 @@ def main():
         ema_te = dict(zip(ck["te"].keys(), ck["ema"][:n_te]))
         ema_den = dict(zip(ck["den"].keys(), ck["ema"][n_te:]))
         print(f"{'EMA @ step ' + str(ck['step']):34s} val/loss {score(ema_te, ema_den):.5f}")
+    best = None
     for cb in combos:
-        te_sd = {k: v for (part, k), v in cb["acc"].items() if part == "te"}
-        den_sd = {k: v for (part, k), v in cb["acc"].items() if part == "den"}
+        te_sd, den_sd = build(cb)
         loss = score(te_sd, den_sd)
-        results.append((loss, cb, te_sd, den_sd))
+        if best is None or loss < best[0]:
+            best = (loss, cb, {k: v.cpu() for k, v in te_sd.items()}, {k: v.cpu() for k, v in den_sd.items()})
         label = f"{cb['method'].upper()} {cb['scheme']:7s} window {cb['window']:.0%} ({len(cb['idx'])} ckpt)"
         print(f"{label:34s} val/loss {loss:.5f}")
 
-    loss, cb, te_sd, den_sd = min(results, key=lambda r: r[0])
+    loss, cb, te_sd, den_sd = best
     out = args.out or os.path.join(args.run, "merged.pt")
-    te_sd = {k: v.cpu() for k, v in te_sd.items()}
-    den_sd = {k: v.cpu() for k, v in den_sd.items()}
     # same layout as a training checkpoint; "ema" holds the merged weights too, so export.py picks them by default
     torch.save(dict(step=last, den_config=meta[0]["den_config"], te_config=meta[0].get("te_config", {}), te=te_sd, den=den_sd,
                     ema=list(te_sd.values()) + list(den_sd.values()),
