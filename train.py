@@ -120,6 +120,10 @@ def build_parser():
                         "averaged weight change is applied by an outer Nesterov-SGD step. H = this value, 0 = off (DDP)")
     p.add_argument("--outer-lr", type=float, default=0.7, help="DiLoCo outer learning rate")
     p.add_argument("--outer-momentum", type=float, default=0.9, help="DiLoCo outer Nesterov momentum")
+    p.add_argument("--gns-every", type=int, default=None,
+                   help="with --diloco: estimate the gradient noise scale B_noise (~ critical batch size, McCandlish "
+                        "et al. 2018) from one worker's vs the all-worker gradient on the first step after an outer "
+                        "sync, every N steps (default 8 x --diloco; costs one gradient all-reduce; 0 = off)")
     p.add_argument("--offload", action="store_true",
                    help="with --diloco: keep the global weights (pinned) and the EMA in CPU memory instead of on the "
                         "GPU (~2 x 4 bytes/param less GPU memory); they are only touched at the outer syncs")
@@ -225,6 +229,30 @@ def weight_sq(named, device):
 def wrms_stats(acc):
     acc = acc.cpu()
     return {f"weights/rms_{k}": (acc[i, 0] / acc[i, 1]).sqrt().item() for i, k in enumerate(WRMS_KEYS) if acc[i, 1] > 0}
+
+
+@torch.no_grad()
+def grad_sq_norms(grads, n, bucket=64 * 2**20):
+    """(mean over the n workers of |local grad|^2, |all-worker mean grad|^2) - one bucketed bf16 all-reduce."""
+    small = torch.stack(torch._foreach_norm(grads)).float().square().sum()
+    dist.all_reduce(small)
+    big, chunk, size = torch.zeros((), device=small.device), [], 0
+    for i, g in enumerate(grads):
+        chunk.append(g)
+        size += g.numel()
+        if size >= bucket or i == len(grads) - 1:
+            flat = torch.cat([c.flatten() for c in chunk]).bfloat16()
+            dist.all_reduce(flat)
+            big += (flat.float() / n).square().sum()
+            chunk, size = [], 0
+    return small / n, big
+
+
+def noise_scale(small_sq, big_sq, b_small, b_big):
+    """McCandlish et al. 2018 (App. A): unbiased |G|^2 and tr(Sigma) from gradient norms at two batch sizes."""
+    g2 = (b_big * big_sq - b_small * small_sq) / (b_big - b_small)
+    s = (small_sq - big_sq) / (1 / b_small - 1 / b_big)
+    return g2, s
 
 
 def muon_splits(named):
@@ -490,6 +518,8 @@ def resolve_defaults(args):
         args.mlm_weight = 0.0  # frozen LM: nothing to train with MLM
     if args.repa_layer is None:
         args.repa_layer = max(1, round(0.3 * (args.depth or SIZES[args.size].depth)))
+    if args.gns_every is None:
+        args.gns_every = 8 * args.diloco
     if args.diloco:  # evals, checkpoints and WSM saves happen right after an outer sync
         up = lambda n: n and -(-n // args.diloco) * args.diloco
         args.eval_every, args.ckpt_every = up(args.eval_every), up(args.ckpt_every)
@@ -703,6 +733,7 @@ def main():
     acc = torch.zeros(5, device=device)  # sum fm, sum mlm, n mlm, sum repa, n repa
     repa_steps = int(args.repa_until * args.steps) if repa_target is not None else 0
     t0, t_last = time.time(), step
+    gns = dict(g2=None, s=None, raw=None)  # gradient noise scale estimates
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
         for micro in range(accum):
@@ -730,6 +761,13 @@ def main():
                 acc[3] += l_repa / accum
                 acc[4] += 1 / accum
 
+        if args.diloco and distributed and args.gns_every and step % args.diloco == 0 and step % args.gns_every == 0:
+            # first step after a sync: every worker's gradient is taken at the same weights
+            small_sq, big_sq = grad_sq_norms([p.grad for p in params if p.grad is not None], world)
+            g2, s = noise_scale(small_sq.item(), big_sq.item(), args.batch // world, args.batch)
+            gns["g2"] = g2 if gns["g2"] is None else 0.7 * gns["g2"] + 0.3 * g2  # ratio of smoothed terms
+            gns["s"] = s if gns["s"] is None else 0.7 * gns["s"] + 0.3 * s
+            gns["raw"] = s / g2 if g2 > 0 else float("nan")
         gnorm = torch.nn.utils.clip_grad_norm_(params, args.clip)
         mult = lr_mult(step, args.steps, warmup, args.schedule)
         for o in opts:
@@ -769,13 +807,19 @@ def main():
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             stats.update(wrms_stats(weight_sq(wrms_named, device)))  # this rank's weights (MuLoCo: worker 0's)
+            gns_s = ""
+            if gns["g2"] is not None:
+                b_noise = gns["s"] / gns["g2"] if gns["g2"] > 0 else float("nan")
+                stats.update({"gns/b_noise": b_noise, "gns/b_noise_raw": gns["raw"], "gns/grad_sq": gns["g2"],
+                              "gns/trace_cov": gns["s"]})
+                gns_s = f" | B_noise ~{b_noise:.0f}"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
                 (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {aux}"
                 f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
                 f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | "
-                f"w_rms {stats['weights/rms_hidden']:.4f} | eta {eta_h:.1f} h", flush=True)
+                f"w_rms {stats['weights/rms_hidden']:.4f}{gns_s} | eta {eta_h:.1f} h", flush=True)
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
