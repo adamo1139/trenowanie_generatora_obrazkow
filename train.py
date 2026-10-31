@@ -797,6 +797,8 @@ def main():
                 dist.all_reduce(acc)
                 acc /= world
             n = step - t_last
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)  # else the CPU runs ahead and short windows look too fast
             dt = time.time() - t0
             stats = {"train/samples": samples, "train/epoch": samples / len(store),
                      "train/loss_fm": acc[0].item() / n, "train/loss_mlm": (acc[1] / acc[2].clamp(min=1e-9)).item(),

@@ -574,6 +574,8 @@ def main():
         if step % args.log_every == 0 or step == args.steps:
             dist.all_reduce(acc)
             n = step - t_last
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)  # else the CPU runs ahead and short windows look too fast
             dt = time.time() - t0
             stats = {"train/samples": step * args.batch, "train/loss_fm": (acc[0] / acc[1].clamp(min=1)).item(),
                      "train/loss_repa": (acc[2] / acc[3].clamp(min=1)).item(), "train/grad_norm": gnorm.item(),
