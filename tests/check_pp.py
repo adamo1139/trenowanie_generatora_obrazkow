@@ -2,7 +2,8 @@
 including the REPA auxiliary loss injected in a middle stage (compared against Denoiser.forward(hidden_at=...)).
 
   DIST_BACKEND=gloo torchrun --nproc_per_node 2 tests/check_pp.py
-  DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py [conv]   # conv = iREPA projector
+  DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py [conv] [full|selective]
+    # conv = iREPA projector; full / selective = activation checkpointing
 
 Runs on CPU (gloo), fp32, so the comparison is exact up to float rounding.
 """
@@ -34,7 +35,8 @@ ids[:, 0], ids[:, 40:] = 2, 0
 target = torch.randn(B, 128, 16, 16)
 # REPA after block 5 (lands in a middle stage for pp >= 3), first 1 sample of each micro-batch, weight 0.5
 REPA_LAYER, N_REPA, W = 5, 1, 0.5
-proj = make_projector(den_cfg.dim, 32, hidden=64, conv=len(sys.argv) > 1 and sys.argv[1] == "conv")
+proj = make_projector(den_cfg.dim, 32, hidden=64, conv="conv" in sys.argv[1:])
+CKPT = next((a for a in sys.argv[1:] if a in ("full", "selective")), None)
 repa_tgts = [torch.randn(N_REPA, 256, 32) for _ in range(M)]
 
 # reference: the plain models (Denoiser.forward with hidden_at), mean over micro-batches of fm + W * repa
@@ -59,7 +61,7 @@ first, last = rank == 0, rank == pp - 1
 b = REPA_LAYER - 1
 repa_here = lo <= b < hi
 stage = Stage(den, den_cfg, lo, hi, first, last, te if first else None, proj if repa_here else None,
-              b - lo if repa_here else -1, W)
+              b - lo if repa_here else -1, W, act_checkpoint=CKPT)
 stage.repa_targets = repa_tgts if repa_here else None
 pstage = PipelineStage(stage, rank, pp, torch.device("cpu"))
 _fwd = pstage.forward_one_chunk

@@ -19,6 +19,7 @@ of them see the same samples. Checkpoints are gathered to rank 0 in train.py's f
 merge.py and tests/check_export.py work unchanged; per-stage optimizer state goes to <out>/opt_stage<s>.pt.
 MLM is not supported here (use --te-size slayer149, the default).
 """
+import functools
 import math
 import os
 import time
@@ -29,6 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
 from aurora.data import ShardStore, TrainStream, load_val, select_shards
@@ -44,9 +46,30 @@ def get_args():
     p.add_argument("--pp", type=int, default=8, help="pipeline stages (GPUs per pipeline); world must be a multiple")
     p.add_argument("--microbatches", type=int, default=None,
                    help="micro-batches per step and pipeline (default 4 x pp; bubble ~ (pp-1)/(microbatches+pp-1))")
-    p.add_argument("--act-checkpoint", action="store_true", help="recompute block activations in backward")
+    p.add_argument("--act-checkpoint", nargs="?", const="full", default=None, choices=["full", "selective"],
+                   help="recompute block activations in backward: full (only block inputs are kept) or selective "
+                        "(matmul and attention outputs are kept, only the cheap elementwise ops are recomputed)")
     p.set_defaults(batch=512, size="1.5b")
     return p.parse_args()
+
+
+# selective activation checkpointing: keep what is expensive to recompute (matmuls, attention), recompute the rest
+_SAC_SAVE = {torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default,
+             torch.ops.aten._scaled_dot_product_flash_attention.default,
+             torch.ops.aten._scaled_dot_product_efficient_attention.default,
+             torch.ops.aten._scaled_dot_product_cudnn_attention.default}
+
+
+def _sac_policy(ctx, op, *args, **kwargs):
+    return CheckpointPolicy.MUST_SAVE if op in _SAC_SAVE else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def checkpointed(block, mode):
+    """block wrapped in activation checkpointing (mode: "full" or "selective"); compile the result, not the block."""
+    if mode == "selective":  # dynamo only traces a functools.partial context_fn
+        ctx = functools.partial(create_selective_checkpoint_contexts, _sac_policy)
+        return lambda *args: checkpoint(block, *args, use_reentrant=False, context_fn=ctx)
+    return lambda *args: checkpoint(block, *args, use_reentrant=False)
 
 
 class AddAux(torch.autograd.Function):
@@ -66,7 +89,7 @@ class Stage(nn.Module):
     """One pipeline stage: optional stem (text encoder, time projection, patch_in), blocks [lo, hi), optional head."""
 
     def __init__(self, den, cfg, lo, hi, first, last, te=None, repa_proj=None, repa_block=-1, repa_weight=0.0,
-                 act_checkpoint=False):
+                 act_checkpoint=None):
         super().__init__()
         self.cfg, self.first, self.last = cfg, first, last
         if first:
@@ -75,7 +98,8 @@ class Stage(nn.Module):
         if last:
             self.norm, self.patch_out = den.norm, den.patch_out
         self.repa_proj, self.repa_block, self.repa_weight = repa_proj, repa_block, repa_weight
-        self.act_checkpoint = act_checkpoint
+        # callables that run each block (plain, or wrapped in activation checkpointing); main() compiles these
+        self.block_fns = [checkpointed(b, act_checkpoint) if act_checkpoint else b for b in self.blocks]
         cos, sin = build_rope_2d(cfg.latent_size, cfg.dim // cfg.heads)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -93,12 +117,8 @@ class Stage(nn.Module):
             # pipelining sends a gradient back for every stage input; the mask needs a (zero) one
             x = x + 0 * validf.sum()
         valid = validf > 0.5
-        for i, block in enumerate(self.blocks):
-            if self.act_checkpoint and torch.is_grad_enabled():
-                x = torch.utils.checkpoint.checkpoint(block, x, t6, text, valid, self.rope_cos, self.rope_sin,
-                                                      use_reentrant=False)
-            else:
-                x = block(x, t6, text, valid, self.rope_cos, self.rope_sin)
+        for i, fn in enumerate(self.block_fns):
+            x = fn(x, t6, text, valid, self.rope_cos, self.rope_sin)
             if i == self.repa_block and self.repa_targets is not None and not x.is_meta \
                     and self._mb < len(self.repa_targets):
                 target = self.repa_targets[self._mb]
@@ -284,8 +304,11 @@ def main():
         # "AssertionError: 640 v.s. 5120") unless reduction splitting is off; it only affects small reductions here
         import torch._inductor.config as inductor_config
         inductor_config.split_reductions = False
-        for blk in stage_mod.blocks:
-            blk.compile(dynamic=False)
+        if args.act_checkpoint:  # compile through the checkpoint so the selective policy applies inside the graph
+            stage_mod.block_fns = [torch.compile(f, dynamic=False) for f in stage_mod.block_fns]
+        else:
+            for blk in stage_mod.blocks:
+                blk.compile(dynamic=False)
         if first:
             te.compile(dynamic=False)
 

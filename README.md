@@ -83,7 +83,9 @@ tekstu i maska (oraz ich gradienty), strata REPA liczy się w stage'u z wybranym
 ```bash
 NCCL_P2P_LEVEL=SYS torchrun --nproc_per_node 8 train_pp.py --data data/aurora_full --fraction 1 --size 1.5b \
   --pp 8 --batch 512 --microbatches 32 --out runs/1p5b
-# OOM: --act-checkpoint albo więcej mikro-batchy (--microbatches 64); 2 potoki po 4 karty: --pp 4 (+ --diloco H)
+# OOM: --act-checkpoint selective (trzyma wyniki matmuli i attention, przelicza tylko elementwise: ~2x mniej
+#      aktywacji, bez straty prędkości) albo --act-checkpoint (pełny: prawie zero aktywacji, ~25% wolniej);
+#      2 potoki po 4 karty: --pp 4 (+ --diloco H)
 ```
 
 `tests/check_pp.py` (CPU, gloo, `torchrun --nproc_per_node 1/2/4`) sprawdza, że straty i gradienty (z REPA) są identyczne
