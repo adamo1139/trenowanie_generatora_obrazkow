@@ -808,13 +808,14 @@ def main():
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             stats.update(wrms_stats(weight_sq(wrms_named, device)))  # this rank's weights (MuLoCo: worker 0's)
-            gns_s = ""
+            w_every = args.gns_every or 1024  # weight RMS in the log line this often (always in wandb)
+            gns_s = f" | w_rms {stats['weights/rms_hidden']:.4f}" if step // w_every != t_last // w_every else ""
             if gns["new"]:  # only on the log line right after a measurement
                 gns["new"] = False
                 b_noise = gns["s"] / gns["g2"] if gns["g2"] > 0 else float("nan")
                 stats.update({"gns/b_noise": b_noise, "gns/grad_sq": gns["g2"], "gns/trace_cov": gns["s"],
                               "gns/measured_at": gns["step"]})
-                gns_s = f" | B_noise {b_noise:.0f} (step {gns['step']})"
+                gns_s += f" | B_noise {b_noise:.0f} (step {gns['step']})"
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
                 (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
