@@ -603,9 +603,22 @@ def main():
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             repa_s = f"repa {stats['train/loss_repa']:.3f} | " if acc[3] > 0 else ""
+            # peak memory and allocator retries (cudaFree + retry = memory pressure, stalls the whole pipeline)
+            mem_s = ""
+            if device.type == "cuda":
+                ms = torch.cuda.memory_stats(device)
+                mine_mem = torch.tensor([ms.get("allocated_bytes.all.peak", 0) / 2**30, ms.get("num_alloc_retries", 0)],
+                                        device=device)
+                all_mem = [torch.zeros_like(mine_mem) for _ in range(world)]
+                dist.all_gather(all_mem, mine_mem)
+                all_mem = torch.stack(all_mem).cpu()
+                worst = int(all_mem[:, 0].argmax())
+                retries = int(all_mem[:, 1].sum())
+                stats.update({"mem_peak_gb": all_mem[worst, 0].item(), "alloc_retries": retries})
+                mem_s = f" | mem {all_mem[worst, 0]:.1f} GB (GPU {worst}){f', ALLOC RETRIES {retries}' if retries else ''}"
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s {stats['imgs_per_s']:.0f} img/s | "
-                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h",
+                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
                 flush=True)
             if wb:
                 wb.log(stats, step=step)
