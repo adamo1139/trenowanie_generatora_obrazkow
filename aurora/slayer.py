@@ -192,14 +192,17 @@ class LMTextEncoder(nn.Module):
         row[0] = LM_NULL
         return row
 
-    def forward(self, ids: torch.Tensor):
-        valid = ids.ne(LM_PAD)
-        is_null = ids[:, 0].eq(LM_NULL)
+    @torch.no_grad()
+    def lm_states(self, ids: torch.Tensor) -> torch.Tensor:
+        """Frozen LM hidden states (no gradient); train_pp.py computes these on other GPUs and passes them in."""
         # pads / null marker -> any real id; attention is causal and padding is on the right, so real tokens never
         # see them, and their positions are masked out downstream
-        x = ids.masked_fill(~valid | ids.eq(LM_NULL), 0)
-        with torch.no_grad():
-            h = self.lm.hidden(x, self.n_blocks)
+        return self.lm.hidden(ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0), self.n_blocks)
+
+    def forward(self, ids: torch.Tensor, lm_states: torch.Tensor = None):
+        valid = ids.ne(LM_PAD)
+        is_null = ids[:, 0].eq(LM_NULL)
+        h = self.lm_states(ids) if lm_states is None else lm_states
         h = self.in_norm(h)
         h = torch.where(is_null[:, None, None], self.null.to(h.dtype).expand_as(h), h)
         h = self.in_proj(h)

@@ -3,7 +3,8 @@ including the REPA auxiliary loss injected in a middle stage (compared against D
 
   DIST_BACKEND=gloo torchrun --nproc_per_node 2 tests/check_pp.py
   DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py [conv] [full|selective]
-    # conv = iREPA projector; full / selective = activation checkpointing
+    # conv = iREPA projector; full / selective = activation checkpointing; lm = frozen Slayer149 + refiner, with the
+    # LM states computed on every stage and gathered to stage 0 (as train_pp.py does)
 
 Runs on CPU (gloo), fp32, so the comparison is exact up to float rounding.
 """
@@ -17,21 +18,28 @@ from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 sys.path.insert(0, ".")
 from aurora.model import build_models, make_configs
 from aurora.repa import make_projector
-from train_pp import Stage, owned_den_names, stage_ranges
+from train_pp import Stage, gather_to_stage, owned_den_names, stage_ranges
 
 dist.init_process_group("gloo")
 rank, pp = dist.get_rank(), dist.get_world_size()
 torch.manual_seed(0)
-den_cfg, te_cfg = make_configs("50m", "13m")
+LM = "lm" in sys.argv[1:]
+den_cfg, te_cfg = make_configs("50m", "slayer149", 640) if LM else make_configs("50m", "13m")
 te, den = build_models(den_cfg, te_cfg)
+te.init_weights()
 # perturb the zero-initialised gates / heads so every path carries signal
 with torch.no_grad():
     for p in den.parameters():
         p.add_(torch.randn_like(p) * 0.02)
 B, M = 8, 4
 z, t = torch.randn(B, 128, 16, 16), torch.rand(B)
-ids = torch.randint(6, 8192, (B, 64))
-ids[:, 0], ids[:, 40:] = 2, 0
+ids = torch.randint(6, 8192, (B, te.config.max_tokens))
+if LM:
+    from aurora.slayer import LM_PAD
+    ids[:, 0], ids[:, 40:] = 12285, LM_PAD
+    ids[1] = torch.from_numpy(te.null_ids())  # a CFG-dropped caption
+else:
+    ids[:, 0], ids[:, 40:] = 2, 0
 target = torch.randn(B, 128, 16, 16)
 # REPA after block 5 (lands in a middle stage for pp >= 3), first 1 sample of each micro-batch, weight 0.5
 REPA_LAYER, N_REPA, W = 5, 1, 0.5
@@ -55,7 +63,7 @@ ref_grads.update({("te", n): p.grad.clone() for n, p in te.named_parameters()})
 for p in list(den.parameters()) + list(te.parameters()):
     p.grad = None
 
-ranges = stage_ranges(den_cfg.depth, pp)
+ranges = stage_ranges(den_cfg.depth, pp, 1.0 if pp > 1 else 0.0)  # stage 0 gets fewer blocks
 lo, hi = ranges[rank]
 first, last = rank == 0, rank == pp - 1
 b = REPA_LAYER - 1
@@ -63,6 +71,11 @@ repa_here = lo <= b < hi
 stage = Stage(den, den_cfg, lo, hi, first, last, te if first else None, proj if repa_here else None,
               b - lo if repa_here else -1, W, act_checkpoint=CKPT)
 stage.repa_targets = repa_tgts if repa_here else None
+if LM:
+    mb = B // M
+    with torch.no_grad():
+        mine = {k: te.lm_states(ids[k * mb:(k + 1) * mb]) for k in range(M) if k % pp == rank}
+    stage.lm_states = gather_to_stage(mine, M, rank, pp, 0, 0)
 pstage = PipelineStage(stage, rank, pp, torch.device("cpu"))
 _fwd = pstage.forward_one_chunk
 

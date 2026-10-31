@@ -50,6 +50,9 @@ def get_args():
     p.add_argument("--act-checkpoint", nargs="?", const="full", default=None, choices=["full", "selective"],
                    help="recompute block activations in backward: full (only block inputs are kept) or selective "
                         "(matmul and attention outputs are kept, only the cheap elementwise ops are recomputed)")
+    p.add_argument("--te-cost", type=float, default=1.0,
+                   help="work of the text encoder on stage 0 in denoiser blocks; stage 0 gets that many blocks fewer "
+                        "so no stage straggles (0 = even split)")
     p.set_defaults(batch=512, size="1.5b")
     return p.parse_args()
 
@@ -105,11 +108,15 @@ class Stage(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.repa_targets, self.repa_losses, self._mb = None, [], 0
+        self.lm_states = None  # frozen-LM hidden states per micro-batch, computed on all stages (see main)
 
     def forward(self, *args):
         if self.first:
             z, t, ids = args
-            text, valid = self.te(ids)
+            if self.lm_states is not None and not ids.is_meta:
+                text, valid = self.te(ids, lm_states=self.lm_states[self._mb])
+            else:
+                text, valid = self.te(ids)
             validf = valid.to(text.dtype)
             x = self.patch_in(z.flatten(2).transpose(1, 2))
             t6 = self.ada(F.silu(self.time_mlp(timestep_embedding(t, 256)))).view(z.shape[0], 6, self.cfg.dim)
@@ -133,9 +140,31 @@ class Stage(nn.Module):
         return x, t6, text, validf
 
 
-def stage_ranges(depth, pp):
-    bounds = np.linspace(0, depth, pp + 1).round().astype(int)
+def stage_ranges(depth, pp, first_extra=0.0):
+    """Contiguous block ranges per stage, balanced when stage 0 also does `first_extra` blocks' worth of other work."""
+    bounds = np.linspace(0, depth + first_extra, pp + 1) - first_extra
+    bounds = np.clip(bounds.round(), 0, depth).astype(int)
+    bounds[0], bounds[-1] = 0, depth
+    assert (np.diff(bounds) > 0).all(), f"{depth} blocks can't fill {pp} stages"
     return [(int(bounds[s]), int(bounds[s + 1])) for s in range(pp)]
+
+
+def gather_to_stage(mine, M, s, pp, dst, base):
+    """mine: {k: tensor} for this stage's micro-batches (k % pp == s). Point-to-point (in k order, so it can't
+    deadlock) to stage `dst` of the pipeline whose stage 0 is global rank `base`; returns the M tensors there."""
+    if s != dst:
+        for k in sorted(mine):
+            dist.send(mine[k].contiguous(), dst=base + dst)
+        return None
+    ref, out = mine[dst], []  # every stage owns at least micro-batch k = s (M >= pp)
+    for k in range(M):
+        if k % pp == s:
+            out.append(mine[k])
+        else:
+            buf = torch.empty_like(ref)
+            dist.recv(buf, src=base + k % pp)
+            out.append(buf)
+    return out
 
 
 def owned_den_names(den, s, pp, ranges):
@@ -194,8 +223,8 @@ def main():
 
     # ---- model: a meta skeleton everywhere, only this stage's parts are materialised -------------------------------
     den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth)
-    assert den_cfg.depth >= pp, f"{den_cfg.depth} blocks can't fill {pp} stages"
-    ranges = stage_ranges(den_cfg.depth, pp)
+    assert M >= pp, f"need at least {pp} micro-batches"
+    ranges = stage_ranges(den_cfg.depth, pp, args.te_cost if pp > 1 else 0.0)
     lo, hi = ranges[s]
     with torch.device("meta"):
         den = Denoiser(den_cfg)
@@ -222,6 +251,14 @@ def main():
             te = TextEncoder(te_cfg)
         te.init_weights()
         te.to(device)
+    # the frozen LM (no gradients) runs on every stage: micro-batch k on stage k % pp, hidden states sent to stage 0;
+    # stage 0 keeps only the trainable refiner
+    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1
+    lm_enc = te
+    if lm_offload and not first:
+        from dataclasses import replace
+        from aurora.slayer import LMTextEncoder
+        lm_enc = LMTextEncoder(replace(te_cfg, depth=0)).to(device)  # just the LM, no refiner
 
     repa_block, repa_stage, repa_proj, repa_target = -1, -1, None, None
     if args.repa_weight > 0:
@@ -314,6 +351,8 @@ def main():
                 blk.compile(dynamic=False)
         if first:
             te.compile(dynamic=False)
+    lm_fn = torch.compile(lm_enc.lm_states, dynamic=False) if lm_offload and not args.no_compile else \
+        (lm_enc.lm_states if lm_offload else None)
 
     outer_opt, global_params = None, None
     if replicas > 1 and args.diloco:
@@ -338,14 +377,13 @@ def main():
 
     # ---- data: only the stages that need it ------------------------------------------------------------------------
     tok_suffix = getattr(te_cfg, "tok_suffix", "")
-    null_row = None
-    if first:
-        null_row = torch.from_numpy(te.null_ids()).to(device)
-    needs_data = first or last or args.repa_weight > 0  # REPA targets are decoded on every stage
+    ids_enc = te if first else lm_enc  # null prompt row (same on every stage that reads captions)
+    null_row = torch.from_numpy(ids_enc.null_ids()).to(device) if ids_enc is not None else None
+    needs_data = first or last or args.repa_weight > 0 or lm_offload  # REPA targets / LM states: every stage
     train_names, val_names = select_shards(args.data, args.fraction, tok_suffix)
     loader = store = None
     if needs_data:
-        store = ShardStore(args.data, train_names, tok_suffix, te.null_ids() if first else None)
+        store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None)
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
@@ -486,32 +524,24 @@ def main():
             t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
             eps = torch.randn(x0.shape, device=device, generator=g)
             drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
+        cond_ids = torch.where(drop[:, None], null_row, ids) if ids is not None and null_row is not None else None
+        stage_mod.lm_states = None
+        if lm_offload:
+            with amp:
+                mine = {k: lm_fn(cond_ids[k * mb:(k + 1) * mb]) for k in range(M) if k % pp == s}
+            stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
-            mine = {k: repa_target(x0[k * mb: k * mb + n_repa]) for k in range(M) if k % pp == s}
-            repa_rank = replica * pp + repa_stage
-            if s == repa_stage:
-                targets = []
-                for k in range(M):
-                    if k % pp == s:
-                        targets.append(mine[k].bfloat16().float())  # same precision as the received ones
-                    else:
-                        buf = torch.empty(n_repa, den_cfg.latent_size ** 2, repa_target.dim, dtype=torch.bfloat16,
-                                          device=device)
-                        dist.recv(buf, src=replica * pp + k % pp)
-                        targets.append(buf.float())
-                stage_mod.repa_targets = targets
-            else:
-                for k in sorted(mine):
-                    dist.send(mine[k].bfloat16().contiguous(), dst=repa_rank)
+            mine = {k: repa_target(x0[k * mb: k * mb + n_repa]).bfloat16() for k in range(M) if k % pp == s}
+            got = gather_to_stage(mine, M, s, pp, repa_stage, replica * pp)
+            stage_mod.repa_targets = [g_.float() for g_ in got] if got is not None else None
         stage_mod.repa_losses = []
         losses = []
         with amp:
             if first:
                 tt = t.view(-1, 1, 1, 1)
                 z_t = (1 - tt) * x0 + tt * eps
-                cond_ids = torch.where(drop[:, None], null_row, ids)
                 if last:
                     sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses)
                 else:

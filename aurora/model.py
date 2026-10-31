@@ -332,9 +332,11 @@ SIZES = {
     "253m": DenoiserConfig(dim=1024, depth=16, heads=16, mlp_hidden=2432),
     # wide models for pipeline-parallel training (train_pp.py): width 2048, 32 heads of 64, MLP 2.375x
     # (~58M params per block with a 768-wide text encoder)
-    "1b": DenoiserConfig(dim=2048, depth=16, heads=32, mlp_hidden=4864),
-    "1.5b": DenoiserConfig(dim=2048, depth=24, heads=32, mlp_hidden=4864),
-    "2b": DenoiserConfig(dim=2048, depth=32, heads=32, mlp_hidden=4864),
+    # depth = 8k - 1: in train_pp.py stage 0 also runs the text encoder (~1 block of work) and gets one block fewer,
+    # which only balances when depth + 1 divides by the number of stages (8, 4, 2)
+    "1b": DenoiserConfig(dim=2048, depth=15, heads=32, mlp_hidden=4864),
+    "1.5b": DenoiserConfig(dim=2048, depth=23, heads=32, mlp_hidden=4864),
+    "2b": DenoiserConfig(dim=2048, depth=31, heads=32, mlp_hidden=4864),
 }
 
 
