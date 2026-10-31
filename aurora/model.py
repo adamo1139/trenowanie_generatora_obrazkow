@@ -337,6 +337,9 @@ SIZES = {
     "1b": DenoiserConfig(dim=2048, depth=15, heads=32, mlp_hidden=4864),
     "1.5b": DenoiserConfig(dim=2048, depth=23, heads=32, mlp_hidden=4864),
     "2b": DenoiserConfig(dim=2048, depth=31, heads=32, mlp_hidden=4864),
+    # width 2560 (head dim 128): bigger GEMMs, best TFLOPS per stage on the 3090 Ti PCIe box (tests/bench_shapes.py)
+    "1.6b": DenoiserConfig(dim=2560, depth=15, heads=20, mlp_hidden=6912),
+    "2.4b": DenoiserConfig(dim=2560, depth=23, heads=20, mlp_hidden=6912),
 }
 
 

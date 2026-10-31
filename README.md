@@ -79,7 +79,7 @@ Bloki DiT dzielone na `--pp` kart (Schedule1F1B z `torch.distributed.pipelining`
 czasu i `patch_in`, ostatni stage `norm`, `patch_out` i stratę. Między kartami idą stany tokenów, modulacja czasu, tokeny
 tekstu i maska (oraz ich gradienty), strata REPA liczy się w stage'u z wybranym blokiem, a cele REPA (dekoder + DINOv2) liczą wszystkie karty po równo
 (micro-batch k na karcie k mod pp) i wysyłają do tego stage'u. Presety: `--size 1b / 1.5b / 2b`
-(szerokość 2048, 15/23/31 bloków). Balans: zamrożony LM liczą wszystkie karty po równo (micro-batch k na karcie
+(szerokość 2048, 15/23/31 bloków) oraz `--size 1.6b / 2.4b` (szerokość 2560, head dim 128, 15/23 bloki; najlepsze TFLOPS na 3090 Ti wg `tests/bench_shapes.py`). Balans: zamrożony LM liczą wszystkie karty po równo (micro-batch k na karcie
 k mod pp, stany wysyłane do stage'u 0), a stage 0, który ma jeszcze trenowany refiner (~1 blok pracy, `--te-cost`),
 dostaje o 1 blok mniej; głębokość 8k−1 sprawia, że przy pp 8/4/2 wychodzi równo (2B na 8 kartach: [3, 4, 4, …]). Checkpointy są zbierane na rank 0 w tym samym formacie co z `train.py`, więc `export.py`,
 `merge.py` i `tests/check_export.py` działają bez zmian; stan optymalizatora per stage w `<out>/opt_stage<s>.pt`.
