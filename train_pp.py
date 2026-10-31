@@ -39,7 +39,7 @@ from aurora.model import (Denoiser, LMEncoderConfig, TextEncoder, build_rope_2d,
                           te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
 from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
-                   peak_tflops, resolve_defaults, wandb_logged_in)
+                   peak_tflops, resolve_defaults, wandb_logged_in, weight_sq, wrms_stats)
 
 
 def get_args():
@@ -584,6 +584,9 @@ def main():
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             repa_s = f"repa {stats['train/loss_repa']:.3f} | " if acc[3] > 0 else ""
+            wsq = weight_sq(named, device)  # this pipeline's stages together (MuLoCo: replica 0's weights)
+            dist.all_reduce(wsq, group=pipe_group)
+            stats.update(wrms_stats(wsq))
             # peak memory and allocator retries (cudaFree + retry = memory pressure, stalls the whole pipeline)
             mem_s = ""
             if device.type == "cuda":
@@ -599,7 +602,7 @@ def main():
                 mem_s = f" | mem {all_mem[worst, 0]:.1f} GB (GPU {worst}){f', ALLOC RETRIES {retries}' if retries else ''}"
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s {stats['imgs_per_s']:.0f} img/s | "
-                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
+                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | w_rms {stats['weights/rms_hidden']:.4f} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
                 flush=True)
             if wb:
                 wb.log(stats, step=step)

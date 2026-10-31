@@ -194,6 +194,36 @@ def make_mlm(ids, prob):
     return ids.masked_fill(m, MASK_ID), ids.masked_fill(~m, -100)
 
 
+WRMS_KINDS = ("attn.qkv", "attn.out", "cross.q", "cross.kv", "cross.out", "mlp.in_proj", "mlp.out_proj")
+WRMS_KEYS = [f"den_{k}" for k in WRMS_KINDS] + ["te_refiner", "hidden"]
+
+
+@torch.no_grad()
+def weight_sq(named, device):
+    """(sum of squares, count) of the hidden block matrices per kind, the text refiner's and all of them, as a
+    (len(WRMS_KEYS), 2) tensor (all-reduce it to combine pipeline stages). A steadily growing weight RMS under
+    Muon + weight decay shrinks the effective (angular) step - one explanation for late-training plateaus."""
+    acc = torch.zeros(len(WRMS_KEYS), 2, device=device)
+    for prefix, name, p in named:
+        if p.ndim != 2 or ".blocks." not in f".{name}" or name.endswith("mod_table") or not p.requires_grad:
+            continue
+        sq = p.detach().float().square().sum()
+        if prefix == "te":
+            rows = [WRMS_KEYS.index("te_refiner")]
+        else:
+            kind = next((k for k in WRMS_KINDS if name.endswith(f"{k}.weight")), None)
+            rows = [WRMS_KEYS.index(f"den_{kind}")] if kind else []
+        for r in rows + [WRMS_KEYS.index("hidden")]:
+            acc[r, 0] += sq
+            acc[r, 1] += p.numel()
+    return acc
+
+
+def wrms_stats(acc):
+    acc = acc.cpu()
+    return {f"weights/rms_{k}": (acc[i, 0] / acc[i, 1]).sqrt().item() for i, k in enumerate(WRMS_KEYS) if acc[i, 1] > 0}
+
+
 def muon_splits(named):
     """CMuon row blocks of the fused matrices: {param: [sizes]} from (prefix, name, param) triples."""
     out = {}
@@ -527,6 +557,7 @@ def main():
             f"every {args.repa_every} step(s), until step {int(args.repa_until * args.steps)}")
     extra = [("repa_proj", repa_proj)] if repa_proj is not None else []
     opts, counts = param_groups(te, den, args, extra)
+    wrms_named = [("te", n, p) for n, p in te.named_parameters()] + [("den", n, p) for n, p in den.named_parameters()]
     variant = "".join([" (CMuon: fused matrices split)" if args.cmuon else "",
                        f" (periodic row-wise: Newton-Schulz every {args.muon_period} steps, gamma {args.muon_gamma})"
                        if args.muon_period > 1 else ""]) if args.optimizer == "muon" else ""
@@ -720,12 +751,14 @@ def main():
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
+            stats.update(wrms_stats(weight_sq(wrms_named, device)))  # this rank's weights (MuLoCo: worker 0's)
             eta_h = (args.steps - step) / stats["steps_per_s"] / 3600
             aux = (f"mlm {stats['train/loss_mlm']:.3f} | " if args.mlm_weight > 0 else "") + \
                 (f"repa {stats['train/loss_repa']:.3f} | " if acc[4] > 0 else "")
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {aux}"
                 f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
-                f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {eta_h:.1f} h", flush=True)
+                f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | "
+                f"w_rms {stats['weights/rms_hidden']:.4f} | eta {eta_h:.1f} h", flush=True)
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
