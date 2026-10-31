@@ -2,7 +2,7 @@
 including the REPA auxiliary loss injected in a middle stage (compared against Denoiser.forward(hidden_at=...)).
 
   DIST_BACKEND=gloo torchrun --nproc_per_node 2 tests/check_pp.py
-  DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py
+  DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py [conv]   # conv = iREPA projector
 
 Runs on CPU (gloo), fp32, so the comparison is exact up to float rounding.
 """
@@ -34,7 +34,7 @@ ids[:, 0], ids[:, 40:] = 2, 0
 target = torch.randn(B, 128, 16, 16)
 # REPA after block 5 (lands in a middle stage for pp >= 3), first 1 sample of each micro-batch, weight 0.5
 REPA_LAYER, N_REPA, W = 5, 1, 0.5
-proj = make_projector(den_cfg.dim, 32, hidden=64)
+proj = make_projector(den_cfg.dim, 32, hidden=64, conv=len(sys.argv) > 1 and sys.argv[1] == "conv")
 repa_tgts = [torch.randn(N_REPA, 256, 32) for _ in range(M)]
 
 # reference: the plain models (Denoiser.forward with hidden_at), mean over micro-batches of fm + W * repa

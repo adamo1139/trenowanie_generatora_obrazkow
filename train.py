@@ -48,8 +48,13 @@ def build_parser():
                         "slayer149 = frozen SlayerLab/Slayer149 + trainable refiner (needs prepare_data.py tokenize "
                         "--encoder slayer149)")
     p.add_argument("--repa-weight", type=float, default=0.5, help="REPA loss weight (0 = off)")
-    p.add_argument("--repa-encoder", default="vit_pe_spatial_base_patch16_512.fb",
-                   help="timm vision encoder for REPA targets (default: Meta PE-Spatial-B16)")
+    p.add_argument("--repa-encoder", default="vit_base_patch14_reg4_dinov2.lvd142m",
+                   help="timm vision encoder for REPA targets (default: DINOv2-B/14 with registers, Apache-2.0; "
+                        "vit_pe_spatial_base_patch16_512.fb = Meta PE-Spatial-B16)")
+    p.add_argument("--irepa", action="store_true",
+                   help="iREPA: 3x3 conv projector + targets normalised over tokens (helped DINOv2 in T2I ablations)")
+    p.add_argument("--repa-every", type=int, default=1,
+                   help="compute REPA only every N-th step (the latent decoder is expensive)")
     p.add_argument("--repa-layer", type=int, default=None, help="align the DiT state after this many blocks "
                                                                  "(default: 30%% of the depth, e.g. 5 of 16)")
     p.add_argument("--repa-frac", type=float, default=0.25,
@@ -451,11 +456,11 @@ def main():
     repa_target, repa_proj = None, None
     if args.repa_weight > 0:
         from aurora.repa import REPATarget, make_projector
-        repa_target = REPATarget(args.vae, args.repa_encoder, device)
-        repa_proj = make_projector(den_cfg.dim, repa_target.dim).to(device)
-        log(f"REPA: {args.repa_encoder} ({repa_target.dim}-d) <- DiT block {args.repa_layer}/{den_cfg.depth}, "
-            f"weight {args.repa_weight}, {args.repa_frac:.0%} of each micro-batch, until step "
-            f"{int(args.repa_until * args.steps)}")
+        repa_target = REPATarget(args.vae, args.repa_encoder, device, spatial_norm=args.irepa)
+        repa_proj = make_projector(den_cfg.dim, repa_target.dim, conv=args.irepa).to(device)
+        log(f"REPA{' (iREPA)' if args.irepa else ''}: {args.repa_encoder} ({repa_target.dim}-d) <- DiT block "
+            f"{args.repa_layer}/{den_cfg.depth}, weight {args.repa_weight}, {args.repa_frac:.0%} of each micro-batch, "
+            f"every {args.repa_every} step(s), until step {int(args.repa_until * args.steps)}")
     extra = [("repa_proj", repa_proj)] if repa_proj is not None else []
     opts, counts = param_groups(te, den, args, extra)
     log(f"optimizer: {args.optimizer} for hidden matrices; split (params): {counts}")
@@ -617,7 +622,8 @@ def main():
             drop = torch.rand(b, device=device) < args.cfg_drop
             cond_ids = torch.where(drop[:, None], null_row, ids)
             mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
-            target = repa_target(x0[: max(1, round(args.repa_frac * b))]) if step < repa_steps else None
+            repa_now = step < repa_steps and step % args.repa_every == 0
+            target = repa_target(x0[: max(1, round(args.repa_frac * b))]) if repa_now else None
             sync = contextlib.nullcontext() if (not ddp or micro == accum - 1) else model.no_sync()
             with sync:
                 with torch.autocast("cuda", dtype=torch.bfloat16):

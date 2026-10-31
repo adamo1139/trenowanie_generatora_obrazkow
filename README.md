@@ -32,16 +32,18 @@ Bez uv: `python3.11 -m venv .venv && source .venv/bin/activate && pip install to
 https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszystkie dalsze komendy zakładają aktywny venv
 (albo wywołanie `.venv/bin/python` / `.venv/bin/torchrun`). Sprawdzone: torch 2.11.0+cu128, diffusers 0.42.1, Python 3.11.
 
-## Text encoder: Slayer149 (zamrożony) + REPA z PE-Spatial-B16 (domyślnie)
+## Text encoder: Slayer149 (zamrożony) + REPA z DINOv2-B/14 (domyślnie)
 
 - `--te-size slayer149` (domyślnie): zamrożony [SlayerLab/Slayer149](https://huggingface.co/SlayerLab/Slayer149) (149M,
   angielski) + trenowany 2-blokowy refiner (~12M). Wymaga osobnej tokenizacji captionów (obok istniejącej):
   `python prepare_data.py tokenize --data data/aurora_full --encoder slayer149`.
   `--te-size 13m` / `27m` to dawne enkodery trenowane od zera (z MLM).
 - **REPA** (`--repa-weight 0.5`, domyślnie): stan DiT po ~30% głębokości jest dopasowywany (cosinus, przez MLP) do cech
-  [PE-Spatial-B16](https://huggingface.co/facebook/PE-Spatial-B16-512) (Apache-2.0) z obrazka zdekodowanego z latentu.
-  Dekoder jest drogi, więc REPA liczy się tylko dla 25% każdego micro-batcha (`--repa-frac`) i przez pierwsze 40%
-  treningu (`--repa-until`). `--repa-weight 0` wyłącza.
+  [DINOv2-B/14 z rejestrami](https://huggingface.co/timm/vit_base_patch14_reg4_dinov2.lvd142m) (Apache-2.0) z obrazka
+  zdekodowanego z latentu (przeskalowanego do 224 px → siatka 16×16 = tokeny DiT). PE-Spatial-B16:
+  `--repa-encoder vit_pe_spatial_base_patch16_512.fb`. `--irepa` = iREPA (projektor conv 3×3 + normalizacja cech po
+  tokenach). Dekoder jest drogi, więc REPA liczy się tylko dla 25% każdego micro-batcha (`--repa-frac`), co N-ty krok
+  (`--repa-every N`) i przez pierwsze 40% treningu (`--repa-until`). `--repa-weight 0` wyłącza.
 - Eksport (`export.py`) pakuje użyte warstwy Slayer149 i jego tokenizer do repo, a `pipeline.py` (`aurora/hf_pipeline.py`)
   obsługuje oba enkodery; `tests/check_export.py` sprawdza zgodność z modułami treningowymi.
 
@@ -73,7 +75,8 @@ python sample.py exports/aurora --out grid.png
 
 Bloki DiT dzielone na `--pp` kart (Schedule1F1B z `torch.distributed.pipelining`). Stage 0 ma też text encoder, projekcję
 czasu i `patch_in`, ostatni stage `norm`, `patch_out` i stratę. Między kartami idą stany tokenów, modulacja czasu, tokeny
-tekstu i maska (oraz ich gradienty), REPA liczy się w stage'u z wybranym blokiem. Presety: `--size 1b / 1.5b / 2b`
+tekstu i maska (oraz ich gradienty), strata REPA liczy się w stage'u z wybranym blokiem, a cele REPA (dekoder + DINOv2) liczą wszystkie karty po równo
+(micro-batch k na karcie k mod pp) i wysyłają do tego stage'u. Presety: `--size 1b / 1.5b / 2b`
 (szerokość 2048, 16/24/32 bloki). Checkpointy są zbierane na rank 0 w tym samym formacie co z `train.py`, więc `export.py`,
 `merge.py` i `tests/check_export.py` działają bez zmian; stan optymalizatora per stage w `<out>/opt_stage<s>.pt`.
 

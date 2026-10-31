@@ -206,10 +206,12 @@ def main():
     if args.repa_weight > 0:
         b = args.repa_layer - 1  # block index after which the state is aligned
         repa_stage = next(st for st, (a, z) in enumerate(ranges) if a <= b < z)
+        # every stage decodes 1/pp of the REPA targets (micro-batch k on stage k mod pp) and sends them to the REPA
+        # stage, so the expensive latent decoder doesn't stall a single GPU
+        from aurora.repa import REPATarget, make_projector
+        repa_target = REPATarget(args.vae, args.repa_encoder, device, spatial_norm=args.irepa)
         if s == repa_stage:
-            from aurora.repa import REPATarget, make_projector
-            repa_target = REPATarget(args.vae, args.repa_encoder, device)
-            repa_proj = make_projector(den_cfg.dim, repa_target.dim).to(device)
+            repa_proj = make_projector(den_cfg.dim, repa_target.dim, conv=args.irepa).to(device)
             repa_block = b - lo
     stage_mod = Stage(den, den_cfg, lo, hi, first, last, te, repa_proj, repa_block, args.repa_weight,
                       args.act_checkpoint).to(device)
@@ -302,7 +304,7 @@ def main():
     null_row = None
     if first:
         null_row = torch.from_numpy(te.null_ids()).to(device)
-    needs_data = first or last or s == repa_stage
+    needs_data = first or last or args.repa_weight > 0  # REPA targets are decoded on every stage
     train_names, val_names = select_shards(args.data, args.fraction, tok_suffix)
     loader = store = None
     if needs_data:
@@ -428,9 +430,13 @@ def main():
         torch._foreach_copy_(params, global_params)
 
     warmup = max(1, int(args.warmup_frac * args.steps))
+    repa_steps = int(args.repa_until * args.steps) if args.repa_weight > 0 else 0
+    if args.repa_weight > 0:
+        log(f"REPA{' (iREPA)' if args.irepa else ''}: {args.repa_encoder} <- DiT block {args.repa_layer} "
+            f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
+            f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"lr: {args.schedule} after {warmup} warmup steps, Muon {args.lr_muon}, AdamW x{args.lr_scale:.2f}, "
         f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps' % args.diloco if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
-    repa_steps = int(args.repa_until * args.steps) if args.repa_weight > 0 else 0
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
     t0, t_last = time.time(), step
     while step < args.steps:
@@ -443,11 +449,25 @@ def main():
             t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
             eps = torch.randn(x0.shape, device=device, generator=g)
             drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
-        if s == repa_stage and step < repa_steps:
+        stage_mod.repa_targets = None
+        if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
-            stage_mod.repa_targets = [repa_target(x0[k * mb: k * mb + n_repa]) for k in range(M)]
-        else:
-            stage_mod.repa_targets = None
+            mine = {k: repa_target(x0[k * mb: k * mb + n_repa]) for k in range(M) if k % pp == s}
+            repa_rank = replica * pp + repa_stage
+            if s == repa_stage:
+                targets = []
+                for k in range(M):
+                    if k % pp == s:
+                        targets.append(mine[k].bfloat16().float())  # same precision as the received ones
+                    else:
+                        buf = torch.empty(n_repa, den_cfg.latent_size ** 2, repa_target.dim, dtype=torch.bfloat16,
+                                          device=device)
+                        dist.recv(buf, src=replica * pp + k % pp)
+                        targets.append(buf.float())
+                stage_mod.repa_targets = targets
+            else:
+                for k in sorted(mine):
+                    dist.send(mine[k].bfloat16().contiguous(), dst=repa_rank)
         stage_mod.repa_losses = []
         losses = []
         with amp:
