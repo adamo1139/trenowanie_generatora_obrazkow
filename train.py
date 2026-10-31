@@ -821,7 +821,7 @@ def main():
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {aux}"
                 f"grad_norm {stats['train/grad_norm']:.3f} | lr x{mult:.3f} | {stats['steps_per_s']:.2f} it/s "
                 f"{stats['imgs_per_s']:.0f} img/s | {stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | "
-                f"w_rms {stats['weights/rms_hidden']:.4f}{gns_s} | eta {eta_h:.1f} h", flush=True)
+                f"eta {eta_h:.1f} h{gns_s}", flush=True)
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
