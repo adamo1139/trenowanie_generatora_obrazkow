@@ -748,7 +748,9 @@ def main():
             drop = torch.rand(b, device=device) < args.cfg_drop
             cond_ids = torch.where(drop[:, None], null_row, ids)
             mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
-            repa_now = step < repa_steps and step % args.repa_every == 0
+            # with --repa-every N, REPA steps sit mid-period (N/2, 3N/2, ...) so they never coincide with the step
+            # right after a MuLoCo sync, where the gradient noise scale is measured on the plain flow-matching loss
+            repa_now = step < repa_steps and step % args.repa_every == args.repa_every // 2
             target = repa_target(x0[: max(1, round(args.repa_frac * b))]) if repa_now else None
             sync = contextlib.nullcontext() if (not ddp or micro == accum - 1) else model.no_sync()
             with sync:
