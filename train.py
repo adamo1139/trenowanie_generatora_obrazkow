@@ -147,6 +147,7 @@ def build_parser():
     p.add_argument("--fid-every", type=int, default=0,
                    help="FD-DINOv2 (aurora/fid.py) of the EMA weights every N steps: generate --fid-samples images for "
                         "held-out captions on all GPUs and compare DINOv2 CLS features with the real images; 0 = off")
+    p.add_argument("--fid-at-start", action="store_true", help="also measure FD-DINOv2 before the first step (resume)")
     p.add_argument("--fid-samples", type=int, default=4096, help="images per FD-DINOv2 eval (<= --val-samples)")
     p.add_argument("--fid-steps", type=int, default=50, help="Euler steps for the FD-DINOv2 samples")
     p.add_argument("--fid-cfg", type=float, default=3.0, help="classifier-free guidance scale for the FD-DINOv2 samples")
@@ -779,6 +780,18 @@ def main():
     repa_steps = int(args.repa_until * args.steps) if repa_target is not None else 0
     t0, t_last = time.time(), step
     gns = dict(g2=None, s=None, step=None, new=False)  # latest gradient noise scale measurement
+    if fid is not None and args.fid_at_start:
+        t_fid = time.time()
+        fd, imgs = fid_eval()
+        if master:
+            log(f"step {step:>7} | EMA FD-DINOv2 {fd:.2f} ({fid['n']} samples, {time.time() - t_fid:.0f} s, at start)",
+                flush=True)
+            if wb:
+                import torchvision
+                import wandb
+                wb.log({"val/fd_dinov2": fd, "samples": wandb.Image(torchvision.utils.make_grid(imgs.cpu(), nrow=4)),
+                        "train/samples": samples}, step=step)
+        t0 = time.time()
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
         for micro in range(accum):
