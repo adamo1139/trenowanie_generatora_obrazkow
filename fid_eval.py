@@ -43,7 +43,7 @@ def main():
     torch.cuda.set_device(device)
     enc = REPATarget(a.vae, a.encoder, device)
     feats = lambda xs: torch.cat([enc.cls_features(xs[i:i + 64].to(device)) for i in range(0, len(xs), 64)])
-    ref = ids = None
+    cache = {}  # per tokenisation (models with different text encoders read different caption token files)
     for path in a.ckpts:
         t0 = time.time()
         ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
@@ -58,14 +58,14 @@ def main():
         step = ck.get("step")
         del ck
         te.to(device).eval(), den.to(device).eval()
-        if ref is None:  # held-out set and the real images' statistics, once
-            tok_suffix = getattr(te_cfg, "tok_suffix", "")
+        tok_suffix = getattr(te_cfg, "tok_suffix", "")
+        if tok_suffix not in cache:  # held-out set and the real images' statistics, once per tokenisation
             _, val_names = select_shards(a.data, 1.0, tok_suffix)
             lat, all_ids = load_val(a.data, val_names, a.val_samples, tok_suffix, te.null_ids())
-            n = min(a.samples, len(all_ids))
-            mine = list(range(rank, n, world))
-            ids = all_ids[mine]
-            ref = stats(gather_features(feats(lat[mine]), n))
+            n_ = min(a.samples, len(all_ids))
+            mine = list(range(rank, n_, world))
+            cache[tok_suffix] = (all_ids[mine], n_, stats(gather_features(feats(lat[mine]), n_)))
+        ids, n, ref = cache[tok_suffix]
         null_row = torch.from_numpy(te.null_ids()).to(device)
         z = sample(te, den, ids, null_row, a.steps, a.cfg, a.seed, device)
         fd = frechet(*stats(gather_features(feats(z), n)), *ref)
