@@ -43,6 +43,7 @@ Odcinki (wznowienia z checkpointu, dane kontynuowane od tego samego obrazu):
 | 48,128 | 48.40M | 8.23 | EMA | 36.51 |
 | 60,928 | 61.51M | 10.46 | EMA | 29.80 |
 | 62,720 | 63.34M | 10.77 | EMA | 29.50 |
+| 69,632 | 70.42M | 11.98 | EMA | 28.99 |
 
 Wnioski:
 - Skok lr 3e-3 → 1e-2 (krok 45,056) pogorszył FD z 33.5 do 43.2; po powrocie do 3e-3 z iREPA szybki spadek do 29.5.
