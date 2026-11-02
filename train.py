@@ -144,6 +144,12 @@ def build_parser():
     p.add_argument("--keep-every", type=int, default=None,
                    help="also keep <out>/snap_<step>.pt (weights + EMA only, ~1 GB for 116m); default steps/10, 0 = off")
     p.add_argument("--val-samples", type=int, default=4096)
+    p.add_argument("--fid-every", type=int, default=0,
+                   help="FD-DINOv2 (aurora/fid.py) of the EMA weights every N steps: generate --fid-samples images for "
+                        "held-out captions on all GPUs and compare DINOv2 CLS features with the real images; 0 = off")
+    p.add_argument("--fid-samples", type=int, default=4096, help="images per FD-DINOv2 eval (<= --val-samples)")
+    p.add_argument("--fid-steps", type=int, default=50, help="Euler steps for the FD-DINOv2 samples")
+    p.add_argument("--fid-cfg", type=float, default=3.0, help="classifier-free guidance scale for the FD-DINOv2 samples")
     p.add_argument("--peak-tflops", type=float, default=0,
                    help="GPU peak bf16 TFLOPS for MFU (default: looked up from the GPU name, 0 = unknown)")
     p.add_argument("--wandb", default="trenowanie_generatora_obrazkow",
@@ -524,6 +530,7 @@ def resolve_defaults(args):
         up = lambda n: n and -(-n // args.diloco) * args.diloco
         args.eval_every, args.ckpt_every = up(args.eval_every), up(args.ckpt_every)
         args.merge_every, args.keep_every = up(args.merge_every), up(args.keep_every)
+        args.fid_every = up(args.fid_every)
     return args
 
 
@@ -680,6 +687,18 @@ def main():
                                               pin_memory=True, prefetch_factor=2 if args.workers else None,
                                               persistent_workers=args.workers > 0))
     null_row = torch.from_numpy(te.null_ids()).to(device)
+    fid = None
+    if args.fid_every and val_names:  # every rank generates a slice, so every rank needs the held-out set
+        from aurora.fid import frechet, gather_features, sample, stats
+        from aurora.repa import REPATarget
+        fid_lat, fid_ids = val if val is not None else load_val(args.data, val_names, args.val_samples, tok_suffix,
+                                                                te.null_ids())
+        n_fid = min(args.fid_samples, len(fid_ids))
+        mine = list(range(rank, n_fid, world))
+        fid = dict(enc=repa_target or REPATarget(args.vae, args.repa_encoder, device), ref=None,
+                   lat=fid_lat[mine], ids=fid_ids[mine], n=n_fid)
+        log(f"FD-DINOv2: {n_fid} held-out captions, {args.fid_steps} Euler steps, CFG {args.fid_cfg}, "
+            f"every {args.fid_every} steps ({args.repa_encoder} CLS features)")
 
     wb = None
     if master and args.wandb and not args.no_wandb:
@@ -722,6 +741,30 @@ def main():
         res = evaluate(te, den, val, device)
         torch._foreach_copy_(ema_params, live_w)
         return res
+
+    @torch.no_grad()
+    def fid_eval():
+        """FD-DINOv2 of the EMA weights (rank 0's EMA, broadcast); returns (fd, first images in [0, 1]) on rank 0."""
+        enc, chunk = fid["enc"], 64
+        feats = lambda xs: torch.cat([enc.cls_features(xs[i:i + chunk].to(device)) for i in range(0, len(xs), chunk)])
+        if fid["ref"] is None:  # real held-out images through the same decoder, once
+            fid["ref"] = stats(gather_features(feats(fid["lat"]), fid["n"]))
+        live_w = [p.detach().to("cpu", copy=True) for p in ema_params]
+        if master:
+            for p, e in zip(ema_params, ema):
+                p.copy_(e)
+        if distributed:
+            for p in ema_params:
+                dist.broadcast(p.data, 0)
+        te.eval(), den.eval()
+        z = sample(te, den, fid["ids"], null_row, args.fid_steps, args.fid_cfg, args.seed, device)
+        te.train(), den.train()
+        for p, w in zip(ema_params, live_w):
+            p.copy_(w)
+        gen = gather_features(feats(z), fid["n"])
+        if not master:
+            return None, None
+        return frechet(*stats(gen), *fid["ref"]), (enc.decode(z[:16]) + 1) / 2
 
     warmup = max(1, int(args.warmup_frac * args.steps))
     lrs = ", ".join(f"{g['base_lr']:.2e}" for o in opts for g in o.param_groups)
@@ -839,6 +882,17 @@ def main():
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
                 wb.log({**res, "train/samples": samples}, step=step)
+        if fid is not None and (step % args.fid_every == 0 or step == args.steps):
+            t_fid = time.time()
+            fd, imgs = fid_eval()
+            if master:
+                log(f"step {step:>7} | EMA FD-DINOv2 {fd:.2f} ({fid['n']} samples, {time.time() - t_fid:.0f} s)",
+                    flush=True)
+                if wb:
+                    import torchvision
+                    import wandb
+                    grid = torchvision.utils.make_grid(imgs.cpu(), nrow=4)
+                    wb.log({"val/fd_dinov2": fd, "samples": wandb.Image(grid), "train/samples": samples}, step=step)
         if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
             save()
         if master and args.merge_every and step >= args.merge_start * args.steps and (

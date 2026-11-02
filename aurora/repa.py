@@ -44,16 +44,29 @@ class REPATarget:
         self.spatial_norm = spatial_norm
 
     @torch.no_grad()
-    def __call__(self, x0: torch.Tensor) -> torch.Tensor:
-        """Normalised packed latents (B, 128, 16, 16) -> encoder patch features (B, 256, dim), fp32."""
+    def decode(self, x0: torch.Tensor) -> torch.Tensor:
+        """Normalised packed latents (B, 128, 16, 16) -> images in [-1, 1], (B, 3, 256, 256), fp32."""
         z = unpatchify_flux2(x0.float() * self.std + self.mean)
-        img = self.vae.decode(z.to(torch.bfloat16)).sample.float().clamp(-1, 1)
+        return self.vae.decode(z.to(torch.bfloat16)).sample.float().clamp(-1, 1)
+
+    @torch.no_grad()
+    def encode(self, img: torch.Tensor) -> torch.Tensor:
+        """Images in [-1, 1] -> all encoder tokens (B, prefix + grid^2, dim)."""
         if tuple(img.shape[-2:]) != self.size:
             img = F.interpolate(img, size=self.size, mode="bicubic", antialias=True, align_corners=False)
         img = ((img + 1) / 2 - self.img_mean) / self.img_std
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            feats = self.enc.forward_features(img)
-        feats = feats[:, self.prefix:].float()
+            return self.enc.forward_features(img)
+
+    @torch.no_grad()
+    def cls_features(self, x0: torch.Tensor) -> torch.Tensor:
+        """Normalised latents -> the encoder's CLS embedding (B, dim), fp32 (for FD-DINOv2)."""
+        return self.enc.forward_head(self.encode(self.decode(x0)), pre_logits=True).float()
+
+    @torch.no_grad()
+    def __call__(self, x0: torch.Tensor) -> torch.Tensor:
+        """Normalised packed latents (B, 128, 16, 16) -> encoder patch features (B, 256, dim), fp32."""
+        feats = self.encode(self.decode(x0))[:, self.prefix:].float()
         if self.spatial_norm:  # iREPA: per image and channel, over the tokens
             feats = (feats - feats.mean(1, keepdim=True)) / (feats.std(1, keepdim=True) + 1e-6)
         return feats
