@@ -690,7 +690,7 @@ def main():
     null_row = torch.from_numpy(te.null_ids()).to(device)
     fid = None
     if args.fid_every and val_names:  # every rank generates a slice, so every rank needs the held-out set
-        from aurora.fid import frechet, gather_features, sample, stats
+        import aurora.fid as fidlib  # module alias: main() has its own `stats` (the log dict)
         from aurora.repa import REPATarget
         fid_lat, fid_ids = val if val is not None else load_val(args.data, val_names, args.val_samples, tok_suffix,
                                                                 te.null_ids())
@@ -749,7 +749,7 @@ def main():
         enc, chunk = fid["enc"], 64
         feats = lambda xs: torch.cat([enc.cls_features(xs[i:i + chunk].to(device)) for i in range(0, len(xs), chunk)])
         if fid["ref"] is None:  # real held-out images through the same decoder, once
-            fid["ref"] = stats(gather_features(feats(fid["lat"]), fid["n"]))
+            fid["ref"] = fidlib.stats(fidlib.gather_features(feats(fid["lat"]), fid["n"]))
         live_w = [p.detach().to("cpu", copy=True) for p in ema_params]
         if master:
             for p, e in zip(ema_params, ema):
@@ -757,15 +757,17 @@ def main():
         if distributed:
             for p in ema_params:
                 dist.broadcast(p.data, 0)
-        te.eval(), den.eval()
-        z = sample(te, den, fid["ids"], null_row, args.fid_steps, args.fid_cfg, args.seed, device)
-        te.train(), den.train()
-        for p, w in zip(ema_params, live_w):
-            p.copy_(w)
-        gen = gather_features(feats(z), fid["n"])
+        try:
+            te.eval(), den.eval()
+            z = fidlib.sample(te, den, fid["ids"], null_row, args.fid_steps, args.fid_cfg, args.seed, device)
+        finally:  # the live weights come back even if generation fails
+            te.train(), den.train()
+            for p, w in zip(ema_params, live_w):
+                p.copy_(w)
+        gen = fidlib.gather_features(feats(z), fid["n"])
         if not master:
             return None, None
-        return frechet(*stats(gen), *fid["ref"]), (enc.decode(z[:16]) + 1) / 2
+        return fidlib.frechet(*fidlib.stats(gen), *fid["ref"]), (enc.decode(z[:16]) + 1) / 2
 
     warmup = max(1, int(args.warmup_frac * args.steps))
     lrs = ", ".join(f"{g['base_lr']:.2e}" for o in opts for g in o.param_groups)
@@ -895,10 +897,16 @@ def main():
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
                 wb.log({**res, "train/samples": samples}, step=step)
+        if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
+            save()
         if fid is not None and (step % args.fid_every == 0 or step == args.steps):
             t_fid = time.time()
-            fd, imgs = fid_eval()
-            if master:
+            try:
+                fd, imgs = fid_eval()
+            except Exception as e:  # a metric must never kill the run
+                fd = imgs = None
+                log(f"step {step:>7} | FD-DINOv2 failed: {e!r}", flush=True)
+            if master and fd is not None:
                 log(f"step {step:>7} | EMA FD-DINOv2 {fd:.2f} ({fid['n']} samples, {time.time() - t_fid:.0f} s)",
                     flush=True)
                 if wb:
@@ -906,8 +914,6 @@ def main():
                     import wandb
                     grid = torchvision.utils.make_grid(imgs.cpu(), nrow=4)
                     wb.log({"val/fd_dinov2": fd, "samples": wandb.Image(grid), "train/samples": samples}, step=step)
-        if step % args.ckpt_every == 0 or step == args.steps or (args.keep_every and step % args.keep_every == 0):
-            save()
         if master and args.merge_every and step >= args.merge_start * args.steps and (
                 step % args.merge_every == 0 or step == args.steps):
             save_merge()
