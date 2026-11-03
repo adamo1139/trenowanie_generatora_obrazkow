@@ -60,9 +60,9 @@ def main():
     p.add_argument("--src", default="英语")      # English
     p.add_argument("--tgt", default="波兰语")    # Polish
     p.add_argument("--max-tokens", type=int, default=768)
-    p.add_argument("--gpu-mem", type=float, default=0.9)
+    p.add_argument("--gpu-mem", type=float, default=0.85)
     p.add_argument("--max-num-seqs", type=int, default=1024, help="sequences decoded at once (vLLM default 256)")
-    p.add_argument("--max-batched-tokens", type=int, default=32768, help="tokens per scheduler step (prefill chunk)")
+    p.add_argument("--max-batched-tokens", type=int, default=16384, help="tokens per scheduler step (prefill chunk)")
     p.add_argument("--pilot", type=int, default=0, help="translate this many captions of the first shard, print samples")
     a = p.parse_args()
 
