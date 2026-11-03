@@ -25,7 +25,7 @@ Odcinki (wznowienia z checkpointu, dane kontynuowane od tego samego obrazu):
 | 34,944 – 45,056 | 1024 | 3e-3 | iREPA 0.5 każdy krok do 44,711 |
 | 45,056 – 48,128 | 4096 | 1e-2 | REPA 0.5 co 32 kroki |
 | 48,128 – 69,888 | 1024 | 3e-3 | iREPA 0.5 każdy krok |
-| 69,888 – | 1024 | 3e-3 | off |
+| 69,888 – 86,997 | 1024 | 3e-3 | off |
 
 | krok | obrazy | epoki | wagi | FD-DINOv2 |
 |---|---|---|---|---|
@@ -44,6 +44,8 @@ Odcinki (wznowienia z checkpointu, dane kontynuowane od tego samego obrazu):
 | 60,928 | 61.51M | 10.46 | EMA | 29.80 |
 | 62,720 | 63.34M | 10.77 | EMA | 29.50 |
 | 69,632 | 70.42M | 11.98 | EMA | 28.99 |
+| 86,997 (koniec) | 88.20M | 15.00 | EMA | 28.27 |
+| 86,997 (koniec) | 88.20M | 15.00 | WSM/QAM (`merged.pt`, snapshoty 70,400–86,997) | **27.66** |
 
 Wnioski:
 - Skok lr 3e-3 → 1e-2 (krok 45,056) pogorszył FD z 33.5 do 43.2; po powrocie do 3e-3 z iREPA szybki spadek do 29.5.
@@ -51,7 +53,9 @@ Wnioski:
 - iREPA przy lr 3e-3 nie szkodziła w środku treningu (wbrew HASTE), raczej pomogła (40,704: ~0.5 lepiej niż trend
   bez REPA). Około kroku 69k strata `repa` się nasyciła (-0.735) i REPA została wyłączona.
 - EMA ~2.6 punktu lepsze od surowych wag (34,304 vs 34,560).
+- Na końcu WSM/QAM z 6 snapshotów ostatniego odcinka (bez REPA) lepszy od EMA: 27.66 vs 28.27.
+- Po wyłączeniu REPA (69,888) EMA `val/loss` spadała ~4× szybciej niż w ostatnim odcinku z iREPA.
 - Przy podobnej liczbie obrazów: 641M ~33.5 (31.4M obrazów) vs IMG-253M 37.6 (29.4M); IMG-50M przy 63.4M obrazów 69.6.
 
 EMA `val/loss` (ten sam zbiór, stałe t i szum): 0.7107 (1,536) → 0.6531 (34,816) → 0.6431 (49,152) → 0.6378 (61,440)
-→ 0.6365 (69,632). Dla porównania IMG-50M (EMA) 0.7030.
+→ 0.6365 (69,632) → 0.6327 (75,776) → 0.6303 (86,997). Dla porównania IMG-50M (EMA) 0.7030.
