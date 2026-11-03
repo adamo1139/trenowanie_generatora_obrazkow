@@ -89,13 +89,15 @@ def main():
                 combos.append(dict(method=method, scheme=scheme, window=window, idx=idx,
                                    c=merge_weights(scheme, len(idx), method)))
 
-    # checkpoints used by any combination go to the GPU once (bf16 copies would lose the small differences between
-    # neighbouring checkpoints, so fp32); every combination is then built in ONE reused buffer, scored, and only the
-    # best one is kept (on the CPU). GPU memory: (#checkpoints + 2) model copies, independent of #combinations.
+    # checkpoints used by any combination are loaded once into RAM in fp32 (bf16 copies would lose the small
+    # differences between neighbouring checkpoints); every combination is built on the CPU in ONE reused buffer and
+    # only copied into the model on the GPU for scoring. GPU memory: one model, whatever the model size or the number
+    # of checkpoints (6 fp32 copies of a 0.68B model no longer fit next to it on a 24 GB card).
     dev = "cuda"
+    torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))  # torchrun-free script: use the CPU for the sums
     keys = [("te", k) for k in meta[0]["te"]] + [("den", k) for k in meta[0]["den"]]
     used = sorted({i for cb in combos for i in cb["idx"]})
-    ckpts = {i: [meta[i][part][k].to(dev, torch.float32) for part, k in keys] for i in used}
+    ckpts = {i: [meta[i][part][k].to("cpu", torch.float32, copy=True) for part, k in keys] for i in used}
     buf = [torch.empty_like(t) for t in ckpts[used[0]]]
 
     def build(cb):
@@ -115,7 +117,7 @@ def main():
         te.load_state_dict(te_sd), den.load_state_dict(den_sd)
         return evaluate(te, den, val, dev)["val/loss"]
 
-    raw = score(*({k: v.to(dev) for k, v in meta[-1][part].items()} for part in ("te", "den")))
+    raw = score(*(dict(meta[-1][part]) for part in ("te", "den")))
     print(f"{'raw weights @ last step':34s} val/loss {raw:.5f}")
     latest = os.path.join(args.run, "latest.pt")
     if os.path.exists(latest):
@@ -129,7 +131,7 @@ def main():
         te_sd, den_sd = build(cb)
         loss = score(te_sd, den_sd)
         if best is None or loss < best[0]:
-            best = (loss, cb, {k: v.cpu() for k, v in te_sd.items()}, {k: v.cpu() for k, v in den_sd.items()})
+            best = (loss, cb, {k: v.clone() for k, v in te_sd.items()}, {k: v.clone() for k, v in den_sd.items()})
         label = f"{cb['method'].upper()} {cb['scheme']:7s} window {cb['window']:.0%} ({len(cb['idx'])} ckpt)"
         print(f"{label:34s} val/loss {loss:.5f}")
 
