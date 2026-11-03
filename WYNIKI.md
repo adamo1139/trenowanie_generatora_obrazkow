@@ -45,7 +45,7 @@ Odcinki (wznowienia z checkpointu, dane kontynuowane od tego samego obrazu):
 | 62,720 | 63.34M | 10.77 | EMA | 29.50 |
 | 69,632 | 70.42M | 11.98 | EMA | 28.99 |
 | 86,997 (koniec) | 88.20M | 15.00 | EMA | 28.27 |
-| 86,997 (koniec) | 88.20M | 15.00 | WSM/QAM (`merged.pt`, snapshoty 70,400–86,997) | **27.66** |
+| 86,997 (koniec) | 88.20M | 15.00 | WSM mean, okno 12% (`merged.pt`, snapshoty 77,440 / 80,960 / 84,480 / 86,997) | **27.66** |
 
 Wnioski:
 - Skok lr 3e-3 → 1e-2 (krok 45,056) pogorszył FD z 33.5 do 43.2; po powrocie do 3e-3 z iREPA szybki spadek do 29.5.
@@ -53,7 +53,9 @@ Wnioski:
 - iREPA przy lr 3e-3 nie szkodziła w środku treningu (wbrew HASTE), raczej pomogła (40,704: ~0.5 lepiej niż trend
   bez REPA). Około kroku 69k strata `repa` się nasyciła (-0.735) i REPA została wyłączona.
 - EMA ~2.6 punktu lepsze od surowych wag (34,304 vs 34,560).
-- Na końcu WSM/QAM z 6 snapshotów ostatniego odcinka (bez REPA) lepszy od EMA: 27.66 vs 28.27.
+- Na końcu WSM lepszy od EMA: FD 27.66 vs 28.27, `val/loss` 0.62974 vs 0.63035 (raw z ostatniego kroku 0.63292).
+  `merge.py` (6 snapshotów co 3,520 kroków z odcinka bez REPA): najlepszy WSM mean z oknem 12% (4 ckpt); okna 8–12%
+  lepsze niż 4% i 20%; schemat mean > cosine > 1-sqrt; QAM nie wygrał z WSM przy tak krótkich oknach (≤6 ckpt).
 - Po wyłączeniu REPA (69,888) EMA `val/loss` spadała ~4× szybciej niż w ostatnim odcinku z iREPA.
 - Przy podobnej liczbie obrazów: 641M ~33.5 (31.4M obrazów) vs IMG-253M 37.6 (29.4M); IMG-50M przy 63.4M obrazów 69.6.
 
