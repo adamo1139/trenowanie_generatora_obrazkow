@@ -61,6 +61,8 @@ def main():
     p.add_argument("--tgt", default="波兰语")    # Polish
     p.add_argument("--max-tokens", type=int, default=768)
     p.add_argument("--gpu-mem", type=float, default=0.9)
+    p.add_argument("--max-num-seqs", type=int, default=1024, help="sequences decoded at once (vLLM default 256)")
+    p.add_argument("--max-batched-tokens", type=int, default=32768, help="tokens per scheduler step (prefill chunk)")
     p.add_argument("--pilot", type=int, default=0, help="translate this many captions of the first shard, print samples")
     a = p.parse_args()
 
@@ -69,7 +71,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     # the model is a multimodal Qwen3.5: text only, so vLLM does not profile (and OOM on) the video encoder
     llm = LLM(a.model, gpu_memory_utilization=a.gpu_mem, max_model_len=4096, enable_prefix_caching=True,
-              limit_mm_per_prompt={"image": 0, "video": 0})
+              limit_mm_per_prompt={"image": 0, "video": 0}, max_num_seqs=a.max_num_seqs,
+              max_num_batched_tokens=a.max_batched_tokens)
     params = SamplingParams(temperature=0.0, max_tokens=a.max_tokens)
 
     def prompt(text):
