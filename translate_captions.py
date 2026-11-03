@@ -67,7 +67,9 @@ def main():
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
     tok = AutoTokenizer.from_pretrained(a.model)
-    llm = LLM(a.model, gpu_memory_utilization=a.gpu_mem, max_model_len=4096, enable_prefix_caching=True)
+    # the model is a multimodal Qwen3.5: text only, so vLLM does not profile (and OOM on) the video encoder
+    llm = LLM(a.model, gpu_memory_utilization=a.gpu_mem, max_model_len=4096, enable_prefix_caching=True,
+              limit_mm_per_prompt={"image": 0, "video": 0})
     params = SamplingParams(temperature=0.0, max_tokens=a.max_tokens)
 
     def prompt(text):
