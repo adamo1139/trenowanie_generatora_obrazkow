@@ -203,6 +203,8 @@ class LMEncoderConfig:
     head_dim: int = 64
     mlp_hidden: int = 2048
     max_tokens: int = 96
+    backend: str = "slayer"  # "slayer" = aurora/slayer.py GPT, "hf" = transformers causal LM (aurora/hf_compat.py)
+    experts: int = 0         # hf MoE: active experts per token (0 = the model's own)
 
 
 @dataclass
@@ -354,12 +356,21 @@ TE_SIZES = {
     "13m": TextEncoderConfig(),
     "27m": TextEncoderConfig(dim=512, depth=8, heads=8, kv_heads=2, head_dim=64, mlp_hidden=1408),
     "slayer149": LMEncoderConfig(),  # frozen SlayerLab/Slayer149 + 2-block refiner (~12M trainable)
+    # frozen cpral/Poziomka-Baza (Polish/English 4B MoE, 16 layers x 2048, 128 experts) with 4 of its 32 active
+    # experts; captions [EOS-as-BOS] ids[:255] (prepare_data.py tokenize --encoder poziomka [--lang pl])
+    "poziomka": LMEncoderConfig(repo="cpral/Poziomka-Baza-2026-09-05", tok_suffix="poziomka", lm_dim=2048,
+                                skip_last=0, max_tokens=256, backend="hf", experts=4),
 }
 
 
-def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None, depth: int = None):
-    """te_dim / te_depth resize the trainable refiner of an LM text encoder (heads of 64, GQA, SwiGLU 8/3 x dim)."""
+def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None, depth: int = None,
+                 te_experts: int = None):
+    """te_dim / te_depth resize the trainable refiner of an LM text encoder (heads of 64, GQA, SwiGLU 8/3 x dim);
+    te_experts sets the active experts of an MoE LM."""
     te_cfg = TE_SIZES[te_size]
+    if te_experts:
+        assert getattr(te_cfg, "backend", "") == "hf", "--te-experts only applies to transformers (MoE) LM encoders"
+        te_cfg = replace(te_cfg, experts=te_experts)
     if te_dim or te_depth:
         assert isinstance(te_cfg, LMEncoderConfig), "--te-dim / --te-depth only apply to LM text encoders"
         dim = te_dim or te_cfg.dim

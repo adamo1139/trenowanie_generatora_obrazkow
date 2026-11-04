@@ -65,6 +65,8 @@ def _fused_moe_infer(self, x, topk_ids, topk_weight):
     order = flat.argsort(stable=True)
     counts = torch.bincount(flat, minlength=self._wg.shape[0])
     xs = x[order // k]
+    if self._grouped is None:  # decided on the device the weights ended up on
+        self._grouped = _grouped_mm_works(x.device, x.dtype)
     if self._grouped:
         offs = counts.cumsum(0).to(torch.int32)
         h = self._act(torch._grouped_mm(xs, self._wg, offs=offs)) * torch._grouped_mm(xs, self._wu, offs=offs)
@@ -103,15 +105,16 @@ def fuse_moe(model):
         experts = getattr(mod, "experts", None)
         if experts is None or not hasattr(mod, "moe_infer") or not isinstance(experts, torch.nn.ModuleList):
             continue
-        # (E, in, out) and contiguous: the layout both grouped_mm and bmm(x, w) want
-        mod._wg = torch.stack([e.gate_proj.weight.t() for e in experts]).contiguous()
-        mod._wu = torch.stack([e.up_proj.weight.t() for e in experts]).contiguous()
-        mod._wd = torch.stack([e.down_proj.weight.t() for e in experts]).contiguous()
+        # (E, in, out) and contiguous: the layout both grouped_mm and bmm(x, w) want; buffers, so .to() moves them
+        for name, proj in (("_wg", "gate_proj"), ("_wu", "up_proj"), ("_wd", "down_proj")):
+            w = torch.stack([getattr(e, proj).weight.t() for e in experts]).contiguous()
+            mod.register_buffer(name, w, persistent=False)
         mod._act = experts[0].act_fn
-        mod._grouped = _grouped_mm_works(mod._wg.device, mod._wg.dtype)
+        mod._grouped = None
         mod.moe_infer = types.MethodType(_fused_moe_infer, mod)
         del mod.experts
         mod.experts = list(range(mod._wg.shape[0]))  # len(self.experts) still works for any remaining code
         n += 1
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return n

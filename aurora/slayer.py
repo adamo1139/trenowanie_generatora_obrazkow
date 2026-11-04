@@ -154,9 +154,13 @@ class LMTextEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.config = cfg
-        lm, _ = load_lm(cfg.repo)
+        if getattr(cfg, "backend", "slayer") == "hf":
+            lm = load_hf_lm(cfg)
+            self.n_blocks = len(lm.model.layers)
+        else:
+            lm, _ = load_lm(cfg.repo)
+            self.n_blocks = len(lm.blocks) - cfg.skip_last
         self.__dict__["lm"] = lm  # frozen, unregistered (see module docstring)
-        self.n_blocks = len(lm.blocks) - cfg.skip_last
         self.in_norm = _RMSNorm(cfg.lm_dim)
         self.null = nn.Parameter(torch.zeros(1, 1, cfg.lm_dim))  # learned CFG null prompt
         self.in_proj = nn.Linear(cfg.lm_dim, cfg.dim, bias=False) if cfg.dim != cfg.lm_dim else nn.Identity()
@@ -197,7 +201,10 @@ class LMTextEncoder(nn.Module):
         """Frozen LM hidden states (no gradient); train_pp.py computes these on other GPUs and passes them in."""
         # pads / null marker -> any real id; attention is causal and padding is on the right, so real tokens never
         # see them, and their positions are masked out downstream
-        return self.lm.hidden(ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0), self.n_blocks)
+        ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
+        if getattr(self.config, "backend", "slayer") == "hf":
+            return _hf_states(self.lm, ids)
+        return self.lm.hidden(ids, self.n_blocks)
 
     def forward(self, ids: torch.Tensor, lm_states: torch.Tensor = None):
         valid = ids.ne(LM_PAD)
@@ -206,6 +213,50 @@ class LMTextEncoder(nn.Module):
         h = self.in_norm(h)
         h = torch.where(is_null[:, None, None], self.null.to(h.dtype).expand_as(h), h)
         h = self.in_proj(h)
+        T = ids.shape[1]  # rows may be trimmed below max_tokens (trim_ids)
+        cos, sin = self.rope_cos[..., :T, :], self.rope_sin[..., :T, :]
         for block in self.blocks:
-            h = block(h, valid, self.rope_cos, self.rope_sin)
+            h = block(h, valid, cos, sin)
         return self.norm(h), valid
+
+
+def load_hf_lm(cfg):
+    """Transformers causal LM (e.g. cpral/Poziomka-Baza, BailingMoeV2) through aurora/hf_compat.py: first
+    num_layers - skip_last decoder layers only, cfg.experts active MoE experts (0 = the model's own), batched experts.
+    Loaded straight onto the current GPU (8 ranks x a few GB of fp32 staging in RAM would not fit)."""
+    import json as _json
+
+    from huggingface_hub import hf_hub_download
+
+    from aurora.hf_compat import load_causal_lm
+    total = _json.load(open(hf_hub_download(cfg.repo, "config.json")))["num_hidden_layers"]
+    overrides = {"num_experts_per_tok": cfg.experts} if cfg.experts else {}
+    device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+    lm, _ = load_causal_lm(cfg.repo, device, num_layers=total - cfg.skip_last, fused_moe=True, **overrides)
+    return lm
+
+
+@torch.compiler.disable  # remote code + data-dependent MoE routing: stays eager when the refiner is compiled
+def _hf_states(lm, ids):
+    with torch.autocast("cuda", enabled=False):  # bf16 weights already; autocast on top gives NaN in BailingMoeV2
+        return lm.model(input_ids=ids, use_cache=False).last_hidden_state
+
+
+def trim_ids(ids: torch.Tensor, multiple: int = 32) -> torch.Tensor:
+    """Drop the all-padding tail columns of a batch of caption rows (rounded up to `multiple`, so a compiled model
+    sees few distinct shapes). Rows are right-padded with LM_PAD; the null prompt keeps its first column."""
+    n = int(ids.ne(LM_PAD).sum(1).max()) if ids.numel() else 1
+    return ids[:, : min(ids.shape[1], max(multiple, -(-n // multiple) * multiple))]
+
+
+def length_sorted(lat: torch.Tensor, ids: torch.Tensor, parts: int, generator=None):
+    """Split one GPU's samples of a step into `parts` micro-batches of similar caption length (sorted by length, then
+    shuffled inside each part), each trimmed with trim_ids: the frozen LM and the text attention then run on ~the real
+    caption lengths instead of max_tokens. Gradient accumulation sums over all of them, so the step is unchanged."""
+    order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
+    out = []
+    for part in order.chunk(parts):
+        part = part[torch.randperm(len(part), generator=generator)]
+        out.append((lat[part], trim_ids(ids[part])))
+    return out
+

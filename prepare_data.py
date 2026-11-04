@@ -14,6 +14,9 @@
 
   # 2) tokenize captions (uses the released BPE tokenizer by default)
   python prepare_data.py tokenize --data data/aurora --tokenizer AuroraIMG2-50M-Preview/tokenizer/tokenizer.json
+  #    for a frozen-LM text encoder, e.g. Poziomka, English and then the Polish translations (translate_captions.py):
+  python prepare_data.py tokenize --data data/aurora --encoder poziomka
+  python prepare_data.py tokenize --data data/aurora --encoder poziomka --lang pl
 
 Only `lat` and `caps` are kept; `dino` (first 60 shards) and `clip` are dropped.
 """
@@ -163,20 +166,37 @@ def cmd_convert(args):
 ENCODERS = {
     # frozen LM: [<|endoftext|>] ids[:95], right-padded with 65535 (see aurora/slayer.py)
     "slayer149": dict(repo="SlayerLab/Slayer149", width=96, bos=12285, pad=65535, leading_space=False),
+    # [EOS = document separator] ids[:255]; 256 covers p95 of the English captions (243 tokens), Polish ones are shorter
+    "poziomka": dict(repo="cpral/Poziomka-Baza-2026-09-05", width=256, bos=1, pad=65535, leading_space=False),
 }
 
 
-def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = ""):
+def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = "", lang: str = ""):
+    """lang (e.g. "pl"): the translated captions from <shard>.caps_<lang>.json (translate_captions.py), row for row
+    aligned with the English ones (same .off.npy); a translation flagged as broken falls back to the English caption."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(tokenizer_path)
     enc_cfg = ENCODERS.get(encoder)
     lead = " " if enc_cfg is None else ("" if not enc_cfg["leading_space"] else " ")
     with open(os.path.join(data, name + ".caps.json")) as f:
         caps = json.load(f)
+    trans, fallback = None, 0
+    if lang:
+        from translate_captions import suspicious
+        with open(os.path.join(data, f"{name}.caps_{lang}.json")) as f:
+            trans = json.load(f)
+        assert len(trans) == len(caps), name
     flat, off = [], np.zeros(len(caps) + 1, dtype=np.int64)
     for i, cs in enumerate(caps):
         # Aurora tokenizer: identical to AuroraIMG2Pipeline._tokenize (collapsed whitespace, explicit leading space)
-        flat += [lead + " ".join(c.split()) for c in cs if c.split()]
+        if trans is None:
+            flat += [lead + " ".join(c.split()) for c in cs if c.split()]
+        else:
+            for c, t in zip(cs, trans[i]):
+                if c.split():  # same captions kept as for English, so the rows line up
+                    bad = suspicious(c, t)
+                    fallback += bad
+                    flat.append(lead + " ".join((c if bad else t).split()))
         off[i + 1] = len(flat)
     encoded = tok.encode_batch(flat, add_special_tokens=False)
     if enc_cfg is None:
@@ -194,10 +214,13 @@ def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = ""):
             ids = e.ids[: w - 1]
             rows[j, 0] = enc_cfg["bos"]
             rows[j, 1:1 + len(ids)] = ids
-        out = f"{name}.tok_{encoder}.npy"
+        out = f"{name}.tok_{encoder}{'_' + lang if lang else ''}.npy"
     save_npy(os.path.join(data, out), rows)
-    save_npy(os.path.join(data, name + ".off.npy"), off)  # .off.npy written last = shard tokenised
-    return name, len(caps), len(flat)
+    if lang:  # .off.npy belongs to the English captions; check instead of rewriting it
+        assert np.array_equal(np.load(os.path.join(data, name + ".off.npy")), off), f"{name}: captions do not line up"
+    else:
+        save_npy(os.path.join(data, name + ".off.npy"), off)  # .off.npy written last = shard tokenised
+    return name, len(caps), len(flat), fallback
 
 
 def cmd_tokenize(args):
@@ -206,14 +229,19 @@ def cmd_tokenize(args):
     if args.encoder:
         from huggingface_hub import hf_hub_download
         tokenizer = hf_hub_download(ENCODERS[args.encoder]["repo"], "tokenizer.json")
-    done = lambda n: os.path.exists(os.path.join(args.data, f"{n}.tok_{args.encoder}.npy" if args.encoder else n + ".off.npy"))
+    assert not args.lang or args.encoder, "--lang needs --encoder (and the English captions tokenised first)"
+    suffix = f"tok_{args.encoder}" + (f"_{args.lang}" if args.lang else "")
+    done = lambda n: os.path.exists(os.path.join(args.data, f"{n}.{suffix}.npy" if args.encoder else n + ".off.npy"))
     todo = [n for n in names if args.force or not done(n)]
-    print(f"{len(names)} shards, {len(todo)} to tokenise" + (f" for {args.encoder}" if args.encoder else ""))
+    if args.lang:  # shards without a translation are skipped (train.py then refuses --pl-prob)
+        todo = [n for n in todo if os.path.exists(os.path.join(args.data, f"{n}.caps_{args.lang}.json"))]
+    print(f"{len(names)} shards, {len(todo)} to tokenise" + (f" for {suffix}" if args.encoder else ""))
     with ProcessPoolExecutor(args.workers) as ex:
-        futs = [ex.submit(tokenize_one, n, args.data, tokenizer, args.encoder) for n in todo]
+        futs = [ex.submit(tokenize_one, n, args.data, tokenizer, args.encoder, args.lang) for n in todo]
         for i, fut in enumerate(as_completed(futs)):
-            name, n, c = fut.result()
-            print(f"[{i + 1}/{len(futs)}] {name}: {n} images, {c} captions", flush=True)
+            name, n, c, fb = fut.result()
+            print(f"[{i + 1}/{len(futs)}] {name}: {n} images, {c} captions"
+                  + (f", {fb} flagged -> English" if args.lang else ""), flush=True)
 
 
 def main():
@@ -236,6 +264,8 @@ def main():
     s.add_argument("--tokenizer", default="AuroraIMG2-50M-Preview/tokenizer/tokenizer.json")
     s.add_argument("--encoder", choices=[""] + sorted(ENCODERS), default="",
                    help="tokenise for another text encoder (writes <shard>.tok_<encoder>.npy, keeps .tok.npy)")
+    s.add_argument("--lang", default="", help="tokenise the translated captions <shard>.caps_<lang>.json instead "
+                   "(writes <shard>.tok_<encoder>_<lang>.npy; e.g. --encoder poziomka --lang pl)")
     s.add_argument("--workers", type=int, default=8)
     s.add_argument("--force", action="store_true")
     args = p.parse_args()

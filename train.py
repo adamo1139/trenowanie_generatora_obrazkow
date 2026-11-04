@@ -35,6 +35,7 @@ from aurora.data import (MASK_ID, ShardStore, TrainStream, full_shard_list, list
 from aurora.model import (SIZES, TE_SIZES, DenoiserConfig, LMEncoderConfig, TextEncoderConfig, build_models,
                           make_configs, te_config_from_dict)
 from aurora.muon import Muon
+from aurora.slayer import length_sorted, trim_ids
 
 
 def build_parser():
@@ -52,6 +53,11 @@ def build_parser():
                    help="LM text encoder: refiner width (default: half the denoiser width; 768 + --te-depth 2 = the "
                         "original ~13M refiner, needed to resume older runs)")
     p.add_argument("--te-depth", type=int, default=None, help="LM text encoder: refiner blocks (default 2)")
+    p.add_argument("--te-experts", type=int, default=None,
+                   help="MoE LM text encoder (--te-size poziomka): active experts per token (default: the preset's)")
+    p.add_argument("--pl-prob", type=float, default=0.0,
+                   help="share of training captions taken from the Polish translations (<shard>.tok_<enc>_pl.npy, "
+                        "prepare_data.py tokenize --encoder ... --lang pl); validation stays English")
     p.add_argument("--repa-weight", type=float, default=0.5, help="REPA loss weight (0 = off)")
     p.add_argument("--repa-encoder", default="vit_base_patch14_reg4_dinov2.lvd142m",
                    help="timm vision encoder for REPA targets (default: DINOv2-B/14 with registers, Apache-2.0; "
@@ -405,8 +411,11 @@ def evaluate(te, den, val, device, seed=1234, chunk=256):
     for i in range(0, len(lat), chunk):
         x0 = lat[i:i + chunk].to(device).float()
         t, eps = t_all[i:i + chunk].to(device), eps_all[i:i + chunk].to(device)
+        chunk_ids = ids[i:i + chunk].to(device)
+        if getattr(te.config, "kind", "") == "lm":
+            chunk_ids = trim_ids(chunk_ids)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            text, valid = te(ids[i:i + chunk].to(device))
+            text, valid = te(chunk_ids)
             tt = t.view(-1, 1, 1, 1)
             v = den((1 - tt) * x0 + tt * eps, t, text, valid)
         per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
@@ -560,7 +569,7 @@ def main():
     # ---- model ---------------------------------------------------------------------------------
     den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size,
                                                                                       args.te_dim, args.te_depth,
-                                                                                      args.depth)
+                                                                                      args.depth, args.te_experts)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)
@@ -572,8 +581,12 @@ def main():
 
     # ---- data ----------------------------------------------------------------------------------
     tok_suffix = getattr(te_cfg, "tok_suffix", "")
-    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix)
-    store = ShardStore(args.data, train_names, tok_suffix, te.null_ids())
+    alt_suffix = f"{tok_suffix}_pl" if args.pl_prob > 0 else ""
+    assert not alt_suffix or tok_suffix, "--pl-prob needs a frozen-LM text encoder (--te-size poziomka)"
+    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix)
+    store = ShardStore(args.data, train_names, tok_suffix, te.null_ids(), alt_suffix, args.pl_prob)
+    if alt_suffix:
+        log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
     log(f"train: {len(train_names)} shards / {len(store):,} images, val: {len(val_names)} shards {val_names}")
     log(f"{args.steps} steps x {args.batch} = {args.steps * args.batch / len(store):.1f} epochs over the training set")
     val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids()) if (master and val_names) else None
@@ -794,17 +807,20 @@ def main():
                 wb.log({"val/fd_dinov2": fd, "samples": wandb.Image(torchvision.utils.make_grid(imgs.cpu(), nrow=4)),
                         "train/samples": samples}, step=step)
         t0 = time.time()
+    lm_te = isinstance(te_cfg, LMEncoderConfig)
     while step < args.steps:
         mlm_step = args.mlm_weight > 0 and step % args.mlm_every == 0
-        for micro in range(accum):
-            lat, ids = next(loader)
+        micros = [next(loader) for _ in range(accum)]
+        if lm_te:  # micro-batches of similar caption length, trimmed: the frozen LM sees ~real lengths, not max_tokens
+            micros = length_sorted(torch.cat([m[0] for m in micros]), torch.cat([m[1] for m in micros]), accum)
+        for micro, (lat, ids) in enumerate(micros):
             x0 = lat.to(device, non_blocking=True).float()
             ids = ids.to(device, non_blocking=True)
             b = x0.shape[0]
             t = torch.sigmoid(torch.randn(b, device=device))  # logit-normal(0, 1)
             eps = torch.randn_like(x0)
             drop = torch.rand(b, device=device) < args.cfg_drop
-            cond_ids = torch.where(drop[:, None], null_row, ids)
+            cond_ids = torch.where(drop[:, None], null_row[: ids.shape[1]], ids)
             mlm_ids, mlm_labels = make_mlm(ids, args.mlm_prob) if mlm_step else (None, None)
             # with --repa-every N, REPA steps sit mid-period (N/2, 3N/2, ...) so they never coincide with the step
             # right after a MuLoCo sync, where the gradient noise scale is measured on the plain flow-matching loss

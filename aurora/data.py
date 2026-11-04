@@ -5,6 +5,7 @@
   <name>.off.npy   int64   [N + 1]            captions of image i are tok[off[i]:off[i+1]]
   <name>.tok_<enc>.npy  uint16 [C, L]          the same captions for another text encoder (e.g. tok_slayer149,
                                              L = 96, PAD = 65535); same order, so .off.npy is shared
+  <name>.tok_<enc>_<lang>.npy                 the translated captions (e.g. tok_poziomka_pl), row for row the same
 
 Everything is opened with mmap, so the page cache is shared by all ranks and loader workers on a node.
 """
@@ -71,17 +72,18 @@ def tok_kind(suffix: str = "") -> str:
     return f"tok_{suffix}" if suffix else "tok"
 
 
-def select_shards(root: str, fraction: float, tok_suffix: str = ""):
+def select_shards(root: str, fraction: float, tok_suffix: str = "", alt_suffix: str = ""):
     """(train, val) shard names for a fraction of the FULL dataset; val shards do not depend on the fraction."""
-    kind = tok_kind(tok_suffix)
-    present = [n for n in list_shards(root) if os.path.exists(os.path.join(root, f"{n}.{kind}.npy"))]
+    kinds = [tok_kind(tok_suffix)] + ([tok_kind(alt_suffix)] if alt_suffix else [])
+    present = [n for n in list_shards(root) if all(os.path.exists(os.path.join(root, f"{n}.{k}.npy")) for k in kinds)]
     train, val = split_shards(full_shard_list(root))
     train = select_fraction(train, fraction)
     missing = sorted(set(train + val) - set(present))
     if missing:
         raise SystemExit(f"{len(missing)} shards selected by --fraction {fraction} are not prepared in {root} "
                          f"(e.g. {missing[0]}); run: prepare_data.py convert ... --fraction {fraction} + tokenize"
-                         + (f" --encoder {tok_suffix}" if tok_suffix else ""))
+                         + (f" --encoder {tok_suffix}" if tok_suffix else "")
+                         + (f" (and --lang {alt_suffix.split('_')[-1]})" if alt_suffix else ""))
     assert train, f"no prepared shards in {root}"
     return train, val
 
@@ -100,15 +102,19 @@ def ensure_open_files(needed: int):
 
 
 class ShardStore:
-    def __init__(self, root: str, names, tok_suffix: str = "", null_row=None):
+    def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0):
+        """alt_suffix / alt_prob: with probability alt_prob a sample's caption comes from <name>.tok_<alt_suffix>.npy
+        (the same caption translated, e.g. poziomka_pl) instead."""
         self.root, self.names = root, list(names)
         self.tok = tok_kind(tok_suffix)
+        self.alt = tok_kind(alt_suffix) if alt_suffix and alt_prob > 0 else None
+        self.alt_prob = alt_prob
         self.null_row = null_ids() if null_row is None else np.asarray(null_row, dtype=np.int64)
-        ensure_open_files(2 * len(self.names) + 512)
+        ensure_open_files((3 if self.alt else 2) * len(self.names) + 512)
         self.offs = [np.load(self._p(n, "off")) for n in self.names]
         self.sizes = np.array([len(o) - 1 for o in self.offs], dtype=np.int64)
         self.starts = np.concatenate([[0], np.cumsum(self.sizes)])
-        self._lat, self._tok = None, None
+        self._lat, self._tok, self._alt = None, None, None
 
     def _p(self, name, kind):
         return os.path.join(self.root, f"{name}.{kind}.npy")
@@ -120,6 +126,8 @@ class ShardStore:
         if self._lat is None:
             self._lat = [np.load(self._p(n, "lat"), mmap_mode="r") for n in self.names]
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
+            if self.alt:
+                self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
 
     def fetch(self, indices: np.ndarray, rng: np.random.Generator | None):
         """Latents + one caption per image (random if rng is given, else the first one)."""
@@ -133,8 +141,11 @@ class ShardStore:
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
             if hi == lo:
                 ids[j] = self.null_row
+            elif rng is None:
+                ids[j] = self._tok[s][lo]
             else:
-                ids[j] = self._tok[s][lo if rng is None else rng.integers(lo, hi)]
+                c = rng.integers(lo, hi)
+                ids[j] = (self._alt if self.alt and rng.random() < self.alt_prob else self._tok)[s][c]
         return lat, ids
 
 
