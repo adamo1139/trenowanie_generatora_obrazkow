@@ -205,6 +205,8 @@ class LMEncoderConfig:
     max_tokens: int = 96
     backend: str = "slayer"  # "slayer" = aurora/slayer.py GPT, "hf" = transformers causal LM (aurora/hf_compat.py)
     experts: int = 0         # hf MoE: active experts per token (0 = the model's own)
+    out_dim: int = 0         # != 0: refiner output projected to this width (= denoiser text_dim), e.g. a new refiner
+                             # of another size in front of a pretrained denoiser
 
 
 @dataclass
@@ -393,7 +395,8 @@ def configs_from_ckpt(ck):
 
 
 def build_models(den_cfg: DenoiserConfig = DenoiserConfig(), te_cfg=TextEncoderConfig()):
-    assert den_cfg.text_dim == te_cfg.dim, f"denoiser text_dim {den_cfg.text_dim} != text encoder dim {te_cfg.dim}"
+    te_out = getattr(te_cfg, "out_dim", 0) or te_cfg.dim
+    assert den_cfg.text_dim == te_out, f"denoiser text_dim {den_cfg.text_dim} != text encoder output {te_out}"
     if isinstance(te_cfg, LMEncoderConfig):
         from aurora.slayer import LMTextEncoder
         te = LMTextEncoder(te_cfg)

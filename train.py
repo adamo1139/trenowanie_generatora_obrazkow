@@ -21,7 +21,7 @@ import math
 import os
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import torch
 import torch.distributed as dist
@@ -165,6 +165,11 @@ def build_parser():
     p.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--load-hf", default="", help="init from a released AuroraIMG2 repo dir")
+    p.add_argument("--init", default="", help="start from the denoiser of this checkpoint (train.py snapshot / "
+                   "latest.pt: its EMA weights; merge.py output: the merged weights) with a NEW text encoder "
+                   "(--te-size / --te-dim / --te-depth; projected to the denoiser's text width); ignored on resume")
+    p.add_argument("--freeze-den", action="store_true",
+                   help="train only the text encoder (e.g. a new refiner in front of an --init denoiser)")
     p.add_argument("--per-shard", type=int, default=0,
                    help="--eval-only: also report loss per shard (N samples each) for the val shards and for the first "
                         "and a middle training shard of every subset, to tell generalisation from memorisation")
@@ -570,9 +575,31 @@ def main():
     den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size,
                                                                                       args.te_dim, args.te_depth,
                                                                                       args.depth, args.te_experts)
+    init_ck = None
+    if args.init:  # pretrained denoiser, new text encoder: its output is projected to the denoiser's text width
+        init_ck = torch.load(args.init, map_location="cpu", weights_only=False)
+        den_cfg = DenoiserConfig(**init_ck["den_config"])
+        assert isinstance(te_cfg, LMEncoderConfig), "--init needs a frozen-LM text encoder (e.g. --te-size poziomka)"
+        if (te_cfg.out_dim or te_cfg.dim) != den_cfg.text_dim:
+            te_cfg = replace(te_cfg, out_dim=den_cfg.text_dim)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)
+    if init_ck is not None and not os.path.exists(os.path.join(args.out, "latest.pt")):
+        den_params = list(den.parameters())
+        if init_ck.get("ema"):  # EMA list = old text encoder params, then the denoiser's, in parameters() order
+            with torch.no_grad():
+                for p_, e in zip(den_params, init_ck["ema"][-len(den_params):]):
+                    assert p_.shape == e.shape, (p_.shape, e.shape)
+                    p_.copy_(e)
+            src = "EMA"
+        else:
+            den.load_state_dict(init_ck["den"])
+            src = "weights"
+        log(f"init: denoiser {src} from {args.init} (step {init_ck.get('step')}), new text encoder")
+    del init_ck
+    if args.freeze_den:
+        den.requires_grad_(False)
     te.to(device), den.to(device)
     frozen = f" + frozen {te_cfg.repo} ({sum(p.numel() for p in te.lm.parameters()) / 1e6:.1f}M)" \
         if isinstance(te_cfg, LMEncoderConfig) else ""

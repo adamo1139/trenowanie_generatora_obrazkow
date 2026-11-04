@@ -167,6 +167,8 @@ class LMTextEncoder(nn.Module):
         self.blocks = nn.ModuleList([TextBlock(cfg.dim, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.mlp_hidden)
                                      for _ in range(cfg.depth)])
         self.norm = _RMSNorm(cfg.dim)
+        out = getattr(cfg, "out_dim", 0)
+        self.out_proj = nn.Linear(cfg.dim, out, bias=False) if out and out != cfg.dim else nn.Identity()
         cos, sin = build_rope_1d(cfg.max_tokens, cfg.head_dim)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -188,8 +190,9 @@ class LMTextEncoder(nn.Module):
                 nn.init.normal_(lin.weight, std=lin.in_features ** -0.5)
             nn.init.zeros_(block.attn.out.weight)  # ungated residual branches: zero output still gets a gradient
             nn.init.zeros_(block.mlp.out_proj.weight)
-        if isinstance(self.in_proj, nn.Linear):
-            nn.init.normal_(self.in_proj.weight, std=self.in_proj.in_features ** -0.5)
+        for lin in (self.in_proj, self.out_proj):
+            if isinstance(lin, nn.Linear):
+                nn.init.normal_(lin.weight, std=lin.in_features ** -0.5)
 
     def null_ids(self) -> np.ndarray:
         row = np.full(self.config.max_tokens, LM_PAD, dtype=np.int64)
@@ -217,7 +220,7 @@ class LMTextEncoder(nn.Module):
         cos, sin = self.rope_cos[..., :T, :], self.rope_sin[..., :T, :]
         for block in self.blocks:
             h = block(h, valid, cos, sin)
-        return self.norm(h), valid
+        return self.out_proj(self.norm(h)), valid
 
 
 def load_hf_lm(cfg):
