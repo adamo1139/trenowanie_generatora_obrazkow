@@ -64,7 +64,7 @@ def main():
         gr.Markdown(f"### IMG-50M · 256×256 text-to-image\n`{args.model}`")
         prompt = gr.Textbox(label="Prompt", lines=3, placeholder="a cozy cabin in a snowy forest at dusk")
         go = gr.Button("Generate", variant="primary")
-        gallery = gr.Gallery(label="Images", columns=2, height="auto", object_fit="contain")
+        gallery = gr.Gallery(label="Images", columns=2, height="auto", object_fit="contain", format="png")  # webp downloads as .bin on phones
         info = gr.Markdown()
         with gr.Accordion("Settings", open=False):
             steps = gr.Slider(4, 100, value=50, step=1, label="Steps (20 = fast, 50 = best)")
@@ -76,7 +76,7 @@ def main():
         go.click(generate, inputs, [gallery, info], api_name="generate")
         prompt.submit(generate, inputs, [gallery, info])
 
-    print(f"\nOpen on your phone: http://{lan_ip()}:{args.port}\n")
+    print(f"\nOpen on your phone: http://{lan_ip()}:{args.port}\n", flush=True)
     demo.queue(max_size=16).launch(server_name="0.0.0.0", server_port=args.port)
 
 
