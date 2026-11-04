@@ -356,10 +356,10 @@ TE_SIZES = {
     "13m": TextEncoderConfig(),
     "27m": TextEncoderConfig(dim=512, depth=8, heads=8, kv_heads=2, head_dim=64, mlp_hidden=1408),
     "slayer149": LMEncoderConfig(),  # frozen SlayerLab/Slayer149 + 2-block refiner (~12M trainable)
-    # frozen cpral/Poziomka-Baza (Polish/English 4B MoE, 16 layers x 2048, 128 experts) with 4 of its 32 active
-    # experts; captions [EOS-as-BOS] ids[:255] (prepare_data.py tokenize --encoder poziomka [--lang pl])
+    # frozen cpral/Poziomka-Baza (Polish/English 4B MoE, 16 layers x 2048, 128 experts) with 8 of its 32 active
+    # experts (BLiMP: 32 -> 68.5%, 8 -> 68.3%, 4 -> 67.2%); captions [EOS-as-BOS] ids[:255] (prepare_data.py tokenize --encoder poziomka [--lang pl])
     "poziomka": LMEncoderConfig(repo="cpral/Poziomka-Baza-2026-09-05", tok_suffix="poziomka", lm_dim=2048,
-                                skip_last=0, max_tokens=256, backend="hf", experts=4),
+                                skip_last=0, max_tokens=256, backend="hf", experts=8),
 }
 
 
