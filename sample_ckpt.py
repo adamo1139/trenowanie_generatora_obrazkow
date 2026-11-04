@@ -24,18 +24,8 @@ from aurora.model import DenoiserConfig, LMEncoderConfig, build_models, configs_
 from aurora.repa import REPATarget
 from aurora.slayer import LM_PAD
 from prepare_data import ENCODERS
-from sample import PROMPTS
+from sample import PROMPTS, PROMPTS_PL
 
-PROMPTS_PL = [
-    "rudy lis siedzący w zaśnieżonym lesie o wschodzie słońca, fotografia",
-    "futurystyczna panorama miasta nocą z neonami odbijającymi się w deszczu",
-    "miska świeżych truskawek na drewnianym stole, miękkie naturalne światło",
-    "akwarela przedstawiająca latarnię morską na skalistym wybrzeżu",
-    "mały robot czytający książkę w przytulnej bibliotece",
-    "astronauta jadący konno po Księżycu, grafika cyfrowa",
-    "szyld z neonowym napisem OPEN",
-    "dwoje dzieci puszczających latawiec na zielonym wzgórzu pod błękitnym niebem",
-]
 
 
 def tokenize(texts, te_cfg):
