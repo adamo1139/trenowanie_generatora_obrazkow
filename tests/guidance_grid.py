@@ -9,8 +9,12 @@
                 and t convention, so any older one can guide; each encodes the prompt with its own text encoder
                 (the older ones are English-only)
 
+Options per method after "|": shift=S (time grid t = S u / (1 + (S - 1) u), u = linspace(1, 0): more steps at high
+noise, as AuroraIMG2-100M samples with S = 1.5) and off=T (no guidance while t <= T: plain conditional velocity on the
+last, lowest-noise steps; AuroraIMG2-100M uses 0.05).
+
   python tests/guidance_grid.py --model cpral/HomeIMG-641M-PL-stage1 --out-dir guidance \\
-      --methods cfg:3 cfgzero:3 ag:cpral/HomeIMG-253M:2 ag:cpral/HomeIMG-50M:2
+      --methods cfg:3 "cfg:3|shift=1.5|off=0.05" cfgzero:3 ag:cpral/HomeIMG-50M:2
 """
 import argparse
 import os
@@ -46,7 +50,8 @@ def load(repo, device, vae=True):
 
 @torch.no_grad()
 def sample(good, prompts, method, guides, steps, seed, device):
-    kind, w = method[0], method[-1]
+    kind, w, opts = method[0], method[-2], method[-1]
+    shift, off = float(opts.get("shift", 1.0)), float(opts.get("off", -1.0))
     b = len(prompts)
     tc = good.transformer.config
     g = torch.Generator(device=device).manual_seed(seed)
@@ -57,11 +62,17 @@ def sample(good, prompts, method, guides, steps, seed, device):
         bctx, bvalid = bad.encode_prompt(prompts, None, False, device)
     else:
         ctx, valid = good.encode_prompt(prompts, None, True, device)  # [uncond; cond]
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    u = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    ts = shift * u / (1 + (shift - 1) * u)
     for i in range(steps):
         t0, t1 = ts[i], ts[i + 1]
         with good._autocast():
-            if kind == "ag":
+            if t0 <= off:  # guidance switched off on the last steps: conditional velocity only
+                if kind == "ag":
+                    v = good.transformer(z, t0.expand(b), ctx, valid).float()
+                else:
+                    v = good.transformer(z, t0.expand(b), ctx[b:], valid[b:]).float()
+            elif kind == "ag":
                 vc = good.transformer(z, t0.expand(b), ctx, valid).float()
                 vb = bad.transformer(z, t0.expand(b), bctx, bvalid).float()
                 v = vb + w * (vc - vb)
@@ -91,9 +102,11 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     methods = []
     for m in a.methods:
-        parts = m.split(":")
-        methods.append((parts[0], ":".join(parts[1:-1]), float(parts[-1])) if parts[0] == "ag"
-                       else (parts[0], float(parts[1])))
+        spec, *extra = m.split("|")
+        opts = dict(e.split("=") for e in extra)
+        parts = spec.split(":")
+        methods.append((parts[0], ":".join(parts[1:-1]), float(parts[-1]), opts) if parts[0] == "ag"
+                       else (parts[0], float(parts[1]), opts))
     good = load(a.model, device)
     good.vae.to(torch.bfloat16)
     guides = {m[1]: load(m[1], device, vae=False) for m in methods if m[0] == "ag"}
