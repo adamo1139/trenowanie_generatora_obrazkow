@@ -205,6 +205,7 @@ class LMEncoderConfig:
     max_tokens: int = 96
     backend: str = "slayer"  # "slayer" = aurora/slayer.py GPT, "hf" = transformers causal LM (aurora/hf_compat.py)
     experts: int = 0         # hf MoE: active experts per token (0 = the model's own)
+    quant: str = ""          # hf MoE: "int8" = expert weights stored as int8 (half the memory, bf16 matmuls)
     out_dim: int = 0         # != 0: refiner output projected to this width (= denoiser text_dim), e.g. a new refiner
                              # of another size in front of a pretrained denoiser
 
@@ -366,13 +367,16 @@ TE_SIZES = {
 
 
 def make_configs(size: str, te_size: str, te_dim: int = None, te_depth: int = None, depth: int = None,
-                 te_experts: int = None):
+                 te_experts: int = None, te_quant: str = None):
     """te_dim / te_depth resize the trainable refiner of an LM text encoder (heads of 64, GQA, SwiGLU 8/3 x dim);
     te_experts sets the active experts of an MoE LM."""
     te_cfg = TE_SIZES[te_size]
     if te_experts:
         assert getattr(te_cfg, "backend", "") == "hf", "--te-experts only applies to transformers (MoE) LM encoders"
         te_cfg = replace(te_cfg, experts=te_experts)
+    if te_quant is not None:
+        assert getattr(te_cfg, "backend", "") == "hf", "--te-quant only applies to transformers (MoE) LM encoders"
+        te_cfg = replace(te_cfg, quant=te_quant)
     if te_dim or te_depth:
         assert isinstance(te_cfg, LMEncoderConfig), "--te-dim / --te-depth only apply to LM text encoders"
         dim = te_dim or te_cfg.dim

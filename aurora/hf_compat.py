@@ -39,7 +39,7 @@ def patch_transformers():
         ru.ROPE_INIT_FUNCTIONS["default"] = default_rope
 
 
-def load_causal_lm(repo, device, num_layers=None, dtype=torch.bfloat16, fused_moe=False, **overrides):
+def load_causal_lm(repo, device, num_layers=None, dtype=torch.bfloat16, fused_moe=False, quant="", **overrides):
     """(model, tokenizer). num_layers keeps only the first N decoder layers (the rest are never loaded: less memory);
     overrides go to the config, e.g. num_experts_per_tok=16 for fewer active MoE experts."""
     patch_transformers()
@@ -55,7 +55,7 @@ def load_causal_lm(repo, device, num_layers=None, dtype=torch.bfloat16, fused_mo
             inv, scale = mod.rope_init_fn(mod.config, device)
             mod.inv_freq, mod.original_inv_freq, mod.attention_scaling = inv, inv, scale
     if fused_moe:
-        fuse_moe(model)
+        fuse_moe(model, quant)
     return model, tok
 
 
@@ -76,56 +76,75 @@ def _fused_moe_infer(self, x, topk_ids, topk_weight):
         from aurora.moe_triton import grouped_mm, make_schedule
         sched = make_schedule(counts, n * k)
         a_idx, y_idx = (order // k).to(torch.int32), order.to(torch.int32)
-        g, u = grouped_mm(x, self._wgu, counts, sched, a_idx=a_idx).chunk(2, dim=-1)
+        g, u = grouped_mm(x, self._wgu, counts, sched, a_idx=a_idx, w_scale=self._wgu_s).chunk(2, dim=-1)
         w = topk_weight.reshape(-1)[order].to(x.dtype)
-        y = grouped_mm(self._act(g) * u, self._wd, counts, sched, y_idx=y_idx, scale=w)
+        y = grouped_mm(self._act(g) * u, self._wd, counts, sched, y_idx=y_idx, scale=w, w_scale=self._wd_s)
         return y.view(n, k, -1).sum(1)
     xs = x[order // k]
+    wgu, wd = _dequant(self._wgu, self._wgu_s, x.dtype), _dequant(self._wd, self._wd_s, x.dtype)
     if self._mode == "grouped":
         offs = counts.cumsum(0).to(torch.int32)
-        g, u = torch._grouped_mm(xs, self._wgu, offs=offs).chunk(2, dim=-1)
-        ys = torch._grouped_mm(self._act(g) * u, self._wd, offs=offs)
+        g, u = torch._grouped_mm(xs, wgu, offs=offs).chunk(2, dim=-1)
+        ys = torch._grouped_mm(self._act(g) * u, wd, offs=offs)
     else:
         expert = flat[order]
         slot = torch.arange(n * k, device=x.device) - (counts.cumsum(0) - counts)[expert]
         buf = x.new_zeros(self._wgu.shape[0], int(counts.max()), x.shape[-1])
         buf[expert, slot] = xs
-        g, u = torch.bmm(buf, self._wgu).chunk(2, dim=-1)
-        ys = torch.bmm(self._act(g) * u, self._wd)[expert, slot]
+        g, u = torch.bmm(buf, wgu).chunk(2, dim=-1)
+        ys = torch.bmm(self._act(g) * u, wd)[expert, slot]
     # routing weight applied in the sorted order, back to (n, k) order by a gather, sum over k: all in x.dtype (the
     # fp32 (n*k, H) temporaries of the reference combine cost about as much as the expert matmuls themselves)
     ys = ys * topk_weight.reshape(-1)[order].to(ys.dtype).unsqueeze(-1)
     return ys[order.argsort()].view(n, k, -1).sum(1)
 
 
-def _self_test(fn, device, dtype):
+def _dequant(w, scale, dtype):
+    return w if scale is None else w.to(dtype) * scale.to(dtype).unsqueeze(1)
+
+
+def _quant_int8(w):
+    """(E, K, N) -> int8 weights and a per-(expert, output column) scale (absmax over K / 127)."""
+    scale = w.float().abs().amax(dim=1).clamp(min=1e-8) / 127
+    return (w.float() / scale.unsqueeze(1)).round().clamp(-127, 127).to(torch.int8), scale.to(torch.bfloat16)
+
+
+def _self_test(fn, device, dtype, quant=False):
+    """fn(a, w, counts) against plain matmuls; quant: fn gets int8 weights + scales, the reference their dequantised
+    values (what the kernel must reproduce; the int8 rounding itself is not the kernel's error)."""
     a = torch.randn(48, 64, device=device, dtype=dtype)
     b = torch.randn(3, 64, 32, device=device, dtype=dtype)
     counts = torch.tensor([16, 0, 32], device=device)
-    ref = torch.cat([a[:16] @ b[0], a[16:] @ b[2]])
-    return torch.allclose(fn(a, b, counts).float(), ref.float(), atol=1e-1, rtol=5e-2)
+    w = _quant_int8(b) if quant else (b, None)
+    ref_w = _dequant(*w, dtype)
+    ref = torch.cat([a[:16] @ ref_w[0], a[16:] @ ref_w[2]])
+    return torch.allclose(fn(a, *w, counts).float(), ref.float(), atol=1e-1, rtol=5e-2)
 
 
 def _pick_mode(device, dtype):
     if device.type == "cuda":
         try:
             from aurora.moe_triton import grouped_mm
-            if _self_test(grouped_mm, device, dtype):
+            fn = lambda a, w, s, c: grouped_mm(a, w, c, w_scale=s)
+            if _self_test(fn, device, dtype) and _self_test(fn, device, dtype, quant=True):
                 return "triton"
         except Exception:  # noqa: BLE001 (no triton / unsupported GPU)
             pass
     if hasattr(torch, "_grouped_mm"):
         try:
-            if _self_test(lambda a, b, c: torch._grouped_mm(a, b, offs=c.cumsum(0).to(torch.int32)), device, dtype):
+            if _self_test(lambda a, w, s, c: torch._grouped_mm(a, w, offs=c.cumsum(0).to(torch.int32)), device, dtype):
                 return "grouped"
         except Exception:  # noqa: BLE001
             pass
     return "bmm"
 
 
-def fuse_moe(model):
+def fuse_moe(model, quant=""):
     """Swap every MoE block's per-expert loop for the batched version; the per-expert modules are dropped (the stacked
-    weights replace them, so memory does not double). Inference only. Returns the number of blocks changed."""
+    weights replace them, so memory does not double). Inference only. quant="int8": expert weights stored as int8
+    with a per-(expert, output column) scale, half the memory (the experts are ~95% of an MoE LM's weights); the
+    matmuls still run in bf16. Returns the number of blocks changed."""
+    assert quant in ("", "int8"), quant
     n = 0
     for mod in model.modules():
         experts = getattr(mod, "experts", None)
@@ -133,9 +152,12 @@ def fuse_moe(model):
             continue
         # (E, in, out) and contiguous: the layout all three matmul paths want; buffers, so .to() moves them
         wgu = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight]).t() for e in experts]).contiguous()
-        mod.register_buffer("_wgu", wgu, persistent=False)
-        mod.register_buffer("_wd", torch.stack([e.down_proj.weight.t() for e in experts]).contiguous(),
-                            persistent=False)
+        wd = torch.stack([e.down_proj.weight.t() for e in experts]).contiguous()
+        for name, w in (("_wgu", wgu), ("_wd", wd)):
+            w, sc = _quant_int8(w) if quant else (w, None)
+            mod.register_buffer(name, w, persistent=False)
+            mod.register_buffer(name + "_s", sc, persistent=False)
+        del wgu, wd
         mod._act = experts[0].act_fn
         mod._mode = None
         mod.moe_infer = types.MethodType(_fused_moe_infer, mod)

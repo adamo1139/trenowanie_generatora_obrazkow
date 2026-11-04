@@ -21,8 +21,8 @@ BLOCK_M = 64  # fixed: the block schedule is computed before the launch
 )
 @triton.jit
 def _grouped_kernel(a_ptr, w_ptr, y_ptr, block_e_ptr, block_row_ptr, row_end_ptr, a_idx_ptr, y_idx_ptr, scale_ptr,
-                    N, K, M_BUCKET, stride_am, stride_we, stride_wk, stride_ym,
-                    GATHER_A: tl.constexpr, SCATTER_Y: tl.constexpr, SCALE: tl.constexpr,
+                    wscale_ptr, N, K, M_BUCKET, stride_am, stride_we, stride_wk, stride_ym,
+                    GATHER_A: tl.constexpr, SCATTER_Y: tl.constexpr, SCALE: tl.constexpr, W_INT8: tl.constexpr,
                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -41,10 +41,14 @@ def _grouped_kernel(a_ptr, w_ptr, y_ptr, block_e_ptr, block_row_ptr, row_end_ptr
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         a = tl.load(a_ptrs, mask=row_ok[:, None] & (rk[None, :] + k < K), other=0.0)
-        w = tl.load(w_ptrs, mask=(rk[:, None] + k < K) & (rn[None, :] < N), other=0.0)
+        w = tl.load(w_ptrs, mask=(rk[:, None] + k < K) & (rn[None, :] < N), other=0)
+        if W_INT8:  # weight-only int8: integers are exact in bf16, the per-column scale comes after the sum
+            w = w.to(a.dtype)
         acc += tl.dot(a, w)
         a_ptrs += BLOCK_K
         w_ptrs += BLOCK_K * stride_wk
+    if W_INT8:
+        acc *= tl.load(wscale_ptr + e.to(tl.int64) * N + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
     if SCALE:
         acc *= tl.load(scale_ptr + rm, mask=row_ok, other=0.0).to(tl.float32)[:, None]
     y_row = tl.load(y_idx_ptr + rm, mask=row_ok, other=0) if SCATTER_Y else rm
@@ -53,11 +57,12 @@ def _grouped_kernel(a_ptr, w_ptr, y_ptr, block_e_ptr, block_row_ptr, row_end_ptr
 
 
 def grouped_mm(a: torch.Tensor, w: torch.Tensor, counts: torch.Tensor, sched=None, a_idx=None, y_idx=None,
-               scale=None) -> torch.Tensor:
+               scale=None, w_scale=None) -> torch.Tensor:
     """a (M, K) sorted by expert, w (E, K, N) contiguous, counts (E,) rows per expert (sum = M) -> (M, N).
     Fused extras for an MoE layer, all indexed by the sorted row r: a_idx[r] = the row of `a` to read (so `a` is the
     unsorted token matrix, no gathered copy), scale[r] multiplies output row r (routing weight), y_idx[r] = where
-    output row r is written (back in token order, no scatter afterwards)."""
+    output row r is written (back in token order, no scatter afterwards). w may be int8 with w_scale (E, N): the
+    weight is then w * w_scale[e] (per expert and output column)."""
     M = a_idx.numel() if a_idx is not None else a.shape[0]
     K = a.shape[1]
     E, _, N = w.shape
@@ -71,9 +76,10 @@ def grouped_mm(a: torch.Tensor, w: torch.Tensor, counts: torch.Tensor, sched=Non
     dummy = block_e
     _grouped_kernel[grid](a, w, y, block_e, block_row, row_end,
                           dummy if a_idx is None else a_idx, dummy if y_idx is None else y_idx,
-                          dummy if scale is None else scale, N, K, triton.next_power_of_2(max(1, M // E)),
+                          dummy if scale is None else scale, dummy if w_scale is None else w_scale, N, K, triton.next_power_of_2(max(1, M // E)),
                           a.stride(0), w.stride(0), w.stride(1), y.stride(0),
                           GATHER_A=a_idx is not None, SCATTER_Y=y_idx is not None, SCALE=scale is not None,
+                          W_INT8=w_scale is not None,
                           BLOCK_M=BLOCK_M)
     return y
 

@@ -55,6 +55,11 @@ def build_parser():
     p.add_argument("--te-depth", type=int, default=None, help="LM text encoder: refiner blocks (default 2)")
     p.add_argument("--te-experts", type=int, default=None,
                    help="MoE LM text encoder (--te-size poziomka): active experts per token (default: the preset's)")
+    p.add_argument("--te-quant", choices=["", "int8"], default=None,
+                   help="MoE LM text encoder: int8 = expert weights stored as int8 (Poziomka 7.7 -> ~4 GB per GPU)")
+    p.add_argument("--ema-cpu", action="store_true",
+                   help="keep the EMA on the CPU (needs --diloco: it is updated only at the outer syncs; frees "
+                        "~4 bytes x params on rank 0)")
     p.add_argument("--pl-prob", type=float, default=0.0,
                    help="share of training captions taken from the Polish translations (<shard>.tok_<enc>_pl.npy, "
                         "prepare_data.py tokenize --encoder ... --lang pl); validation stays English")
@@ -574,7 +579,8 @@ def main():
     # ---- model ---------------------------------------------------------------------------------
     den_cfg, te_cfg = hf_configs(args.load_hf) if args.load_hf else make_configs(args.size, args.te_size,
                                                                                       args.te_dim, args.te_depth,
-                                                                                      args.depth, args.te_experts)
+                                                                                      args.depth, args.te_experts,
+                                                                                      args.te_quant)
     init_ck = None
     if args.init:  # pretrained denoiser, new text encoder: its output is projected to the denoiser's text width
         init_ck = torch.load(args.init, map_location="cpu", weights_only=False)
@@ -584,8 +590,9 @@ def main():
         # same frozen LM in the checkpoint (e.g. stage 1 with --freeze-den): keep its text encoder (refiner) too;
         # --te-experts may still change the active experts
         keep_te = isinstance(init_te, LMEncoderConfig) and init_te.repo == te_cfg.repo
-        if keep_te:
-            te_cfg = replace(init_te, experts=te_cfg.experts) if args.te_experts else init_te
+        if keep_te:  # the refiner comes from the checkpoint; experts / quantisation of the frozen LM may change
+            te_cfg = replace(init_te, experts=te_cfg.experts if args.te_experts else init_te.experts,
+                             quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
         elif (te_cfg.out_dim or te_cfg.dim) != den_cfg.text_dim:
             te_cfg = replace(te_cfg, out_dim=den_cfg.text_dim)
     te, den = build_models(den_cfg, te_cfg)
@@ -663,7 +670,8 @@ def main():
     # EMA only of what trains: a frozen module's EMA is itself (no fp32 copy of a frozen denoiser on rank 0)
     ema_params = [p for p in all_params if p.requires_grad]
     assert not args.offload or args.diloco, "--offload needs --diloco (it updates the EMA only at the outer syncs)"
-    ema_dev = "cpu" if args.offload else device
+    assert not args.ema_cpu or args.diloco, "--ema-cpu needs --diloco (it updates the EMA only at the outer syncs)"
+    ema_dev = "cpu" if args.offload or args.ema_cpu else device
     ema = [p.detach().float().to(ema_dev, copy=True) for p in ema_params] if master else None
 
     def ema_full():
@@ -908,6 +916,8 @@ def main():
                     if args.offload:
                         torch.cuda.synchronize(device)  # the global weights' H2D copies are non-blocking
                         torch._foreach_lerp_(ema, ema_src, 1 - d)
+                    elif args.ema_cpu:
+                        torch._foreach_lerp_(ema, [p.detach().to("cpu") for p in ema_params], 1 - d)
                     else:
                         torch._foreach_lerp_(ema, [p.detach() for p in ema_params], 1 - d)
         elif master:

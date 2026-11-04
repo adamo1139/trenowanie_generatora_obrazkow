@@ -33,7 +33,7 @@ def load_blimp(limit):
     return out
 
 
-def load_model(repo, device, overrides=None):
+def load_model(repo, device, overrides=None, quant=""):
     """-> (logits_fn(ids LongTensor B x T) -> B x T x V, encode(str) -> list[int] incl. BOS, label)."""
     files = list_repo_files(repo)
     if "modeling_gollem_v6.py" in files:
@@ -57,7 +57,7 @@ def load_model(repo, device, overrides=None):
         logits = lambda ids: lm.head(lm.lnf(lm.hidden(ids, len(lm.blocks))))
         return logits, (lambda s: [bos] + tok.encode(s).ids), "gollem-gpt"
     from aurora.hf_compat import load_causal_lm
-    model, tok = load_causal_lm(repo, device, **(overrides or {}))
+    model, tok = load_causal_lm(repo, device, fused_moe=bool(quant), quant=quant, **(overrides or {}))
     bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     enc = lambda s: [bos] + tok(s, add_special_tokens=False).input_ids
 
@@ -94,6 +94,8 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch", type=int, default=64, help="sentences per forward (MoE remote code needs a lot of memory)")
     p.add_argument("--out", default=None)
+    p.add_argument("--quant", choices=["", "int8"], default="",
+                   help="transformers MoE models: int8 expert weights (aurora/hf_compat.fuse_moe)")
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                    help="config overrides for transformers models, e.g. num_experts_per_tok=16")
     a = p.parse_args()
@@ -104,9 +106,9 @@ def main():
     results = {}
     for repo in a.models:
         t0 = time.time()
-        logits_fn, enc, kind = load_model(repo, a.device, overrides)
-        if overrides:
-            repo = f"{repo} {overrides}"
+        logits_fn, enc, kind = load_model(repo, a.device, overrides, a.quant)
+        if overrides or a.quant:
+            repo = f"{repo} {overrides}" + (f" {a.quant}" if a.quant else "")
         good = score(logits_fn, [enc(r["sentence_good"]) for r in data], a.device, a.batch)
         bad = score(logits_fn, [enc(r["sentence_bad"]) for r in data], a.device, a.batch)
         ok = [g > b for g, b in zip(good, bad)]

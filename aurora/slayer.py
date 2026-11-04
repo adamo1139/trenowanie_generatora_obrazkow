@@ -235,7 +235,8 @@ def load_hf_lm(cfg):
     total = _json.load(open(hf_hub_download(cfg.repo, "config.json")))["num_hidden_layers"]
     overrides = {"num_experts_per_tok": cfg.experts} if cfg.experts else {}
     device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    lm, _ = load_causal_lm(cfg.repo, device, num_layers=total - cfg.skip_last, fused_moe=True, **overrides)
+    lm, _ = load_causal_lm(cfg.repo, device, num_layers=total - cfg.skip_last, fused_moe=True,
+                           quant=getattr(cfg, "quant", ""), **overrides)
     return lm
 
 
