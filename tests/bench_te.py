@@ -23,6 +23,7 @@ p.add_argument("--experts", type=int, nargs="+", default=[16, 32])
 p.add_argument("--batch", type=int, default=32)
 p.add_argument("--tokens", type=int, default=256)
 p.add_argument("--compile", action="store_true", help="also try torch.compile on the decoder")
+p.add_argument("--fused-moe", action="store_true", help="batched experts (aurora/hf_compat.fuse_moe) instead of the loop")
 a = p.parse_args()
 dev = "cuda"
 print(f"{torch.cuda.get_device_name()}, micro-batch {a.batch} x {a.tokens} tokens\n")
