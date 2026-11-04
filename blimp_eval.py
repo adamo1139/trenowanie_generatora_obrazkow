@@ -56,31 +56,8 @@ def load_model(repo, device, overrides=None):
             bos = 12285  # Slayer149's document start (prepare_data.py ENCODERS)
         logits = lambda ids: lm.head(lm.lnf(lm.hidden(ids, len(lm.blocks))))
         return logits, (lambda s: [bos] + tok.encode(s).ids), "gollem-gpt"
-    import transformers.utils.import_utils as iu
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    if not hasattr(iu, "is_torch_fx_available"):  # removed in transformers 5; older remote code still imports it
-        iu.is_torch_fx_available = lambda: False
-    import transformers.modeling_rope_utils as ru
-    if "default" not in ru.ROPE_INIT_FUNCTIONS:  # transformers 4's plain RoPE, which 4.x remote code looks up by name
-        def default_rope(config, device=None, seq_len=None):
-            # transformers 5 moves rope_theta / partial_rotary_factor into rope_scaling / rope_parameters
-            extra = {**(getattr(config, "rope_parameters", None) or {}), **(getattr(config, "rope_scaling", None) or {})}
-            base = getattr(config, "rope_theta", None) or extra["rope_theta"]
-            factor = getattr(config, "partial_rotary_factor", None) or extra.get("partial_rotary_factor", 1.0)
-            head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-            dim = int(head_dim * factor)
-            inv = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
-            return inv, 1.0
-        ru.ROPE_INIT_FUNCTIONS["default"] = default_rope
-    tok = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
-    # explicit attention implementation: transformers 5's default one gives NaN logits with older remote code
-    model = AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=True, dtype=torch.bfloat16,
-                                                 attn_implementation="sdpa", **(overrides or {})).to(device)
-    model.eval()
-    for mod in model.modules():  # transformers 5 builds on meta and never recomputes old remote code's RoPE buffers
-        if hasattr(mod, "rope_init_fn") and hasattr(mod, "inv_freq"):
-            inv, scale = mod.rope_init_fn(mod.config, device)
-            mod.inv_freq, mod.original_inv_freq, mod.attention_scaling = inv, inv, scale
+    from aurora.hf_compat import load_causal_lm
+    model, tok = load_causal_lm(repo, device, **(overrides or {}))
     bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     enc = lambda s: [bos] + tok(s, add_special_tokens=False).input_ids
 
