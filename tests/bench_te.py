@@ -33,7 +33,7 @@ for L in a.layers:
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
         try:
-            model, tok = load_causal_lm(a.repo, dev, num_layers=L, num_experts_per_tok=E)
+            model, tok = load_causal_lm(a.repo, dev, num_layers=L, num_experts_per_tok=E, fused_moe=a.fused_moe)
         except Exception as e:  # noqa: BLE001
             print(f"{L:>6} {E:>7}  load failed: {e!r}")
             continue
