@@ -57,44 +57,66 @@ def load_causal_lm(repo, device, num_layers=None, dtype=torch.bfloat16, fused_mo
 
 @torch.no_grad()
 def _fused_moe_infer(self, x, topk_ids, topk_weight):
-    """Same result as the reference moe_infer (checked to ~1e-6 relative in fp32; in bf16 cos 0.9999 to the loop, differences from routing flips): token copies sorted by expert, every
-    expert applied at once, outputs put back in place and combined with the routing weights. torch._grouped_mm takes
-    the per-expert groups as they are (no padding, no CPU sync); otherwise an (E, capacity, H) buffer and bmm."""
+    """Same result as the reference moe_infer (checked to ~1e-6 relative in fp32; in bf16 cos 0.9999 to the loop, the
+    differences come from routing flips): token copies sorted by expert, every expert applied at once, outputs put
+    back in place and combined with the routing weights. Expert matmuls, fastest first: one Triton launch for all
+    experts (aurora/moe_triton.py), torch._grouped_mm (one kernel per expert before Hopper), an (E, capacity, H)
+    buffer and bmm. Gate and up projections are one matmul."""
     n, k = topk_ids.shape
     flat = topk_ids.reshape(-1)
     order = flat.argsort(stable=True)
-    counts = torch.bincount(flat, minlength=self._wg.shape[0])
+    counts = torch.bincount(flat, minlength=self._wgu.shape[0])
+    if self._mode is None:  # decided on the device the weights ended up on
+        self._mode = _pick_mode(x.device, x.dtype)
+    if self._mode == "triton":  # gather, routing weight and scatter back happen inside the two kernels
+        from aurora.moe_triton import grouped_mm, make_schedule
+        sched = make_schedule(counts, n * k)
+        a_idx, y_idx = (order // k).to(torch.int32), order.to(torch.int32)
+        g, u = grouped_mm(x, self._wgu, counts, sched, a_idx=a_idx).chunk(2, dim=-1)
+        w = topk_weight.reshape(-1)[order].to(x.dtype)
+        y = grouped_mm(self._act(g) * u, self._wd, counts, sched, y_idx=y_idx, scale=w)
+        return y.view(n, k, -1).sum(1)
     xs = x[order // k]
-    if self._grouped is None:  # decided on the device the weights ended up on
-        self._grouped = _grouped_mm_works(x.device, x.dtype)
-    if self._grouped:
+    if self._mode == "grouped":
         offs = counts.cumsum(0).to(torch.int32)
-        h = self._act(torch._grouped_mm(xs, self._wg, offs=offs)) * torch._grouped_mm(xs, self._wu, offs=offs)
-        ys = torch._grouped_mm(h, self._wd, offs=offs)
+        g, u = torch._grouped_mm(xs, self._wgu, offs=offs).chunk(2, dim=-1)
+        ys = torch._grouped_mm(self._act(g) * u, self._wd, offs=offs)
     else:
         expert = flat[order]
         slot = torch.arange(n * k, device=x.device) - (counts.cumsum(0) - counts)[expert]
-        buf = x.new_zeros(self._wg.shape[0], int(counts.max()), x.shape[-1])
+        buf = x.new_zeros(self._wgu.shape[0], int(counts.max()), x.shape[-1])
         buf[expert, slot] = xs
-        h = self._act(torch.bmm(buf, self._wg)) * torch.bmm(buf, self._wu)
-        ys = torch.bmm(h, self._wd)[expert, slot]
+        g, u = torch.bmm(buf, self._wgu).chunk(2, dim=-1)
+        ys = torch.bmm(self._act(g) * u, self._wd)[expert, slot]
     # routing weight applied in the sorted order, back to (n, k) order by a gather, sum over k: all in x.dtype (the
     # fp32 (n*k, H) temporaries of the reference combine cost about as much as the expert matmuls themselves)
     ys = ys * topk_weight.reshape(-1)[order].to(ys.dtype).unsqueeze(-1)
     return ys[order.argsort()].view(n, k, -1).sum(1)
 
 
-def _grouped_mm_works(device, dtype):
-    if not hasattr(torch, "_grouped_mm"):
-        return False
-    try:
-        a = torch.randn(48, 64, device=device, dtype=dtype)
-        b = torch.randn(3, 64, 32, device=device, dtype=dtype)
-        offs = torch.tensor([16, 16, 48], device=device, dtype=torch.int32)
-        ref = torch.cat([a[:16] @ b[0], a[16:16] @ b[1], a[16:] @ b[2]])
-        return torch.allclose(torch._grouped_mm(a, b, offs=offs).float(), ref.float(), atol=1e-1, rtol=5e-2)
-    except Exception:  # noqa: BLE001 (unsupported GPU / dtype)
-        return False
+def _self_test(fn, device, dtype):
+    a = torch.randn(48, 64, device=device, dtype=dtype)
+    b = torch.randn(3, 64, 32, device=device, dtype=dtype)
+    counts = torch.tensor([16, 0, 32], device=device)
+    ref = torch.cat([a[:16] @ b[0], a[16:] @ b[2]])
+    return torch.allclose(fn(a, b, counts).float(), ref.float(), atol=1e-1, rtol=5e-2)
+
+
+def _pick_mode(device, dtype):
+    if device.type == "cuda":
+        try:
+            from aurora.moe_triton import grouped_mm
+            if _self_test(grouped_mm, device, dtype):
+                return "triton"
+        except Exception:  # noqa: BLE001 (no triton / unsupported GPU)
+            pass
+    if hasattr(torch, "_grouped_mm"):
+        try:
+            if _self_test(lambda a, b, c: torch._grouped_mm(a, b, offs=c.cumsum(0).to(torch.int32)), device, dtype):
+                return "grouped"
+        except Exception:  # noqa: BLE001
+            pass
+    return "bmm"
 
 
 def fuse_moe(model):
@@ -105,15 +127,16 @@ def fuse_moe(model):
         experts = getattr(mod, "experts", None)
         if experts is None or not hasattr(mod, "moe_infer") or not isinstance(experts, torch.nn.ModuleList):
             continue
-        # (E, in, out) and contiguous: the layout both grouped_mm and bmm(x, w) want; buffers, so .to() moves them
-        for name, proj in (("_wg", "gate_proj"), ("_wu", "up_proj"), ("_wd", "down_proj")):
-            w = torch.stack([getattr(e, proj).weight.t() for e in experts]).contiguous()
-            mod.register_buffer(name, w, persistent=False)
+        # (E, in, out) and contiguous: the layout all three matmul paths want; buffers, so .to() moves them
+        wgu = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight]).t() for e in experts]).contiguous()
+        mod.register_buffer("_wgu", wgu, persistent=False)
+        mod.register_buffer("_wd", torch.stack([e.down_proj.weight.t() for e in experts]).contiguous(),
+                            persistent=False)
         mod._act = experts[0].act_fn
-        mod._grouped = None
+        mod._mode = None
         mod.moe_infer = types.MethodType(_fused_moe_infer, mod)
         del mod.experts
-        mod.experts = list(range(mod._wg.shape[0]))  # len(self.experts) still works for any remaining code
+        mod.experts = list(range(mod._wgu.shape[0]))  # len(self.experts) still works for any remaining code
         n += 1
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
