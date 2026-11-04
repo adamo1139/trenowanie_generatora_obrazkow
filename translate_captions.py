@@ -138,3 +138,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # vLLM's engine-core process sometimes keeps the interpreter alive after the work is done: exit hard (all output
+    # files are already written and renamed, stdout is flushed)
+    import sys
+    sys.stdout.flush()
+    os._exit(0)
