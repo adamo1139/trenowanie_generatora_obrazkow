@@ -19,6 +19,10 @@ import torch.nn.functional as F
 
 
 def patch_transformers():
+    import warnings
+    # old remote code calls these on every forward: one deprecation line per batch shape and GPU otherwise
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*attention mask API.*")
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*rope_scaling.*")
     import transformers.modeling_rope_utils as ru
     import transformers.utils.import_utils as iu
     if not hasattr(iu, "is_torch_fx_available"):
