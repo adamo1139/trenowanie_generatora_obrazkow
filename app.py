@@ -21,6 +21,10 @@ EXAMPLES = [
     "a watercolor painting of a lighthouse on a rocky coast",
     "a small robot reading a book in a cozy library",
     "an astronaut riding a horse on the moon, digital art",
+    # Polish, for bilingual models (HomeIMG-641M-PL-*)
+    "rudy lis siedzący w zaśnieżonym lesie o wschodzie słońca, fotografia",
+    "akwarela przedstawiająca latarnię morską na skalistym wybrzeżu",
+    "mały robot czytający książkę w przytulnej bibliotece",
 ]
 
 
