@@ -57,7 +57,7 @@ def load_causal_lm(repo, device, num_layers=None, dtype=torch.bfloat16, fused_mo
 
 @torch.no_grad()
 def _fused_moe_infer(self, x, topk_ids, topk_weight):
-    """Same result as the reference moe_infer (checked to ~1e-6 relative in fp32): token copies sorted by expert, every
+    """Same result as the reference moe_infer (checked to ~1e-6 relative in fp32; in bf16 cos 0.9999 to the loop, differences from routing flips): token copies sorted by expert, every
     expert applied at once, outputs put back in place and combined with the routing weights. torch._grouped_mm takes
     the per-expert groups as they are (no padding, no CPU sync); otherwise an (E, capacity, H) buffer and bmm."""
     n, k = topk_ids.shape
@@ -76,9 +76,10 @@ def _fused_moe_infer(self, x, topk_ids, topk_weight):
         buf[expert, slot] = xs
         h = self._act(torch.bmm(buf, self._wg)) * torch.bmm(buf, self._wu)
         ys = torch.bmm(h, self._wd)[expert, slot]
-    y = torch.empty_like(ys)
-    y[order] = ys
-    return (y.view(n, k, -1).type(topk_weight.dtype) * topk_weight.unsqueeze(-1)).sum(1).type(x.dtype)
+    # routing weight applied in the sorted order, back to (n, k) order by a gather, sum over k: all in x.dtype (the
+    # fp32 (n*k, H) temporaries of the reference combine cost about as much as the expert matmuls themselves)
+    ys = ys * topk_weight.reshape(-1)[order].to(ys.dtype).unsqueeze(-1)
+    return ys[order.argsort()].view(n, k, -1).sum(1)
 
 
 def _grouped_mm_works(device, dtype):

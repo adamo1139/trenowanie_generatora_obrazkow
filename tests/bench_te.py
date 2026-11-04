@@ -44,13 +44,13 @@ for L in a.layers:
         ids = torch.randint(1000, 30000, (a.batch, a.tokens), device=dev)
         with torch.no_grad():
             for _ in range(2):
-                body(input_ids=ids)
+                body(input_ids=ids, use_cache=False)
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
             n = 5
             for _ in range(n):
-                body(input_ids=ids)
+                body(input_ids=ids, use_cache=False)
             torch.cuda.synchronize()
         ms = (time.time() - t0) / n * 1000
         peak = (torch.cuda.max_memory_allocated() - base) / 2**30
