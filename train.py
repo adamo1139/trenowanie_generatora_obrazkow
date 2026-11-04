@@ -580,28 +580,40 @@ def main():
         init_ck = torch.load(args.init, map_location="cpu", weights_only=False)
         den_cfg = DenoiserConfig(**init_ck["den_config"])
         assert isinstance(te_cfg, LMEncoderConfig), "--init needs a frozen-LM text encoder (e.g. --te-size poziomka)"
-        if (te_cfg.out_dim or te_cfg.dim) != den_cfg.text_dim:
+        init_te = te_config_from_dict(init_ck.get("te_config", {}))
+        # same frozen LM in the checkpoint (e.g. stage 1 with --freeze-den): keep its text encoder (refiner) too;
+        # --te-experts may still change the active experts
+        keep_te = isinstance(init_te, LMEncoderConfig) and init_te.repo == te_cfg.repo
+        if keep_te:
+            te_cfg = replace(init_te, experts=te_cfg.experts) if args.te_experts else init_te
+        elif (te_cfg.out_dim or te_cfg.dim) != den_cfg.text_dim:
             te_cfg = replace(te_cfg, out_dim=den_cfg.text_dim)
     te, den = build_models(den_cfg, te_cfg)
     if args.load_hf:
         load_hf(te, den, args.load_hf)
     if init_ck is not None and not os.path.exists(os.path.join(args.out, "latest.pt")):
-        den_params = list(den.parameters())
-        if init_ck.get("ema"):  # EMA list = old text encoder params, then the denoiser's, in parameters() order
+        mods = [den] + ([te] if keep_te else [])
+        if init_ck.get("ema"):  # EMA list = text encoder params, then the denoiser's, in parameters() order
+            n_den = len(list(den.parameters()))
+            srcs = {den: init_ck["ema"][-n_den:], te: init_ck["ema"][:-n_den]}
             with torch.no_grad():
-                for p_, e in zip(den_params, init_ck["ema"][-len(den_params):]):
-                    assert p_.shape == e.shape, (p_.shape, e.shape)
-                    p_.copy_(e)
+                for m in mods:
+                    assert len(list(m.parameters())) == len(srcs[m]), "checkpoint EMA does not match the model"
+                    for p_, e in zip(m.parameters(), srcs[m]):
+                        assert p_.shape == e.shape, (p_.shape, e.shape)
+                        p_.copy_(e)
             src = "EMA"
         else:
-            den.load_state_dict(init_ck["den"])
+            for m in mods:
+                m.load_state_dict(init_ck["den" if m is den else "te"])
             src = "weights"
-        log(f"init: denoiser {src} from {args.init} (step {init_ck.get('step')}), new text encoder")
+        log(f"init: denoiser{' + text encoder' if keep_te else ''} {src} from {args.init} (step {init_ck.get('step')})"
+            + ("" if keep_te else ", new text encoder"))
     del init_ck
     if args.freeze_den:
         den.requires_grad_(False)
     te.to(device), den.to(device)
-    frozen = f" + frozen {te_cfg.repo} ({sum(p.numel() for p in te.lm.parameters()) / 1e6:.1f}M)" \
+    frozen = f" + frozen {te_cfg.repo} ({sum(t.numel() for t in [*te.lm.parameters(), *te.lm.buffers()]) / 1e6:.1f}M)" \
         if isinstance(te_cfg, LMEncoderConfig) else ""
     log(f"params: text encoder {sum(p.numel() for p in te.parameters()) / 1e6:.2f}M trainable{frozen}, "
         f"denoiser {sum(p.numel() for p in den.parameters()) / 1e6:.2f}M")
@@ -647,10 +659,17 @@ def main():
                        f" (periodic row-wise: Newton-Schulz every {args.muon_period} steps, gamma {args.muon_gamma})"
                        if args.muon_period > 1 else ""]) if args.optimizer == "muon" else ""
     log(f"optimizer: {args.optimizer}{variant} for hidden matrices; split (params): {counts}")
-    ema_params = list(te.parameters()) + list(den.parameters())  # what EMA / eval / export use
+    all_params = list(te.parameters()) + list(den.parameters())  # the saved "ema" list covers all of these
+    # EMA only of what trains: a frozen module's EMA is itself (no fp32 copy of a frozen denoiser on rank 0)
+    ema_params = [p for p in all_params if p.requires_grad]
     assert not args.offload or args.diloco, "--offload needs --diloco (it updates the EMA only at the outer syncs)"
     ema_dev = "cpu" if args.offload else device
     ema = [p.detach().float().to(ema_dev, copy=True) for p in ema_params] if master else None
+
+    def ema_full():
+        """EMA in the checkpoint layout: one entry per parameter of te then den."""
+        it = iter(ema)
+        return [next(it).cpu() if p.requires_grad else p.detach().float().cpu() for p in all_params]
 
     # ---- resume --------------------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
@@ -667,7 +686,7 @@ def main():
         for o, s in zip(opts, ck["opts"]):
             load_opt_state(o, s)
         if master:
-            for e, v in zip(ema, ck["ema"]):
+            for e, v in zip(ema, [v for p, v in zip(all_params, ck["ema"]) if p.requires_grad]):
                 e.copy_(v)
         step = ck["step"]
         samples = ck.get("samples", step * (ck.get("args") or {}).get("batch", args.batch))
@@ -754,12 +773,12 @@ def main():
         sd = lambda m: {k: v.detach().cpu() for k, v in m.state_dict().items()}
         tmp = ckpt_path + ".tmp"
         torch.save(dict(step=step, samples=samples, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), opts=[o.state_dict() for o in opts],
-                        ema=[e.cpu() for e in ema], args=vars(args),
+                        ema=ema_full(), args=vars(args),
                         outer=outer_opt.state_dict() if args.diloco else None,
                         repa_proj=sd(repa_proj) if repa_proj is not None else None), tmp)
         os.replace(tmp, ckpt_path)
         if args.keep_every and step % args.keep_every == 0:
-            torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), ema=[e.cpu() for e in ema]),
+            torch.save(dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=sd(te), den=sd(den), ema=ema_full()),
                        os.path.join(args.out, f"snap_{step:07d}.pt"))
 
     def save_merge():
