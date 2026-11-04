@@ -1,14 +1,16 @@
-"""Prompt grids straight from a train.py checkpoint (EMA weights if it has them), for text encoders the diffusers
-pipeline does not know yet (frozen-LM encoders such as Poziomka): the README prompts in English and in Polish, with the
-same noise for prompt k in both grids, so the two languages can be compared image by image. Optionally exports the
-weights (EMA) as safetensors + configs for a Hub upload.
+"""Images from a model whose text encoder the diffusers pipeline does not know yet (frozen-LM encoders such as
+Poziomka): a train.py checkpoint (EMA weights if it has them) or a model exported by this script (local dir or Hub
+repo). By default the README prompts in English and in Polish, with the same noise for prompt k in both grids, so the
+two languages can be compared image by image; --prompt for your own. --export writes the weights (EMA) as
+safetensors + configs + the decoder, for a Hub upload.
 
-  python sample_ckpt.py runs/poziomka_stage1/latest.pt --out-dir exports/poziomka_stage1
-  python sample_ckpt.py runs/poziomka_stage1/latest.pt --out-dir exports/poziomka_stage1 --export
+  python sample_ckpt.py runs/poziomka_stage1/latest.pt --out-dir exports/HomeIMG-641M-PL-stage1 --export
+  python sample_ckpt.py cpral/HomeIMG-641M-PL-stage1 --out-dir out --prompt "rudy kot na parapecie" "a red cat"
 """
 import argparse
 import json
 import os
+import shutil
 from dataclasses import asdict
 
 import numpy as np
@@ -18,7 +20,7 @@ from PIL import Image
 from tokenizers import Tokenizer
 
 from aurora import fid as fidlib
-from aurora.model import build_models, configs_from_ckpt
+from aurora.model import DenoiserConfig, LMEncoderConfig, build_models, configs_from_ckpt
 from aurora.repa import REPATarget
 from aurora.slayer import LM_PAD
 from prepare_data import ENCODERS
@@ -47,6 +49,32 @@ def tokenize(texts, te_cfg):
     return torch.from_numpy(rows)
 
 
+def load(src, raw=False):
+    """(te, den, info) from a .pt checkpoint, or an exported dir / Hub repo (text_encoder/, transformer/)."""
+    if src.endswith(".pt"):
+        ck = torch.load(src, map_location="cpu", weights_only=False, mmap=True)
+        den_cfg, te_cfg = configs_from_ckpt(ck)
+        assert getattr(te_cfg, "kind", "") == "lm", "for the released text encoders use sample.py on an export"
+        te, den = build_models(den_cfg, te_cfg)
+        te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
+        ema = bool(ck.get("ema")) and not raw
+        if ema:  # EMA list = te params, then den params, in parameters() order
+            with torch.no_grad():
+                for p_, e in zip(list(te.parameters()) + list(den.parameters()), ck["ema"], strict=True):
+                    p_.copy_(e)
+        return te, den, dict(step=ck.get("step"), weights="EMA" if ema else "raw", root=None)
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+    root = src if os.path.isdir(src) else snapshot_download(src)
+    cfg = lambda sub: json.load(open(os.path.join(root, sub, "config.json")))
+    te, den = build_models(DenoiserConfig(**cfg("transformer")), LMEncoderConfig(**cfg("text_encoder")))
+    for sub, mod in (("text_encoder", te), ("transformer", den)):
+        mod.load_state_dict(load_file(os.path.join(root, sub, "diffusion_pytorch_model.safetensors")))
+    info = json.load(open(os.path.join(root, "prompts.json"))) if os.path.exists(os.path.join(root, "prompts.json")) \
+        else {}
+    return te, den, dict(step=info.get("step"), weights=info.get("weights", "exported"), root=root)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("ckpt")
@@ -55,33 +83,38 @@ def main():
     p.add_argument("--cfg", type=float, default=3.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--raw", action="store_true", help="the raw weights instead of the EMA")
-    p.add_argument("--vae", default="AuroraIMG2-50M-Preview/vae")
+    p.add_argument("--vae", default=None, help="FLUX.2 decoder dir (default: the model's vae/, else "
+                   "AuroraIMG2-50M-Preview/vae)")
+    p.add_argument("--prompt", nargs="+", default=None, help="your own prompts (any language) instead of the grids")
     p.add_argument("--export", action="store_true", help="also write text_encoder / transformer safetensors + configs")
     a = p.parse_args()
     device = torch.device("cuda")
     os.makedirs(a.out_dir, exist_ok=True)
 
-    ck = torch.load(a.ckpt, map_location="cpu", weights_only=False, mmap=True)
-    den_cfg, te_cfg = configs_from_ckpt(ck)
-    assert getattr(te_cfg, "kind", "") == "lm", "for the released text encoders use sample.py on an export"
-    te, den = build_models(den_cfg, te_cfg)
-    te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
-    if ck.get("ema") and not a.raw:  # EMA list = te params, then den params, in parameters() order
-        with torch.no_grad():
-            for p_, e in zip(list(te.parameters()) + list(den.parameters()), ck["ema"], strict=True):
-                p_.copy_(e)
-    src = "raw" if a.raw or not ck.get("ema") else "EMA"
-    print(f"{a.ckpt}: step {ck.get('step')}, {src} weights, text encoder {te_cfg.repo} "
+    te, den, info = load(a.ckpt, a.raw)
+    te_cfg, den_cfg = te.config, den.config
+    src = info["weights"]
+    print(f"{a.ckpt}: step {info['step']}, {src} weights, text encoder {te_cfg.repo} "
           f"({te_cfg.experts or 'all'} experts{', ' + te_cfg.quant if te_cfg.quant else ''})")
     te.to(device).eval(), den.to(device).eval()
+    if a.vae is None:
+        own = info["root"] and os.path.join(info["root"], "vae")
+        a.vae = own if own and os.path.isdir(own) else "AuroraIMG2-50M-Preview/vae"
     vae = REPATarget(a.vae, "vit_base_patch14_reg4_dinov2.lvd142m", device)
     null_row = torch.from_numpy(te.null_ids()).to(device)[None]
 
+    sets = [("en", PROMPTS), ("pl", PROMPTS_PL)] if a.prompt is None else [("prompt", a.prompt)]
     with torch.no_grad():
-        for lang, prompts in (("en", PROMPTS), ("pl", PROMPTS_PL)):
+        for lang, prompts in sets:
             z = fidlib.sample(te, den, tokenize(prompts, te_cfg), null_row, a.steps, a.cfg, a.seed, device)
             imgs = ((vae.decode(z) + 1) / 2).clamp(0, 1)
             imgs = (imgs.permute(0, 2, 3, 1).float().cpu().numpy() * 255).round().astype(np.uint8)
+            if a.prompt is not None:
+                for i, im in enumerate(imgs):
+                    path = os.path.join(a.out_dir, f"{i:02d}.png")
+                    Image.fromarray(im).save(path)
+                    print(f"saved {path}: {prompts[i]}")
+                continue
             h, w = imgs.shape[1:3]
             grid = Image.new("RGB", (4 * w, 2 * h))
             for i, im in enumerate(imgs):
@@ -99,8 +132,10 @@ def main():
             with open(os.path.join(a.out_dir, sub, "config.json"), "w") as f:
                 json.dump(asdict(cfg), f, indent=1)
         with open(os.path.join(a.out_dir, "prompts.json"), "w") as f:
-            json.dump(dict(en=PROMPTS, pl=PROMPTS_PL, steps=a.steps, cfg=a.cfg, seed=a.seed, step=ck.get("step"),
+            json.dump(dict(en=PROMPTS, pl=PROMPTS_PL, steps=a.steps, cfg=a.cfg, seed=a.seed, step=info["step"],
                            weights=src), f, ensure_ascii=False, indent=1)
+        if os.path.abspath(a.vae) != os.path.abspath(os.path.join(a.out_dir, "vae")):
+            shutil.copytree(a.vae, os.path.join(a.out_dir, "vae"), dirs_exist_ok=True)
         print(f"exported weights to {a.out_dir}/text_encoder, {a.out_dir}/transformer")
 
 
