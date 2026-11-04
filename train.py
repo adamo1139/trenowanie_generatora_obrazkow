@@ -412,6 +412,8 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
 def evaluate(te, den, val, device, seed=1234, chunk=256):
     """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs."""
     lat, ids = val
+    if getattr(te.config, "kind", "") == "lm" and getattr(te.config, "backend", "") == "hf":
+        chunk = min(chunk, 64)  # a big MoE LM's routing buffers at 256 captions x 256 tokens would not fit next to training
     g = torch.Generator(device="cpu").manual_seed(seed)
     t_all = torch.sigmoid(torch.randn(len(lat), generator=g))
     eps_all = torch.randn(lat.shape, generator=g)
