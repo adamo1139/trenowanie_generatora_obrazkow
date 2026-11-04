@@ -4,6 +4,7 @@ candidate text encoder knows (a text-to-image model conditioned on it can only s
 
   python blimp_eval.py cpral/Poziomka-Baza-2026-09-05 SlayerLab/GoLLeM-v6-250M SlayerLab/Slayer149 --out blimp.json
   python blimp_eval.py SlayerLab/GoLLeM-v6-250M --limit 100      # quick: 100 pairs per paradigm
+  python blimp_eval.py cpral/Poziomka-Baza-2026-09-05 --set num_experts_per_tok=16   # fewer active experts (MoE)
 
 Backends: GoLLeM v6 repos (their own modeling_gollem_v6.py), GoLLeM/Slayer GPT repos (aurora/slayer.py), anything
 else through transformers AutoModelForCausalLM (trust_remote_code). Every sentence gets a BOS / document-start token
@@ -32,7 +33,7 @@ def load_blimp(limit):
     return out
 
 
-def load_model(repo, device):
+def load_model(repo, device, overrides=None):
     """-> (logits_fn(ids LongTensor B x T) -> B x T x V, encode(str) -> list[int] incl. BOS, label)."""
     files = list_repo_files(repo)
     if "modeling_gollem_v6.py" in files:
@@ -57,7 +58,8 @@ def load_model(repo, device):
         return logits, (lambda s: [bos] + tok.encode(s).ids), "gollem-gpt"
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
+    model = AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                                                 **(overrides or {})).to(device)
     model.eval()
     bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     enc = lambda s: [bos] + tok(s, add_special_tokens=False).input_ids
@@ -90,14 +92,19 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="pairs per paradigm (0 = all 1,000)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default=None)
+    p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                   help="config overrides for transformers models, e.g. num_experts_per_tok=16")
     a = p.parse_args()
 
     data = load_blimp(a.limit)
     print(f"BLiMP: {len(data):,} pairs, {len({r['UID'] for r in data})} paradigms", flush=True)
+    overrides = {k: json.loads(v) for k, v in (s.split("=", 1) for s in a.set)}
     results = {}
     for repo in a.models:
         t0 = time.time()
-        logits_fn, enc, kind = load_model(repo, a.device)
+        logits_fn, enc, kind = load_model(repo, a.device, overrides)
+        if overrides:
+            repo = f"{repo} {overrides}"
         good = score(logits_fn, [enc(r["sentence_good"]) for r in data], a.device)
         bad = score(logits_fn, [enc(r["sentence_bad"]) for r in data], a.device)
         ok = [g > b for g, b in zip(good, bad)]
