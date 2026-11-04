@@ -16,6 +16,7 @@
 """
 import argparse
 import contextlib
+import gc
 import json
 import math
 import os
@@ -585,7 +586,8 @@ def main():
                                                                                       args.te_quant)
     init_ck = None
     if args.init:  # pretrained denoiser, new text encoder: its output is projected to the denoiser's text width
-        init_ck = torch.load(args.init, map_location="cpu", weights_only=False)
+        # mmap: the 8 ranks share the file's page cache instead of each holding a private copy in RAM
+        init_ck = torch.load(args.init, map_location="cpu", weights_only=False, mmap=True)
         den_cfg = DenoiserConfig(**init_ck["den_config"])
         assert isinstance(te_cfg, LMEncoderConfig), "--init needs a frozen-LM text encoder (e.g. --te-size poziomka)"
         init_te = te_config_from_dict(init_ck.get("te_config", {}))
@@ -597,7 +599,15 @@ def main():
                              quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
         elif (te_cfg.out_dim or te_cfg.dim) != den_cfg.text_dim:
             te_cfg = replace(te_cfg, out_dim=den_cfg.text_dim)
-    te, den = build_models(den_cfg, te_cfg)
+    # a big frozen LM is materialised in RAM before it moves to the GPU: build on 2 ranks at a time so 8 copies of
+    # it are never in host memory together
+    staggered = distributed and getattr(te_cfg, "backend", "") == "hf"
+    for turn in range(0, world, 2) if staggered else [0]:
+        if not staggered or turn <= rank < turn + 2:
+            te, den = build_models(den_cfg, te_cfg)
+            gc.collect()
+        if staggered:
+            dist.barrier()
     if args.load_hf:
         load_hf(te, den, args.load_hf)
     if init_ck is not None and not os.path.exists(os.path.join(args.out, "latest.pt")):
