@@ -284,6 +284,9 @@ def lm_server(te_cfg, clients, device, log):
     lm = LMTextEncoder(te_cfg).to(device).lm
     log(f"LM server: {te_cfg.repo} for ranks {clients}", flush=True)
     active, served, t0 = list(clients), 0, time.time()
+    # busy share: time from a request's arrival to its last send, over wall time. Near 100% = the LM GPU is the
+    # bottleneck (the trainers wait for it); well below = it keeps up
+    busy, win_t, win_n = 0.0, time.time(), 0
     while active:
         for r in list(active):
             hdr = torch.empty(3, dtype=torch.long, device=device)
@@ -293,13 +296,22 @@ def lm_server(te_cfg, clients, device, log):
                 continue
             ids = torch.empty(int(hdr[1]), int(hdr[2]), dtype=torch.long, device=device)
             dist.recv(ids, src=r)
+            t_req = time.time()
             sends = []
             for _, _, sub in lm_chunk_plan(ids):
                 h = hf_lm_part(lm, sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0), True, True).contiguous()
                 sends.append((dist.isend(h, dst=r), h))
             for req, _ in sends:
                 req.wait()
+            torch.cuda.synchronize(device) if device.type == "cuda" else None
+            busy += time.time() - t_req
             served += len(ids)
+            win_n += len(ids)
+            if time.time() - win_t > 60:
+                dt = time.time() - win_t
+                log(f"LM server: busy {100 * busy / dt:.0f}% over the last {dt:.0f} s, {win_n / dt:.0f} captions/s",
+                    flush=True)
+                busy, win_t, win_n = 0.0, time.time(), 0
     log(f"LM server: {served:,} captions in {time.time() - t0:.0f} s, done", flush=True)
 
 
