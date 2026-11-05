@@ -61,3 +61,25 @@ Wnioski:
 
 EMA `val/loss` (ten sam zbiór, stałe t i szum): 0.7107 (1,536) → 0.6531 (34,816) → 0.6431 (49,152) → 0.6378 (61,440)
 → 0.6365 (69,632) → 0.6327 (75,776) → 0.6303 (86,997). Dla porównania IMG-50M (EMA) 0.7030.
+
+## HomeIMG-641M-PL: Poziomka jako text encoder (etap 1 + etap 2)
+
+Start: denoiser z hero runu (EMA, krok 86,997). Text encoder: zamrożona cpral/Poziomka-Baza (16 warstw, 8 z 32
+aktywnych ekspertów, eksperci int8) + nowy refiner 1280 × 4 (72.1M). 50% captionów po polsku (`--pl-prob 0.5`).
+- Etap 1: zamrożony denoiser, trenowany tylko refiner, 1 epoka (5,743 kroków × 1024), ~650 img/s.
+- Etap 2: cały model, 4 epoki (22,972 kroków × 1024), micro-batch 16, ~385 img/s, `--seed 1`.
+
+| model | val/loss | FD-DINOv2 (prompty EN) | FD-DINOv2 (prompty PL) |
+| --- | --- | --- | --- |
+| hero run, Slayer149 (EMA) | 0.6304 | 28.27 | – |
+| hero run, Slayer149 (WSM) | 0.6297 | 27.66 | – |
+| etap 1 (EMA) | 0.6316 | – | – |
+| etap 2, EMA | 0.62839 | 29.25 | 29.82 |
+| etap 2, WSM mean 20% (5 ckpt) | **0.62768** | 28.90 | 29.29 |
+
+Wnioski:
+- val/loss lepsza niż w hero runie, ale FD-DINOv2 ~1.2 gorsze (EN); połowa treningu szła na polskie prompty, a
+  refiner + Poziomka trenowały łącznie 5 epok zamiast 15.
+- Polskie prompty tylko ~0.4–0.6 FD gorsze od angielskich (te same obrazy, ten sam szum): model naprawdę działa
+  po polsku.
+- WSM znowu lepszy od EMA (oba języki); najlepsze najdłuższe okno (20%), mean > cosine > 1-sqrt, QAM gorszy.
