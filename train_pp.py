@@ -638,15 +638,18 @@ def main():
         stage_mod.lm_states = None
         if lm_offload:
             mine = {}
-            for k in range(M):
-                if k % pp == s:
-                    c = cond_ids[k * mb:(k + 1) * mb]
-                    if hf_lm:  # the LM runs on the micro-batch's real length; padded back (masked) for the pipeline
-                        w = trim_ids(c).shape[1]
-                        mine[k] = F.pad(lm_fn(c[:, :w]), (0, 0, 0, c.shape[1] - w))
-                    else:
-                        with amp:
-                            mine[k] = lm_fn(c)
+            ks = [k for k in range(M) if k % pp == s]
+            if hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
+                per = max(1, 32 // mb)
+                for i in range(0, len(ks), per):
+                    group = ks[i:i + per]
+                    h = lm_fn(torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in group]))
+                    for j, k in enumerate(group):
+                        mine[k] = h[j * mb:(j + 1) * mb]
+            else:
+                for k in ks:
+                    with amp:
+                        mine[k] = lm_fn(cond_ids[k * mb:(k + 1) * mb])
             stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:

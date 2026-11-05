@@ -247,14 +247,22 @@ def load_hf_lm(cfg):
 @torch.compiler.disable  # remote code + data-dependent MoE routing / trimming: stays eager when the refiner is compiled
 def _hf_states(lm, ids):
     """Caption rows (LM_PAD / LM_NULL marked) -> LM hidden states of the same width. The LM runs on the batch's real
-    length only (causal, so the pads would not change the real tokens beyond bf16 noise) and is padded back, so
-    callers that need a fixed width (pipeline stages, compiled refiners) keep it."""
-    T = ids.shape[1]
-    ids = trim_ids(ids)
-    ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
-    with torch.autocast("cuda", enabled=False):  # bf16 weights already; autocast on top gives NaN in BailingMoeV2
-        h = lm.model(input_ids=ids, use_cache=False).last_hidden_state
-    return F.pad(h, (0, 0, 0, T - ids.shape[1]))
+    length only (rounded up to 8; causal, so the pads would not change the real tokens beyond bf16 noise) and skips
+    null-prompt rows (zeros there); the result is padded back, so callers that need a fixed width (pipeline stages,
+    compiled refiners) keep it."""
+    B, T = ids.shape
+    real = ids[:, 0].ne(LM_NULL)  # CFG null prompts are replaced by the learned null vector anyway: not run
+    out = None
+    if real.any():
+        sub = trim_ids(ids[real], multiple=8)  # eager code: a fine rounding costs no recompiles
+        sub = sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0)
+        with torch.autocast("cuda", enabled=False):  # bf16 weights already; autocast on top gives NaN in BailingMoeV2
+            h = lm.model(input_ids=sub, use_cache=False).last_hidden_state
+        out = h.new_zeros(B, T, h.shape[-1])
+        out[real, : h.shape[1]] = h
+    else:
+        out = torch.zeros(B, T, lm.config.hidden_size, device=ids.device, dtype=torch.bfloat16)
+    return out
 
 
 def trim_ids(ids: torch.Tensor, multiple: int = 32) -> torch.Tensor:
