@@ -64,6 +64,8 @@ def get_args():
     p.add_argument("--te-cost", type=float, default=1.0,
                    help="work of the text encoder on stage 0 in denoiser blocks; stage 0 gets that many blocks fewer "
                         "so no stage straggles (0 = even split)")
+    p.add_argument("--bench", action="store_true",
+                   help="throughput test: no checkpoints, no merge files, no evaluation (nothing is written to --out)")
     p.set_defaults(batch=512, size="1.5b")
     return p.parse_args()
 
@@ -349,7 +351,8 @@ def main():
     ema = [p.detach().clone().float().to(ema_dev or p.device) for p in model_params] if keep_ema else None
 
     # ---- resume ----------------------------------------------------------------------------------------------------
-    os.makedirs(args.out, exist_ok=True)
+    if not args.bench:
+        os.makedirs(args.out, exist_ok=True)
     ckpt_path = os.path.join(args.out, "latest.pt")
     opt_path = os.path.join(args.out, f"opt_stage{s}.pt")
     step, outer_state = 0, None
@@ -465,7 +468,7 @@ def main():
     peak = args.peak_tflops or (peak_tflops(torch.cuda.get_device_name(device)) if device.type == "cuda" else 0)
 
     wb = None
-    if master and args.wandb and not args.no_wandb:
+    if master and args.wandb and not args.no_wandb and not args.bench:
         if wandb_logged_in():
             wb = init_wandb(args)
         else:
@@ -682,6 +685,8 @@ def main():
             acc.zero_()
             t0, t_last = time.time(), step
 
+        if args.bench:
+            continue
         if step % args.eval_every == 0 or step == args.steps:
             res = ema_eval()
             if master and res is not None:
