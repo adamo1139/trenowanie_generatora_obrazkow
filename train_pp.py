@@ -154,11 +154,13 @@ class Stage(nn.Module):
 
 
 def stage_ranges(depth, pp, first_extra=0.0):
-    """Contiguous block ranges per stage, balanced when stage 0 also does `first_extra` blocks' worth of other work."""
+    """Contiguous block ranges per stage, balanced when stage 0 also does `first_extra` blocks' worth of other work.
+    Stage 0 may end up with no blocks at all (only the text encoder and the stem), e.g. 14 blocks, 8 stages,
+    first_extra 2 -> [0, 2, 2, 2, 2, 2, 2, 2]; every other stage needs at least one."""
     bounds = np.linspace(0, depth + first_extra, pp + 1) - first_extra
     bounds = np.clip(bounds.round(), 0, depth).astype(int)
     bounds[0], bounds[-1] = 0, depth
-    assert (np.diff(bounds) > 0).all(), f"{depth} blocks can't fill {pp} stages"
+    assert (np.diff(bounds)[1:] > 0).all() and bounds[1] >= 0, f"{depth} blocks can't fill {pp} stages"
     return [(int(bounds[s]), int(bounds[s + 1])) for s in range(pp)]
 
 

@@ -63,7 +63,7 @@ ref_grads.update({("te", n): p.grad.clone() for n, p in te.named_parameters()})
 for p in list(den.parameters()) + list(te.parameters()):
     p.grad = None
 
-ranges = stage_ranges(den_cfg.depth, pp, 1.0 if pp > 1 else 0.0)  # stage 0 gets fewer blocks
+ranges = stage_ranges(den_cfg.depth, pp, float(__import__("os").environ.get("TE_COST", 1.0)) if pp > 1 else 0.0)  # stage 0 gets fewer blocks
 lo, hi = ranges[rank]
 first, last = rank == 0, rank == pp - 1
 b = REPA_LAYER - 1
