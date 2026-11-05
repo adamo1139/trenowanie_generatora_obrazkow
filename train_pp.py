@@ -71,6 +71,12 @@ def get_args():
     p.add_argument("--te-checkpoint", action="store_true",
                    help="activation checkpointing of the text encoder's refiner blocks (stage 0): stage 0 holds the most "
                         "micro-batches in flight under 1F1B and the refiner runs on the full padded text width")
+    p.add_argument("--mem-debug", action="store_true",
+                   help="print every rank's GPU memory breakdown (weights, grads, optimizer, EMA, MuLoCo copy, frozen LM, "
+                        "peak activations) after steps 1-3; the same report is always printed on an out-of-memory error")
+    p.add_argument("--mem-snapshot", default="",
+                   help="dir: record the CUDA allocator history and dump <dir>/rank<r>.pickle after step 2 or on OOM "
+                        "(open in https://pytorch.org/memory_viz)")
     p.add_argument("--bench", action="store_true",
                    help="throughput test: no checkpoints, no merge files, no evaluation (nothing is written to --out)")
     p.set_defaults(batch=512, size="1.5b")
@@ -568,6 +574,53 @@ def main():
         f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps' % args.diloco if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
     t0, t_last = time.time(), step
+    GB = 2 ** 30
+    nbytes = lambda ts: sum(t.numel() * t.element_size() for t in ts if t is not None and t.is_cuda)
+
+    def mem_report(tag):
+        """This rank's memory: what is resident between steps, and the peak that the step's activations add."""
+        if device.type != "cuda":
+            return
+        ms = torch.cuda.memory_stats(device)
+        trainable = [p for _, _, p in named if p.requires_grad]
+        parts = {
+            "weights": nbytes(p for _, _, p in named),
+            "grads (in backward)": nbytes(trainable),
+            "optimizer": nbytes(v for o in opts for st in o.state.values() for v in st.values()
+                                if torch.is_tensor(v)),
+            "EMA": nbytes(ema or []),
+            "MuLoCo global copy": nbytes(global_params or []),
+            "frozen LM": nbytes([*lm_mod.parameters(), *lm_mod.buffers()]) if lm_mod is not None else 0,
+        }
+        static = sum(parts.values())
+        peak = ms.get("allocated_bytes.all.peak", 0)
+        line = " | ".join(f"{k} {v / GB:.2f}" for k, v in parts.items() if v)
+        print(f"[mem {tag}] rank {rank} stage {s} blocks {lo}-{hi}: now {ms.get('allocated_bytes.all.current', 0) / GB:.2f}"
+              f" GB, peak {peak / GB:.2f} GB, reserved {ms.get('reserved_bytes.all.current', 0) / GB:.2f} GB, "
+              f"alloc retries {ms.get('num_alloc_retries', 0)} || {line} || peak - these = activations + temporaries "
+              f"{(peak - static) / GB:.2f} GB", flush=True)
+
+    def mem_report_all(tag):
+        for r in range(world):  # one rank after another, so the lines don't interleave
+            if r == rank:
+                mem_report(tag)
+            dist.barrier()
+
+    lm_owner = te if first else lm_enc
+    lm_mod = getattr(lm_owner, "lm", None) if lm_owner is not None else None
+    if args.mem_snapshot and device.type == "cuda":
+        os.makedirs(args.mem_snapshot, exist_ok=True)
+        torch.cuda.memory._record_memory_history(max_entries=200_000)
+
+    def dump_snapshot(tag):
+        if args.mem_snapshot and device.type == "cuda":
+            path = os.path.join(args.mem_snapshot, f"rank{rank}.pickle")
+            torch.cuda.memory._dump_snapshot(path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            print(f"[mem {tag}] rank {rank}: allocator history -> {path}", flush=True)
+
+    if device.type == "cuda":  # the peak should be the training step's, not the one from loading (e.g. LM -> int8)
+        torch.cuda.reset_peak_memory_stats(device)
     while step < args.steps:
         x0 = ids = None
         if needs_data:
@@ -603,18 +656,23 @@ def main():
             stage_mod.repa_targets = [g_.float() for g_ in got] if got is not None else None
         stage_mod.repa_losses = []
         losses = []
-        with amp:
-            if first:
-                tt = t.view(-1, 1, 1, 1)
-                z_t = (1 - tt) * x0 + tt * eps
-                if last:
-                    sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses)
+        try:
+            with amp:
+                if first:
+                    tt = t.view(-1, 1, 1, 1)
+                    z_t = (1 - tt) * x0 + tt * eps
+                    if last:
+                        sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses)
+                    else:
+                        sched.step(z_t, t, cond_ids)
+                elif last:
+                    sched.step(target=eps - x0, losses=losses)
                 else:
-                    sched.step(z_t, t, cond_ids)
-            elif last:
-                sched.step(target=eps - x0, losses=losses)
-            else:
-                sched.step()
+                    sched.step()
+        except torch.OutOfMemoryError:
+            mem_report(f"OOM at step {step + 1}")  # no barrier: the other ranks may be stuck in communication
+            dump_snapshot("OOM")
+            raise
         if losses:
             acc[0] += torch.stack([l.detach().float() for l in losses]).mean()
             acc[1] += 1
@@ -644,6 +702,10 @@ def main():
             o.step()
             o.zero_grad(set_to_none=True)
         step += 1
+        if args.mem_debug and step <= 3:
+            mem_report_all(f"step {step}")
+        if step == 2:
+            dump_snapshot("step 2")
         if outer_opt is not None:
             if step % args.diloco == 0 or step == args.steps:
                 outer_sync(global_params, params, outer_opt, replicas, args.outer_comm, stage_group)
