@@ -31,6 +31,9 @@ def main():
     p.add_argument("--seed", type=int, default=0, help="train.py --seed (same noise as the in-training eval)")
     p.add_argument("--raw", action="store_true", help="raw weights even where the checkpoint has EMA weights")
     p.add_argument("--out", default=None, help="append one JSON line per checkpoint to this file")
+    p.add_argument("--lang", default="", help="caption language of the held-out prompts: '' = the original (English), "
+                   "pl = the Polish translations (<shard>.tok_<enc>_pl.npy, frozen-LM text encoders only); the real "
+                   "images, noise and reference statistics stay the same")
     a = p.parse_args()
 
     distributed = "RANK" in os.environ
@@ -59,6 +62,9 @@ def main():
         del ck
         te.to(device).eval(), den.to(device).eval()
         tok_suffix = getattr(te_cfg, "tok_suffix", "")
+        if a.lang:
+            assert tok_suffix, f"--lang {a.lang} needs a frozen-LM text encoder (translated captions)"
+            tok_suffix = f"{tok_suffix}_{a.lang}"
         if tok_suffix not in cache:  # held-out set and the real images' statistics, once per tokenisation
             _, val_names = select_shards(a.data, 1.0, tok_suffix)
             lat, all_ids = load_val(a.data, val_names, a.val_samples, tok_suffix, te.null_ids())
@@ -71,8 +77,9 @@ def main():
         fd = frechet(*stats(gather_features(feats(z), n)), *ref)
         if rank == 0:
             res = dict(ckpt=path, step=step, weights="ema" if ema else "raw", fd_dinov2=round(fd, 3), samples=n,
-                       steps=a.steps, cfg=a.cfg)
-            print(f"{path}  step {step}  {res['weights']}  FD-DINOv2 {fd:.2f}  ({time.time() - t0:.0f} s)", flush=True)
+                       steps=a.steps, cfg=a.cfg, lang=a.lang or "orig")
+            print(f"{path}  step {step}  {res['weights']}  prompts {res['lang']}  FD-DINOv2 {fd:.2f}  "
+                  f"({time.time() - t0:.0f} s)", flush=True)
             if a.out:
                 with open(a.out, "a") as f:
                     f.write(json.dumps(res) + "\n")
