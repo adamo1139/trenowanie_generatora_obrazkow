@@ -49,7 +49,7 @@ def load(repo, device, vae=True):
 
 
 @torch.no_grad()
-def sample(good, prompts, method, guides, steps, seed, device):
+def sample(good, prompts, method, guides, steps, seed, device, decode=True):
     kind, w, opts = method[0], method[-2], method[-1]
     shift, off = float(opts.get("shift", 1.0)), float(opts.get("off", -1.0))
     b = len(prompts)
@@ -86,6 +86,8 @@ def sample(good, prompts, method, guides, steps, seed, device):
                     vu = s * vu
                 v = vu + w * (vc - vu)
         z = z + (t1 - t0) * v
+    if not decode:
+        return z
     return ((good.decode_latents(z) + 1) / 2).clamp(0, 1)
 
 
