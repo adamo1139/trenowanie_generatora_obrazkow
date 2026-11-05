@@ -166,6 +166,23 @@ class Stage(nn.Module):
         return x, t6, text, validf
 
 
+@torch.no_grad()
+def average_params(params, n, group, bucket=64 * 2**20):
+    """MuLoCo with outer lr 1 and no momentum: every replica's weights become the replicas' mean (fp32 all-reduce in
+    buckets of ~`bucket` elements)."""
+    chunk, size = [], 0
+    for i, p in enumerate(params):
+        chunk.append(p)
+        size += p.numel()
+        if size >= bucket or i == len(params) - 1:
+            flat = torch.cat([q.detach().float().flatten() for q in chunk])
+            dist.all_reduce(flat, group=group)
+            flat /= n
+            for q, d in zip(chunk, flat.split([q.numel() for q in chunk])):
+                q.copy_(d.view_as(q))
+            chunk, size = [], 0
+
+
 def stage_ranges(depth, pp, first_extra=0.0):
     """Contiguous block ranges per stage, balanced when stage 0 also does `first_extra` blocks' worth of other work.
     Stage 0 may end up with no blocks at all (only the text encoder and the stem), e.g. 14 blocks, 8 stages,
@@ -427,7 +444,11 @@ def main():
         (lm_enc.lm_states if lm_offload else None)
 
     outer_opt, global_params = None, None
-    if replicas > 1 and args.diloco:
+    # outer lr 1 without momentum is plain weight averaging: new = mean of the replicas, so no global copy is needed
+    # (it only serves to send the change in bf16); average the weights themselves in fp32 instead, one fp32 model less
+    # in GPU memory per rank for 2x the (every-H-steps) traffic
+    plain_avg = replicas > 1 and args.diloco and args.outer_lr == 1 and args.outer_momentum == 0
+    if replicas > 1 and args.diloco and not plain_avg:
         global_params = [nn.Parameter(p.detach().clone().float(), requires_grad=False) for p in params]
         outer_opt = torch.optim.SGD(global_params, lr=args.outer_lr, momentum=args.outer_momentum,
                                     nesterov=args.outer_momentum > 0)
@@ -571,7 +592,7 @@ def main():
             f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
             f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"lr: {args.schedule} after {warmup} warmup steps, Muon {args.lr_muon}, AdamW x{args.lr_scale:.2f}, "
-        f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps' % args.diloco if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
+        f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps%s' % (args.diloco, ' (plain averaging, no global copy)' if plain_avg else '') if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
     t0, t_last = time.time(), step
     GB = 2 ** 30
@@ -714,9 +735,12 @@ def main():
             mem_report_all(f"step {step}")
         if step == 2:
             dump_snapshot("step 2")
-        if outer_opt is not None:
+        if outer_opt is not None or plain_avg:
             if step % args.diloco == 0 or step == args.steps:
-                outer_sync(global_params, params, outer_opt, replicas, args.outer_comm, stage_group)
+                if plain_avg:
+                    average_params(params, replicas, stage_group)
+                else:
+                    outer_sync(global_params, params, outer_opt, replicas, args.outer_comm, stage_group)
                 if keep_ema:
                     n_sync = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n_sync) / (10 + n_sync))
