@@ -18,13 +18,23 @@ stream is deterministic and noise / t / caption dropout come from a generator se
 of them see the same samples. Checkpoints are gathered to rank 0 in train.py's format (te, den, ema), so export.py,
 merge.py and tests/check_export.py work unchanged; per-stage optimizer state goes to <out>/opt_stage<s>.pt.
 MLM is not supported here (use --te-size slayer149, the default).
+
+Growing a trained model deeper (SANA 1.5-style): --init <train.py / train_pp.py checkpoint> --depth N keeps its blocks
+(EMA weights if the file has them), its stem and head, and its text encoder if it uses the same frozen LM; the
+N - old_depth new blocks are appended at the end with zero output projections (attention, cross-attention, MLP), so
+the grown model starts as exactly the old one. Copying trained blocks instead diverged in SANA 1.5.
+
+  # HomeIMG 641M (6 blocks) -> 12 blocks: 4 pipelines of 2 stages, Poziomka with Polish captions
+  NCCL_P2P_LEVEL=SYS torchrun --nproc_per_node 8 train_pp.py --data data/aurora_full --fraction 1 --size 750m \\
+      --depth 12 --pp 2 --te-size poziomka --te-quant int8 --pl-prob 0.5 --init runs/poziomka_stage2/latest.pt \\
+      --batch 1024 --microbatches 16 --diloco 64 --outer-lr 1 --outer-momentum 0 --ema-cpu --out runs/grow12
 """
 import functools
 import logging
 import math
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 import torch
@@ -35,9 +45,10 @@ from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selectiv
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
 from aurora.data import ShardStore, TrainStream, load_val, select_shards
-from aurora.model import (Denoiser, LMEncoderConfig, TextEncoder, build_rope_2d, make_configs,
+from aurora.model import (Denoiser, DenoiserConfig, LMEncoderConfig, TextEncoder, build_rope_2d, make_configs,
                           te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
+from aurora.slayer import LM_PAD, trim_ids
 from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
                    peak_tflops, resolve_defaults, wandb_logged_in, weight_sq, wrms_stats)
 
@@ -222,7 +233,25 @@ def main():
     args.mlm_weight = 0.0
 
     # ---- model: a meta skeleton everywhere, only this stage's parts are materialised -------------------------------
-    den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth)
+    den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth,
+                                   args.te_experts, args.te_quant)
+    assert not args.freeze_den, "--freeze-den is only supported by train.py"
+    assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
+    resuming = os.path.exists(os.path.join(args.out, "latest.pt"))
+    init_ck, keep_te, old_depth = None, False, 0
+    if args.init:  # also on resume: the text encoder config must be derived the same way every time
+        init_ck = torch.load(args.init, map_location="cpu", weights_only=False, mmap=True)
+        old = DenoiserConfig(**init_ck["den_config"])
+        old_depth = old.depth
+        init_te = te_config_from_dict(init_ck.get("te_config", {}))
+        keep_te = isinstance(init_te, LMEncoderConfig) and isinstance(te_cfg, LMEncoderConfig) \
+            and init_te.repo == te_cfg.repo
+        if keep_te:  # the refiner comes from the checkpoint; experts / quantisation of the frozen LM may change
+            te_cfg = replace(init_te, experts=te_cfg.experts if args.te_experts else init_te.experts,
+                             quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
+        assert asdict(replace(old, depth=den_cfg.depth)) == asdict(den_cfg), \
+            f"--init denoiser {old} differs from {den_cfg} in more than the depth"
+        assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     assert M >= pp, f"need at least {pp} micro-batches"
     ranges = stage_ranges(den_cfg.depth, pp, args.te_cost if pp > 1 else 0.0)
     lo, hi = ranges[s]
@@ -256,7 +285,6 @@ def main():
     lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1
     lm_enc = te
     if lm_offload and not first:
-        from dataclasses import replace
         from aurora.slayer import LMTextEncoder
         lm_enc = LMTextEncoder(replace(te_cfg, depth=0)).to(device)  # just the LM, no refiner
 
@@ -285,6 +313,31 @@ def main():
     n_den = sum(p.numel() for p in den.parameters())
     log(f"pipeline: {replicas} x {pp} stages, blocks per stage {[b - a for a, b in ranges]}, "
         f"denoiser {n_den / 1e9:.2f}B, batch {args.batch} = {replicas} x {M} micro-batches x {mb}")
+    if init_ck is not None and not resuming:
+        src = "EMA" if init_ck.get("ema") else "weights"
+        keys = [("te", n) for n in init_ck["te"]] + [("den", n) for n in init_ck["den"]]
+        if init_ck.get("ema"):
+            assert len(keys) == len(init_ck["ema"]), "checkpoint EMA does not match its state dicts"
+            lookup = dict(zip(keys, init_ck["ema"]))
+        else:
+            lookup = {**{("te", n): v for n, v in init_ck["te"].items()},
+                      **{("den", n): v for n, v in init_ck["den"].items()}}
+        with torch.no_grad():
+            for n in den_names:
+                parts = n.split(".")
+                if parts[0] == "blocks" and int(parts[1]) >= old_depth:
+                    continue
+                den_params[n].copy_(lookup[("den", n)])
+            for i in range(max(lo, old_depth), hi):  # appended blocks start as the identity (their gates are not 0:
+                blk = den.blocks[i]                 # adaLN-single's shared projection is trained, so zero outputs)
+                for lin in (blk.attn.out, blk.cross.out, blk.mlp.out_proj):
+                    nn.init.zeros_(lin.weight)
+            if first and keep_te:
+                for n, p_ in te.named_parameters():
+                    p_.copy_(lookup[("te", n)])
+        log(f"init: {old_depth} blocks + stem + head{' + text encoder' if keep_te else ''} ({src}) from {args.init} "
+            f"(step {init_ck.get('step')}); blocks {old_depth}..{den_cfg.depth - 1} new, zero output projections")
+    del init_ck
     if replicas > 1:  # identical start on every replica
         for p in model_params + ([] if repa_proj is None else list(repa_proj.parameters())):
             dist.broadcast(p.data, s, group=stage_group)
@@ -292,7 +345,8 @@ def main():
     opts, counts = param_groups(None, None, args, named=named)
     opts = [o if not isinstance(o, Muon) else make_muon(o.param_groups, args, named, shard=False) for o in opts]
     keep_ema = replica == 0
-    ema = [p.detach().clone().float() for p in model_params] if keep_ema else None
+    ema_dev = "cpu" if args.ema_cpu else None
+    ema = [p.detach().clone().float().to(ema_dev or p.device) for p in model_params] if keep_ema else None
 
     # ---- resume ----------------------------------------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
@@ -349,7 +403,8 @@ def main():
                 blk.compile(dynamic=False)
         if first:
             te.compile(dynamic=False)
-    lm_fn = torch.compile(lm_enc.lm_states, dynamic=False) if lm_offload and not args.no_compile else \
+    hf_lm = getattr(te_cfg, "backend", "") == "hf"  # remote code + MoE routing: runs eager (see aurora/slayer.py)
+    lm_fn = torch.compile(lm_enc.lm_states, dynamic=False) if lm_offload and not args.no_compile and not hf_lm else \
         (lm_enc.lm_states if lm_offload else None)
 
     outer_opt, global_params = None, None
@@ -378,10 +433,15 @@ def main():
     ids_enc = te if first else lm_enc  # null prompt row (same on every stage that reads captions)
     null_row = torch.from_numpy(ids_enc.null_ids()).to(device) if ids_enc is not None else None
     needs_data = first or last or args.repa_weight > 0 or lm_offload  # REPA targets / LM states: every stage
-    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix)
+    alt_suffix = f"{tok_suffix}_pl" if args.pl_prob > 0 else ""
+    assert not alt_suffix or tok_suffix, "--pl-prob needs a frozen-LM text encoder (--te-size poziomka)"
+    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix)
     loader = store = None
     if needs_data:
-        store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None)
+        store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None,
+                           alt_suffix, args.pl_prob)
+        if alt_suffix:
+            log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
@@ -422,7 +482,7 @@ def main():
             return None
         if not master:
             for t_ in tensors[len(tensors) - len(den_names):]:
-                dist.send(t_.detach().float().contiguous(), dst=0)
+                dist.send(t_.detach().float().to(device).contiguous(), dst=0)  # the EMA may live on the CPU
             return None
         out = {}
         n_te = len(te_names)
@@ -499,6 +559,9 @@ def main():
         x0 = ids = None
         if needs_data:
             lat, ids = next(loader)
+            if hf_lm and lm_offload:  # micro-batches of similar caption length (same order on every stage)
+                order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
+                lat, ids = lat[order], ids[order]
             x0 = lat.to(device, non_blocking=True).float()
             ids = ids.to(device, non_blocking=True)
             g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + step)
@@ -508,8 +571,16 @@ def main():
         cond_ids = torch.where(drop[:, None], null_row, ids) if ids is not None and null_row is not None else None
         stage_mod.lm_states = None
         if lm_offload:
-            with amp:
-                mine = {k: lm_fn(cond_ids[k * mb:(k + 1) * mb]) for k in range(M) if k % pp == s}
+            mine = {}
+            for k in range(M):
+                if k % pp == s:
+                    c = cond_ids[k * mb:(k + 1) * mb]
+                    if hf_lm:  # the LM runs on the micro-batch's real length; padded back (masked) for the pipeline
+                        w = trim_ids(c).shape[1]
+                        mine[k] = F.pad(lm_fn(c[:, :w]), (0, 0, 0, c.shape[1] - w))
+                    else:
+                        with amp:
+                            mine[k] = lm_fn(c)
             stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
@@ -566,7 +637,7 @@ def main():
                 if keep_ema:
                     n_sync = step // args.diloco
                     d = min(args.ema ** args.diloco, (1 + n_sync) / (10 + n_sync))
-                    torch._foreach_lerp_(ema, [p.detach().float() for p in model_params], 1 - d)
+                    torch._foreach_lerp_(ema, [p.detach().float().to(ema_dev or p.device) for p in model_params], 1 - d)
         elif keep_ema:
             d = min(args.ema, step / (9 + step))
             torch._foreach_lerp_(ema, [p.detach().float() for p in model_params], 1 - d)
