@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from aurora.model import RMSNorm as _RMSNorm, TextBlock, build_rope_1d
 
@@ -219,7 +220,10 @@ class LMTextEncoder(nn.Module):
         T = ids.shape[1]  # rows may be trimmed below max_tokens (trim_ids)
         cos, sin = self.rope_cos[..., :T, :], self.rope_sin[..., :T, :]
         for block in self.blocks:
-            h = block(h, valid, cos, sin)
+            if getattr(self, "checkpoint_blocks", False) and torch.is_grad_enabled():  # recompute in backward
+                h = torch.utils.checkpoint.checkpoint(block, h, valid, cos, sin, use_reentrant=False)
+            else:
+                h = block(h, valid, cos, sin)
         return self.out_proj(self.norm(h)), valid
 
 

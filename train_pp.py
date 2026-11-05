@@ -68,6 +68,9 @@ def get_args():
                    help="frozen LM text encoder only on stage 0, run inside its pipeline forward (classic PP; pair with "
                         "--te-cost ~2 so stage 0 gets fewer blocks). Default: the LM runs on every stage for 1/pp of "
                         "the micro-batches before each step and its states are sent to stage 0")
+    p.add_argument("--te-checkpoint", action="store_true",
+                   help="activation checkpointing of the text encoder's refiner blocks (stage 0): stage 0 holds the most "
+                        "micro-batches in flight under 1F1B and the refiner runs on the full padded text width")
     p.add_argument("--bench", action="store_true",
                    help="throughput test: no checkpoints, no merge files, no evaluation (nothing is written to --out)")
     p.set_defaults(batch=512, size="1.5b")
@@ -288,6 +291,7 @@ def main():
             te = TextEncoder(te_cfg)
         te.init_weights()
         te.to(device)
+        te.checkpoint_blocks = args.te_checkpoint
     # the frozen LM (no gradients) runs on every stage: micro-batch k on stage k % pp, hidden states sent to stage 0;
     # stage 0 keeps only the trainable refiner
     lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1 and not args.lm_stage0
