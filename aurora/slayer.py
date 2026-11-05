@@ -204,9 +204,14 @@ class LMTextEncoder(nn.Module):
         """Frozen LM hidden states (no gradient); train_pp.py computes these on other GPUs and passes them in."""
         # pads / null marker -> any real id; attention is causal and padding is on the right, so real tokens never
         # see them, and their positions are masked out downstream
-        ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
         if getattr(self.config, "backend", "slayer") == "hf":
-            return _hf_states(self.lm, ids)
+            # the LM runs on the batch's real length (causal: the pads never matter), padded back so callers that
+            # need a fixed width (pipeline stages, compiled refiners) keep it
+            T = ids.shape[1]
+            ids = trim_ids(ids)
+            h = _hf_states(self.lm, ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0))
+            return F.pad(h, (0, 0, 0, T - ids.shape[1]))
+        ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
         return self.lm.hidden(ids, self.n_blocks)
 
     def forward(self, ids: torch.Tensor, lm_states: torch.Tensor = None):

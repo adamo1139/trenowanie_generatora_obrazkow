@@ -64,6 +64,10 @@ def get_args():
     p.add_argument("--te-cost", type=float, default=1.0,
                    help="work of the text encoder on stage 0 in denoiser blocks; stage 0 gets that many blocks fewer "
                         "so no stage straggles (0 = even split)")
+    p.add_argument("--lm-stage0", action="store_true",
+                   help="frozen LM text encoder only on stage 0, run inside its pipeline forward (classic PP; pair with "
+                        "--te-cost ~2 so stage 0 gets fewer blocks). Default: the LM runs on every stage for 1/pp of "
+                        "the micro-batches before each step and its states are sent to stage 0")
     p.add_argument("--bench", action="store_true",
                    help="throughput test: no checkpoints, no merge files, no evaluation (nothing is written to --out)")
     p.set_defaults(batch=512, size="1.5b")
@@ -286,7 +290,7 @@ def main():
         te.to(device)
     # the frozen LM (no gradients) runs on every stage: micro-batch k on stage k % pp, hidden states sent to stage 0;
     # stage 0 keeps only the trainable refiner
-    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1
+    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1 and not args.lm_stage0
     lm_enc = te
     if lm_offload and not first:
         from aurora.slayer import LMTextEncoder
@@ -564,7 +568,7 @@ def main():
         x0 = ids = None
         if needs_data:
             lat, ids = next(loader)
-            if hf_lm and lm_offload:  # micro-batches of similar caption length (same order on every stage)
+            if hf_lm:  # micro-batches of similar caption length (same order on every stage that reads data)
                 order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
                 lat, ids = lat[order], ids[order]
             x0 = lat.to(device, non_blocking=True).float()
