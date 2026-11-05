@@ -75,6 +75,7 @@ class Muon(torch.optim.Optimizer):
         """splits: {param: [row block sizes]} for CMuon; period / gamma: periodic row-wise Muon (period 1 = off);
         momentum_dtype: e.g. torch.bfloat16 halves the momentum buffers' memory (default: the parameter's dtype)."""
         self.momentum_dtype = momentum_dtype
+        self.chunk_elems = 64 * 2 ** 20  # unsharded step: at most this many elements orthogonalised at once
         super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                                       weight_decay=weight_decay))
         # shard=False: every rank orthogonalises everything locally (DiLoCo, where ranks hold different weights)
@@ -130,6 +131,18 @@ class Muon(torch.optim.Optimizer):
                     g = p.grad[r0:r1]
                     return g.lerp(buf.to(g.dtype), mom) if group["nesterov"] else buf
 
+                if self.world == 1:  # unsharded (DiLoCo): bounded chunks, so the stacked fp32 / NS temporaries of a
+                    # big bucket (CMuon puts every q, k, v, out, ... of the model in one) do not all live at once
+                    step = max(1, self.chunk_elems // (rows * cols))
+                    for c0 in range(0, len(entries), step):
+                        idx = range(c0, min(len(entries), c0 + step))
+                        X = torch.stack([direction(i) for i in idx])
+                        X = (self._ns(X, group["ns_steps"]) if refresh else rownorm(X) * self.gamma)
+                        for j, i in enumerate(idx):
+                            p, r0, r1, s = entries[i]
+                            p[r0:r1].add_(X[j].float(), alpha=-lr * s)
+                        del X
+                    continue
                 if refresh:
                     per = math.ceil(len(entries) / self.world)
                     lo, hi = min(len(entries), self.rank * per), min(len(entries), (self.rank + 1) * per)
