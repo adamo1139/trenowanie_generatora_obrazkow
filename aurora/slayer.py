@@ -205,12 +205,7 @@ class LMTextEncoder(nn.Module):
         # pads / null marker -> any real id; attention is causal and padding is on the right, so real tokens never
         # see them, and their positions are masked out downstream
         if getattr(self.config, "backend", "slayer") == "hf":
-            # the LM runs on the batch's real length (causal: the pads never matter), padded back so callers that
-            # need a fixed width (pipeline stages, compiled refiners) keep it
-            T = ids.shape[1]
-            ids = trim_ids(ids)
-            h = _hf_states(self.lm, ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0))
-            return F.pad(h, (0, 0, 0, T - ids.shape[1]))
+            return _hf_states(self.lm, ids)
         ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
         return self.lm.hidden(ids, self.n_blocks)
 
@@ -245,10 +240,17 @@ def load_hf_lm(cfg):
     return lm
 
 
-@torch.compiler.disable  # remote code + data-dependent MoE routing: stays eager when the refiner is compiled
+@torch.compiler.disable  # remote code + data-dependent MoE routing / trimming: stays eager when the refiner is compiled
 def _hf_states(lm, ids):
+    """Caption rows (LM_PAD / LM_NULL marked) -> LM hidden states of the same width. The LM runs on the batch's real
+    length only (causal, so the pads would not change the real tokens beyond bf16 noise) and is padded back, so
+    callers that need a fixed width (pipeline stages, compiled refiners) keep it."""
+    T = ids.shape[1]
+    ids = trim_ids(ids)
+    ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
     with torch.autocast("cuda", enabled=False):  # bf16 weights already; autocast on top gives NaN in BailingMoeV2
-        return lm.model(input_ids=ids, use_cache=False).last_hidden_state
+        h = lm.model(input_ids=ids, use_cache=False).last_hidden_state
+    return F.pad(h, (0, 0, 0, T - ids.shape[1]))
 
 
 def trim_ids(ids: torch.Tensor, multiple: int = 32) -> torch.Tensor:
