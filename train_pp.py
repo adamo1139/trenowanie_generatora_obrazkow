@@ -699,11 +699,16 @@ def main():
         coef = (args.clip / (gnorm + 1e-6)).clamp(max=1.0)
         torch._foreach_mul_([p.grad for p in params if p.grad is not None], coef)
         mult = lr_mult(step, args.steps, warmup, args.schedule)
-        for o in opts:
-            for gr in o.param_groups:
-                gr["lr"] = gr["base_lr"] * mult
-            o.step()
-            o.zero_grad(set_to_none=True)
+        try:
+            for o in opts:
+                for gr in o.param_groups:
+                    gr["lr"] = gr["base_lr"] * mult
+                o.step()
+                o.zero_grad(set_to_none=True)
+        except torch.OutOfMemoryError:
+            mem_report(f"OOM in the optimizer step {step + 1}")
+            dump_snapshot("OOM")
+            raise
         step += 1
         if args.mem_debug and step <= 3:
             mem_report_all(f"step {step}")
