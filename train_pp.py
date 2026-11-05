@@ -68,6 +68,10 @@ def get_args():
                    help="frozen LM text encoder only on stage 0, run inside its pipeline forward (classic PP; pair with "
                         "--te-cost ~2 so stage 0 gets fewer blocks). Default: the LM runs on every stage for 1/pp of "
                         "the micro-batches before each step and its states are sent to stage 0")
+    p.add_argument("--lm-rank", action="store_true",
+                   help="the LAST rank only runs the frozen transformers LM (Poziomka) for all the others, which hold no "
+                        "LM at all: each pipeline's stage 0 sends the next step's captions while it trains the current "
+                        "one and gets their LM states back (world = 1 + pipelines x pp, e.g. 8 GPUs = 7 x pp 1)")
     p.add_argument("--lm-split", action="store_true",
                    help="frozen transformers LM (Poziomka) split by layers over the pipeline's stages: each GPU holds "
                         "1/pp of it, the hidden states go stage 0 -> 1 -> ... -> back to stage 0 (chunks of ~32 "
@@ -258,6 +262,79 @@ def lm_split_forward(lm, chunks, s, pp, base, device, hidden):
     return out
 
 
+def lm_chunk_plan(ids, chunk=32):
+    """--lm-rank: how a request's caption rows are run through the LM, computed identically by client and server:
+    consecutive chunks of `chunk` rows, null-prompt rows skipped, trimmed to the chunk's real length (multiple of 8).
+    -> [(first row, real-row mask, trimmed ids)]."""
+    from aurora.slayer import LM_NULL
+    out = []
+    for i in range(0, len(ids), chunk):
+        c = ids[i:i + chunk]
+        real = c[:, 0].ne(LM_NULL)
+        if real.any():
+            out.append((i, real, trim_ids(c[real], multiple=8)))
+    return out
+
+
+def lm_server(te_cfg, clients, device, log):
+    """--lm-rank: this rank holds only the frozen LM and serves the `clients` (each pipeline's stage 0) round-robin
+    until every one of them has said stop. Protocol per request, on each client's own NCCL pair: header
+    [1, rows, width] (or [0] = stop) + the int64 caption rows -> one bf16 tensor per lm_chunk_plan() chunk."""
+    from aurora.slayer import LM_NULL, LMTextEncoder, hf_lm_part
+    lm = LMTextEncoder(te_cfg).to(device).lm
+    log(f"LM server: {te_cfg.repo} for ranks {clients}", flush=True)
+    active, served, t0 = list(clients), 0, time.time()
+    while active:
+        for r in list(active):
+            hdr = torch.empty(3, dtype=torch.long, device=device)
+            dist.recv(hdr, src=r)
+            if hdr[0].item() == 0:
+                active.remove(r)
+                continue
+            ids = torch.empty(int(hdr[1]), int(hdr[2]), dtype=torch.long, device=device)
+            dist.recv(ids, src=r)
+            sends = []
+            for _, _, sub in lm_chunk_plan(ids):
+                h = hf_lm_part(lm, sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0), True, True).contiguous()
+                sends.append((dist.isend(h, dst=r), h))
+            for req, _ in sends:
+                req.wait()
+            served += len(ids)
+    log(f"LM server: {served:,} captions in {time.time() - t0:.0f} s, done", flush=True)
+
+
+class LMClient:
+    """--lm-rank, on a pipeline's stage 0: request(ids) sends caption rows to the LM server and posts the receives
+    (non-blocking, so the server works while this rank trains); collect() waits and returns the (rows, width, H)
+    states, zeros for null prompts."""
+
+    def __init__(self, server, hidden, device):
+        self.server, self.hidden, self.device = server, hidden, device
+
+    def request(self, ids):
+        ids = ids.contiguous()
+        hdr = torch.tensor([1, ids.shape[0], ids.shape[1]], dtype=torch.long, device=self.device)
+        reqs = [dist.isend(hdr, dst=self.server), dist.isend(ids, dst=self.server)]
+        plans, bufs = lm_chunk_plan(ids), []
+        for _, _, sub in plans:
+            bufs.append(torch.empty(*sub.shape, self.hidden, dtype=torch.bfloat16, device=self.device))
+            reqs.append(dist.irecv(bufs[-1], src=self.server))
+        return dict(ids=ids, hdr=hdr, plans=plans, bufs=bufs, reqs=reqs)
+
+    def collect(self, h, out_device=None):
+        for r in h["reqs"]:
+            r.wait()
+        ids = h["ids"]
+        full = torch.zeros(*ids.shape, self.hidden, dtype=torch.bfloat16, device=out_device or self.device)
+        for (i, real, sub), buf in zip(h["plans"], h["bufs"]):
+            block = full[i:i + real.shape[0]]
+            block[real, : sub.shape[1]] = buf.to(full.device)
+        return full
+
+    def stop(self):
+        dist.send(torch.tensor([0, 0, 0], dtype=torch.long, device=self.device), dst=self.server)
+
+
 def owned_den_names(den, s, pp, ranges):
     lo, hi = ranges[s]
     out = []
@@ -280,11 +357,13 @@ def owned_den_names(den, s, pp, ranges):
 def main():
     args = resolve_defaults(get_args())
     dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))
-    rank, world = dist.get_rank(), dist.get_world_size()
+    rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
-    assert world % pp == 0, f"world size {world} is not a multiple of --pp {pp}"
+    world = world_all - 1 if args.lm_rank else world_all  # training ranks; with --lm-rank the last one serves the LM
+    lm_server_rank = world if args.lm_rank else None
+    assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
-    replica, s = divmod(rank, pp)
+    replica, s = divmod(rank, pp) if rank < world else (-1, 0)
     first, last = s == 0, s == pp - 1
     local = int(os.environ.get("LOCAL_RANK", 0)) % max(1, torch.cuda.device_count())
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
@@ -301,7 +380,8 @@ def main():
     # every rank creates every group in the same order
     pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp))) for r in range(replicas)]
     stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
-    pipe_group, stage_group = pipe_groups[replica], stage_groups[s]
+    train_group = dist.new_group(list(range(world))) if args.lm_rank else None  # None = everyone
+    pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
 
     per_pipe = args.batch // replicas
     M = args.microbatches or 4 * pp
@@ -332,6 +412,13 @@ def main():
         assert asdict(replace(old, depth=den_cfg.depth)) == asdict(den_cfg), \
             f"--init denoiser {old} differs from {den_cfg} in more than the depth"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
+    if args.lm_rank:
+        assert getattr(te_cfg, "backend", "") == "hf" and not args.lm_split and not args.lm_stage0, \
+            "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
+        if rank == lm_server_rank:
+            lm_server(te_cfg, [r * pp for r in range(replicas)], device, print)
+            dist.destroy_process_group()
+            return
     assert M >= pp, f"need at least {pp} micro-batches"
     ranges = stage_ranges(den_cfg.depth, pp, args.te_cost if pp > 1 else 0.0)
     lo, hi = ranges[s]
@@ -355,7 +442,7 @@ def main():
     if first:
         if isinstance(te_cfg, LMEncoderConfig):
             from aurora.slayer import LMTextEncoder
-            te = LMTextEncoder(te_cfg)
+            te = LMTextEncoder(te_cfg, with_lm=not args.lm_rank)
         else:
             te = TextEncoder(te_cfg)
         te.init_weights()
@@ -363,7 +450,7 @@ def main():
         te.checkpoint_blocks = args.te_checkpoint
     # the frozen LM (no gradients) runs on every stage: micro-batch k on stage k % pp, hidden states sent to stage 0;
     # stage 0 keeps only the trainable refiner
-    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1 and not args.lm_stage0
+    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1 and not args.lm_stage0 and not args.lm_rank
     lm_enc = te
     if lm_offload and not first:
         from aurora.slayer import LMTextEncoder
@@ -560,13 +647,25 @@ def main():
             val_lm = [h.cpu() for h in got]
             log(f"--lm-split: LM layers {lm_lo}-{lm_hi - 1} of {n_lm} on this stage; held-out LM states for "
                 f"{len(ids_val)} captions precomputed")
+    lm_client = LMClient(lm_server_rank, te_cfg.lm_dim, device) if args.lm_rank and first else None
+    if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
+        ids_val = val[1].to(device)
+        h = lm_client.request(ids_val)
+        full = lm_client.collect(h)
+        ch = 64  # evaluate()'s chunk for transformers LMs
+        val_lm = []
+        for i in range(0, len(ids_val), ch):
+            w = trim_ids(ids_val[i:i + ch]).shape[1]
+            val_lm.append(full[i:i + ch, :w].cpu())
+        del full, h
+        log(f"--lm-rank: LM on rank {lm_server_rank}; held-out LM states for {len(ids_val)} captions precomputed")
 
     # FLOPs per sample (fwd + bwd), analytic: matmuls 6 N T, attention 12 L d T (T + T_text), frozen LM forward 2 N T
     T, Tt = den_cfg.latent_size ** 2, getattr(te_cfg, "max_tokens", 64)
     flops_sample = 6 * n_den * T + 12 * den_cfg.depth * den_cfg.dim * T * (T + Tt)
     if first:
         flops_sample += 6 * sum(p.numel() for p in te.parameters()) * Tt
-        if hasattr(te, "lm"):
+        if getattr(te, "lm", None) is not None:
             flops_sample += 2 * sum(p.numel() for p in te.lm.parameters()) * Tt
     peak = args.peak_tflops or (peak_tflops(torch.cuda.get_device_name(device)) if device.type == "cuda" else 0)
 
@@ -625,7 +724,7 @@ def main():
                             repa_proj={k: v.cpu() for k, v in repa_proj.state_dict().items()} if repa_proj else None),
                        opt_path + ".tmp")
             os.replace(opt_path + ".tmp", opt_path)
-        dist.barrier()
+        dist.barrier(group=train_group)
         if master:
             ema_list = [emas[("te", n)] for n in te_names] + [emas[("den", n)] for n, _ in den.named_parameters()]
             torch.save(dict(meta, ema=ema_list, args=vars(args), opts=None), ckpt_path + ".tmp")
@@ -691,7 +790,7 @@ def main():
         for r in range(world):  # one rank after another, so the lines don't interleave
             if r == rank:
                 mem_report(tag)
-            dist.barrier()
+            dist.barrier(group=train_group)
 
     lm_owner = te if first else lm_enc
     lm_mod = getattr(lm_owner, "lm", None) if lm_owner is not None else None
@@ -708,21 +807,40 @@ def main():
 
     if device.type == "cuda":  # the peak should be the training step's, not the one from loading (e.g. LM -> int8)
         torch.cuda.reset_peak_memory_stats(device)
+    def next_batch(at):
+        """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
+        if not needs_data:
+            return None, None, None, None, None
+        lat, ids = next(loader)
+        if hf_lm:  # micro-batches of similar caption length (same order on every stage that reads data)
+            order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
+            lat, ids = lat[order], ids[order]
+        x0 = lat.to(device, non_blocking=True).float()
+        ids = ids.to(device, non_blocking=True)
+        g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
+        t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
+        eps = torch.randn(x0.shape, device=device, generator=g)
+        drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
+        cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
+        return x0, ids, t, eps, cond
+
+    pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     while step < args.steps:
-        x0 = ids = None
-        if needs_data:
-            lat, ids = next(loader)
-            if hf_lm:  # micro-batches of similar caption length (same order on every stage that reads data)
-                order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
-                lat, ids = lat[order], ids[order]
-            x0 = lat.to(device, non_blocking=True).float()
-            ids = ids.to(device, non_blocking=True)
-            g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + step)
-            t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
-            eps = torch.randn(x0.shape, device=device, generator=g)
-            drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
-        cond_ids = torch.where(drop[:, None], null_row, ids) if ids is not None and null_row is not None else None
+        if lm_client is not None:
+            if pending is None:
+                nb = next_batch(step)
+                pending = (nb, lm_client.request(nb[4]))
+            (x0, ids, t, eps, cond_ids), req = pending
+            lm_full = lm_client.collect(req)
+            pending = None
+            if step + 1 < args.steps:
+                nb = next_batch(step + 1)
+                pending = (nb, lm_client.request(nb[4]))
+        else:
+            x0, ids, t, eps, cond_ids = next_batch(step)
         stage_mod.lm_states = None
+        if lm_client is not None:
+            stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
         if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
             per = max(1, 32 // mb)
             groups = [list(range(i, min(M, i + per))) for i in range(0, M, per)]
@@ -822,7 +940,7 @@ def main():
             torch._foreach_lerp_(ema, [p.detach().float() for p in model_params], 1 - d)
 
         if step % args.log_every == 0 or step == args.steps:
-            dist.all_reduce(acc)
+            dist.all_reduce(acc, group=train_group)
             n = step - t_last
             if device.type == "cuda":
                 torch.cuda.synchronize(device)  # else the CPU runs ahead and short windows look too fast
@@ -846,7 +964,7 @@ def main():
                 mine_mem = torch.tensor([ms.get("allocated_bytes.all.peak", 0) / 2**30, ms.get("num_alloc_retries", 0)],
                                         device=device)
                 all_mem = [torch.zeros_like(mine_mem) for _ in range(world)]
-                dist.all_gather(all_mem, mine_mem)
+                dist.all_gather(all_mem, mine_mem, group=train_group)
                 all_mem = torch.stack(all_mem).cpu()
                 worst = int(all_mem[:, 0].argmax())
                 retries = int(all_mem[:, 1].sum())
@@ -869,14 +987,16 @@ def main():
                 log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
                 if wb:
                     wb.log({**res, "train/samples": step * args.batch}, step=step)
-            dist.barrier()
+            dist.barrier(group=train_group)
         if step % args.ckpt_every == 0 or step == args.steps:
             save()
         if args.merge_every and step >= args.merge_start * args.steps and (
                 step % args.merge_every == 0 or step == args.steps):
             save(merge_only=True)
-            dist.barrier()
+            dist.barrier(group=train_group)
 
+    if lm_client is not None:
+        lm_client.stop()
     log("done")
     if wb:
         wb.finish()

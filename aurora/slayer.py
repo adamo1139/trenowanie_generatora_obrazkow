@@ -152,10 +152,14 @@ def load_lm(repo: str):
 class LMTextEncoder(nn.Module):
     """Frozen LM hidden states (causal) -> trainable refiner (bidirectional TextBlocks) -> denoiser text tokens."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, with_lm=True):
+        """with_lm=False: refiner only; the frozen LM's states must then always be passed in (forward(lm_states=...)),
+        e.g. computed on another GPU (train_pp.py --lm-rank)."""
         super().__init__()
         self.config = cfg
-        if getattr(cfg, "backend", "slayer") == "hf":
+        if not with_lm:
+            lm, self.n_blocks = None, 0
+        elif getattr(cfg, "backend", "slayer") == "hf":
             lm = load_hf_lm(cfg)
             self.n_blocks = len(lm.model.layers)
         else:
@@ -176,12 +180,14 @@ class LMTextEncoder(nn.Module):
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse)
-        self.lm._apply(fn)
+        if self.lm is not None:
+            self.lm._apply(fn)
         return self
 
     def train(self, mode=True):
         super().train(mode)
-        self.lm.eval()
+        if self.lm is not None:
+            self.lm.eval()
         return self
 
     @torch.no_grad()
