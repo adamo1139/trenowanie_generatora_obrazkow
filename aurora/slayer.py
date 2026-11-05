@@ -283,3 +283,33 @@ def length_sorted(lat: torch.Tensor, ids: torch.Tensor, parts: int, generator=No
         out.append((lat[part], trim_ids(ids[part])))
     return out
 
+
+
+def split_hf_lm(lm, lo, hi):
+    """Keep only decoder layers [lo, hi) of a transformers LM (BailingMoeV2 layout: model.word_embeddings,
+    model.layers, model.norm); the embedding goes unless lo == 0. For pipeline stages that each hold a slice."""
+    m = lm.model
+    m.layers = nn.ModuleList(list(m.layers)[lo:hi])
+    if lo > 0:
+        m.word_embeddings = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return lm
+
+
+@torch.compiler.disable
+@torch.no_grad()
+def hf_lm_part(lm, x, first, last):
+    """Run this rank's slice of the LM: ids -> embedding (first slice) -> its layers -> final norm (last slice).
+    Same computation as BailingMoeV2Model.forward without a cache or mask (causal SDPA)."""
+    m = lm.model
+    with torch.autocast("cuda", enabled=False):
+        if first:
+            x = m.word_embeddings(x)
+        pos = torch.arange(x.shape[1], device=x.device)[None]
+        pe = m.rotary_emb(x, pos)
+        for layer in m.layers:
+            x = layer(x, position_ids=pos, position_embeddings=pe, use_cache=False)[0]
+        if last:
+            x = m.norm(x)
+    return x

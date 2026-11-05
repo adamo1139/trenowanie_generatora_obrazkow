@@ -68,6 +68,10 @@ def get_args():
                    help="frozen LM text encoder only on stage 0, run inside its pipeline forward (classic PP; pair with "
                         "--te-cost ~2 so stage 0 gets fewer blocks). Default: the LM runs on every stage for 1/pp of "
                         "the micro-batches before each step and its states are sent to stage 0")
+    p.add_argument("--lm-split", action="store_true",
+                   help="frozen transformers LM (Poziomka) split by layers over the pipeline's stages: each GPU holds "
+                        "1/pp of it, the hidden states go stage 0 -> 1 -> ... -> back to stage 0 (chunks of ~32 "
+                        "captions, overlapped); the held-out set's LM states are computed once at the start")
     p.add_argument("--te-checkpoint", action="store_true",
                    help="activation checkpointing of the text encoder's refiner blocks (stage 0): stage 0 holds the most "
                         "micro-batches in flight under 1F1B and the refiner runs on the full padded text width")
@@ -212,6 +216,48 @@ def gather_to_stage(mine, M, s, pp, dst, base):
     return out
 
 
+def lm_split_forward(lm, chunks, s, pp, base, device, hidden):
+    """--lm-split: caption rows (chunks of any length) through the LM slices of a pipeline's stages in order (stage s
+    holds one slice; global ranks base .. base + pp - 1), overlapped chunk by chunk; returns on stage 0 one
+    (rows, T, hidden) bf16 tensor per chunk (zeros for null-prompt rows), None elsewhere. Every stage of the pipeline
+    calls it with the same chunks."""
+    from aurora.slayer import LM_NULL, hf_lm_part
+    plans = []
+    for c in chunks:
+        real = c[:, 0].ne(LM_NULL)
+        plans.append((c, real, trim_ids(c[real], multiple=8) if real.any() else None))
+    # per pair of ranks NCCL runs the sends and receives in issue order, so both sides issue them in mirrored order:
+    # stage 0 "send chunk i, receive its result", stage s "receive chunk i, send it on". Compute still overlaps:
+    # stage 0 works on chunk i + 1 while the later stages work on chunk i.
+    results, recvs, sends = [None] * len(plans), [], []
+    for i, (c, real, sub) in enumerate(plans):
+        if sub is None:
+            continue
+        if s == 0:
+            x = sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0)
+        else:
+            x = torch.empty(*sub.shape, hidden, dtype=torch.bfloat16, device=device)
+            dist.recv(x, src=base + s - 1)
+        h = hf_lm_part(lm, x, first=s == 0, last=s == pp - 1).contiguous()
+        sends.append((dist.isend(h, dst=base + (s + 1) % pp), h))
+        if s == 0:
+            results[i] = torch.empty(*sub.shape, hidden, dtype=torch.bfloat16, device=device)
+            recvs.append(dist.irecv(results[i], src=base + pp - 1))
+    for req, _ in sends:
+        req.wait()
+    if s != 0:
+        return None
+    for req in recvs:
+        req.wait()
+    out = []
+    for (c, real, sub), h in zip(plans, results):
+        full = torch.zeros(c.shape[0], c.shape[1], hidden, dtype=torch.bfloat16, device=device)
+        if h is not None:
+            full[real, : h.shape[1]] = h
+        out.append(full)
+    return out
+
+
 def owned_den_names(den, s, pp, ranges):
     lo, hi = ranges[s]
     out = []
@@ -322,6 +368,14 @@ def main():
     if lm_offload and not first:
         from aurora.slayer import LMTextEncoder
         lm_enc = LMTextEncoder(replace(te_cfg, depth=0)).to(device)  # just the LM, no refiner
+    if args.lm_split:
+        assert lm_offload and getattr(te_cfg, "backend", "") == "hf", \
+            "--lm-split needs a transformers LM text encoder (--te-size poziomka), pp > 1 and no --lm-stage0"
+        from aurora.slayer import split_hf_lm
+        n_lm = len(lm_enc.lm.model.layers)
+        lm_lo, lm_hi = s * n_lm // pp, (s + 1) * n_lm // pp
+        split_hf_lm(lm_enc.lm, lm_lo, lm_hi)
+        lm_hidden = lm_enc.lm.config.hidden_size
 
     repa_block, repa_stage, repa_proj, repa_target = -1, -1, None, None
     if args.repa_weight > 0:
@@ -491,9 +545,21 @@ def main():
         len(np.load(os.path.join(args.data, f"{n}.off.npy"), mmap_mode="r")) - 1 for n in train_names)
     log(f"train: {len(train_names)} shards / {n_train:,} images; {args.steps} steps x {args.batch} = "
         f"{args.steps * args.batch / n_train:.1f} epochs")
-    val = None
+    def lm_split_forward_(chunks):
+        return lm_split_forward(lm_enc.lm, chunks, s, pp, replica * pp, device, lm_hidden)
+
+    val, val_lm = None, None
     if master and val_names:
         val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids())
+    if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
+        ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
+                                                ids_enc.null_ids()))[1]
+        ch = 64  # evaluate()'s chunk for transformers LMs
+        got = lm_split_forward_([trim_ids(ids_val[i:i + ch].to(device)) for i in range(0, len(ids_val), ch)])
+        if master:
+            val_lm = [h.cpu() for h in got]
+            log(f"--lm-split: LM layers {lm_lo}-{lm_hi - 1} of {n_lm} on this stage; held-out LM states for "
+                f"{len(ids_val)} captions precomputed")
 
     # FLOPs per sample (fwd + bwd), analytic: matmuls 6 N T, attention 12 L d T (T + T_text), frozen LM forward 2 N T
     T, Tt = den_cfg.latent_size ** 2, getattr(te_cfg, "max_tokens", 64)
@@ -578,7 +644,7 @@ def main():
         den_eval.rope_cos, den_eval.rope_sin = cos.to(device), sin.to(device)
         te_live = [p.detach().clone() for p in te.parameters()]
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])
-        res = evaluate(te, den_eval, val, device)
+        res = evaluate(te, den_eval, val, device, lm_states=val_lm)
         torch._foreach_copy_(list(te.parameters()), te_live)
         del den_eval
         if device.type == "cuda":
@@ -657,7 +723,13 @@ def main():
             drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
         cond_ids = torch.where(drop[:, None], null_row, ids) if ids is not None and null_row is not None else None
         stage_mod.lm_states = None
-        if lm_offload:
+        if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
+            per = max(1, 32 // mb)
+            groups = [list(range(i, min(M, i + per))) for i in range(0, M, per)]
+            got = lm_split_forward_([torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in g]) for g in groups])
+            if got is not None:
+                stage_mod.lm_states = [h[j * mb:(j + 1) * mb] for g, h in zip(groups, got) for j in range(len(g))]
+        elif lm_offload:
             mine = {}
             ks = [k for k in range(M) if k % pp == s]
             if hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
