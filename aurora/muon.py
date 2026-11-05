@@ -61,10 +61,20 @@ def _all_gather(out: torch.Tensor, local: torch.Tensor):
         out.copy_(torch.cat(parts))
 
 
+def stochastic_round_bf16(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> bf16 rounding up or down with probability proportional to the distance (unbiased): add uniform noise
+    to the 16 mantissa bits bf16 drops, then truncate. Works on the magnitude, so it is symmetric for negatives."""
+    bits = x.contiguous().view(torch.int32)
+    noise = torch.randint(0, 1 << 16, bits.shape, dtype=torch.int32, device=x.device)
+    return ((bits + noise) & -65536).view(torch.float32).to(torch.bfloat16)
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, compile_ns=False,
-                 shard=True, splits=None, period=1, gamma=0.15):
-        """splits: {param: [row block sizes]} for CMuon; period / gamma: periodic row-wise Muon (period 1 = off)."""
+                 shard=True, splits=None, period=1, gamma=0.15, momentum_dtype=None):
+        """splits: {param: [row block sizes]} for CMuon; period / gamma: periodic row-wise Muon (period 1 = off);
+        momentum_dtype: e.g. torch.bfloat16 halves the momentum buffers' memory (default: the parameter's dtype)."""
+        self.momentum_dtype = momentum_dtype
         super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
                                       weight_decay=weight_decay))
         # shard=False: every rank orthogonalises everything locally (DiLoCo, where ranks hold different weights)
@@ -102,8 +112,14 @@ class Muon(torch.optim.Optimizer):
             assert all(g is not None for g in grads), "Muon expects a gradient for every matrix"
             for p in ps:
                 if "momentum_buffer" not in self.state[p]:
-                    self.state[p]["momentum_buffer"] = torch.zeros_like(p)
-            torch._foreach_lerp_([self.state[p]["momentum_buffer"] for p in ps], grads, 1 - mom)
+                    self.state[p]["momentum_buffer"] = torch.zeros_like(p, dtype=self.momentum_dtype or p.dtype)
+            bufs = [self.state[p]["momentum_buffer"] for p in ps]
+            if all(b.dtype == g.dtype for b, g in zip(bufs, grads)):
+                torch._foreach_lerp_(bufs, grads, 1 - mom)
+            else:  # bf16 momentum: the EMA step in fp32, stored with stochastic rounding, one matrix at a time.
+                # (1 - mom) * (g - m) is often below a bf16 ulp of m; round-to-nearest would drop it every step.
+                for b, g in zip(bufs, grads):
+                    b.copy_(stochastic_round_bf16(b.float().lerp_(g.float(), 1 - mom)))
             torch._foreach_mul_(ps, 1 - lr * wd)
             for entries in buckets:
                 rows, cols = entries[0][2] - entries[0][1], entries[0][0].shape[1]
@@ -111,7 +127,8 @@ class Muon(torch.optim.Optimizer):
                 def direction(i):
                     p, r0, r1, _ = entries[i]
                     buf = self.state[p]["momentum_buffer"][r0:r1]
-                    return p.grad[r0:r1].lerp(buf, mom) if group["nesterov"] else buf
+                    g = p.grad[r0:r1]
+                    return g.lerp(buf.to(g.dtype), mom) if group["nesterov"] else buf
 
                 if refresh:
                     per = math.ceil(len(entries) / self.world)

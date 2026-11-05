@@ -141,6 +141,8 @@ def build_parser():
                         "GPU (~2 x 4 bytes/param less GPU memory); they are only touched at the outer syncs")
     p.add_argument("--outer-comm", choices=["bf16", "fp32"], default="bf16",
                    help="precision of the averaged weight change sent at each sync (bf16 halves the traffic)")
+    p.add_argument("--muon-momentum-dtype", choices=["fp32", "bf16"], default="fp32",
+                   help="Muon momentum buffers: bf16 halves their memory (the update is still taken in fp32)")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
@@ -294,9 +296,10 @@ def muon_splits(named):
 
 
 def make_muon(params, args, named, shard):
+    dtype = torch.bfloat16 if getattr(args, "muon_momentum_dtype", "fp32") == "bf16" else None
     return Muon(params, lr=args.lr_muon, momentum=args.momentum, ns_steps=args.ns_steps, weight_decay=args.wd,
                 compile_ns=not args.no_compile, shard=shard, splits=muon_splits(named) if args.cmuon else None,
-                period=args.muon_period, gamma=args.muon_gamma)
+                period=args.muon_period, gamma=args.muon_gamma, momentum_dtype=dtype)
 
 
 def param_groups(te, den, args, extra=(), named=None):
@@ -410,8 +413,10 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
 
 
 @torch.no_grad()
-def evaluate(te, den, val, device, seed=1234, chunk=256):
-    """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs."""
+def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None):
+    """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs.
+    lm_states: optional precomputed frozen-LM states, one tensor per `chunk` of captions (trimmed the same way), for
+    text encoders whose LM is not held whole on this rank (train_pp.py --lm-split)."""
     lat, ids = val
     if getattr(te.config, "kind", "") == "lm" and getattr(te.config, "backend", "") == "hf":
         chunk = min(chunk, 64)  # a big MoE LM's routing buffers at 256 captions x 256 tokens would not fit next to training
@@ -428,7 +433,10 @@ def evaluate(te, den, val, device, seed=1234, chunk=256):
         if getattr(te.config, "kind", "") == "lm":
             chunk_ids = trim_ids(chunk_ids)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            text, valid = te(chunk_ids)
+            if lm_states is not None:
+                text, valid = te(chunk_ids, lm_states=lm_states[i // chunk].to(device))
+            else:
+                text, valid = te(chunk_ids)
             tt = t.view(-1, 1, 1, 1)
             v = den((1 - tt) * x0 + tt * eps, t, text, valid)
         per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
