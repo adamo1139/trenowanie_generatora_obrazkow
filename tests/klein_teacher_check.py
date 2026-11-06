@@ -79,13 +79,14 @@ def main():
         pipe = Flux2KleinPipeline(scheduler=sched, vae=AutoencoderKLFlux2.from_pretrained(a.klein, subfolder="vae").to(device),
                                   text_encoder=teacher.te, tokenizer=teacher.tok, transformer=teacher.transformer)
         g = torch.Generator(device=device).manual_seed(123)
-        noise = torch.randn(2, 128, 16, 16, device=device, generator=g)
-        ref = pipe(prompt=PROMPTS[:2], height=256, width=256, latents=noise.to(torch.bfloat16), num_inference_steps=a.steps,
-                   guidance_scale=a.cfg, output_type="latent").images.float()  # denormalised, unpatchified
-        ours = teacher.sample(teacher.encode(PROMPTS[:2]), null, noise, a.steps, a.cfg)
-        ours = unpatchify_flux2(ours * enc.std + enc.mean)
-        print(f"check vs Flux2KleinPipeline: relative difference {((ours - ref).norm() / ref.norm()).item():.4f}",
-              flush=True)
+        noise = torch.randn(2, 128, 16, 16, device=device, generator=g).to(torch.bfloat16)  # same noise for both
+        for steps in (1, a.steps):  # 1 step: the velocity alone; many steps: plus the ODE amplifying bf16 rounding
+            ref = pipe(prompt=PROMPTS[:2], height=256, width=256, latents=noise, num_inference_steps=steps,
+                       guidance_scale=a.cfg, output_type="latent").images.float()  # denormalised, unpatchified
+            ours = teacher.sample(teacher.encode(PROMPTS[:2]), null, noise.float(), steps, a.cfg)
+            ours = unpatchify_flux2(ours * enc.std + enc.mean)
+            print(f"check vs Flux2KleinPipeline, {steps} steps: relative difference "
+                  f"{((ours - ref).norm() / ref.norm()).item():.4f}", flush=True)
         del pipe
 
     if rank == 0:
