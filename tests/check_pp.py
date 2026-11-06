@@ -18,7 +18,7 @@ from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 sys.path.insert(0, ".")
 from aurora.model import build_models, make_configs
 from aurora.repa import make_projector
-from train_pp import Stage, gather_to_stage, owned_den_names, stage_ranges
+from train_pp import Stage, gather_to_stage, owned_den_names, stage_ranges, local_train_step
 
 dist.init_process_group("gloo")
 rank, pp = dist.get_rank(), dist.get_world_size()
@@ -88,13 +88,13 @@ sched = Schedule1F1B(pstage, M,
                      loss_fn=lambda v, g: F.mse_loss(v, g))  # needed on every stage to enable backward
 losses = []
 if first and last:
-    sched.step(z, t, ids, target=target, losses=losses)
+    local_train_step(stage, z, t, ids, target, B // M, losses)
 elif first:
-    sched.step(z, t, ids)
+    sched.step(z, t, ids, return_outputs=False)
 elif last:
-    sched.step(target=target, losses=losses)
+    sched.step(target=target, losses=losses, return_outputs=False)
 else:
-    sched.step()
+    sched.step(return_outputs=False)
 if last:
     print(f"fm loss: pipeline {torch.stack(losses).mean().item():.6f}")
 mine = [("den", n) for n in owned_den_names(den, rank, pp, ranges)]

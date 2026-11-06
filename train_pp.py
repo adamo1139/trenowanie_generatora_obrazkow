@@ -19,6 +19,12 @@ of them see the same samples. Checkpoints are gathered to rank 0 in train.py's f
 merge.py and tests/check_export.py work unchanged; per-stage optimizer state goes to <out>/opt_stage<s>.pt.
 MLM is not supported here (use --te-size slayer149, the default).
 
+With --pp 1, forward/backward runs directly with gradient accumulation. HF captions are trimmed for the refiner
+and denoiser too, to multiples of --text-bucket (default 64, 0 disables trimming). Static compilation warms up
+separately for each encountered text width; allow those compilations to finish before comparing throughput.
+Logged img/s includes statistics overhead (and eval/checkpoint time in the next logging window), unlike older
+versions which excluded logging. Keep machine-required NCCL settings such as NCCL_P2P_LEVEL=SYS unchanged.
+
 Growing a trained model deeper (SANA 1.5-style): --init <train.py / train_pp.py checkpoint> --depth N keeps its blocks
 (EMA weights if the file has them), its stem and head, and its text encoder if it uses the same frozen LM; the
 N - old_depth new blocks are appended at the end with zero output projections (attention, cross-attention, MLP), so
@@ -79,7 +85,11 @@ def get_args():
                         "captions, overlapped); the held-out set's LM states are computed once at the start")
     p.add_argument("--te-checkpoint", action="store_true",
                    help="activation checkpointing of the text encoder's refiner blocks (stage 0): stage 0 holds the most "
-                        "micro-batches in flight under 1F1B and the refiner runs on the full padded text width")
+                        "micro-batches in flight under 1F1B; PP=1 trims text using --text-bucket")
+    p.add_argument("--text-bucket", type=int, choices=[0, 64, 128, 256], default=64,
+                   help="PP=1 HF text widths rounded to this bucket (default 64; 0 disables trimming). "
+                        "With static compilation each new width needs its own forward/backward warmup; "
+                        "benchmark only after all encountered widths have compiled.")
     p.add_argument("--mem-debug", action="store_true",
                    help="print every rank's GPU memory breakdown (weights, grads, optimizer, EMA, MuLoCo copy, frozen LM, "
                         "peak activations) after steps 1-3; the same report is always printed on an out-of-memory error")
@@ -264,70 +274,90 @@ def lm_split_forward(lm, chunks, s, pp, base, device, hidden):
 
 
 def lm_chunk_plan(ids, chunk=32):
-    """--lm-rank: how a request's caption rows are run through the LM, computed identically by client and server:
-    consecutive chunks of `chunk` rows, null-prompt rows skipped, trimmed to the chunk's real length (multiple of 8).
-    -> [(first row, real-row mask, trimmed ids)]."""
+    """CPU-only request metadata: (first row, real row indices, trimmed caption IDs).
+
+    Both peers derive the same plan from the CPU IDs sent over the control group; no CUDA scalar reads,
+    nonzero or boolean indexing are needed to allocate receives or run the LM.
+    """
     from aurora.slayer import LM_NULL
+    assert ids.device.type == "cpu", "plan LM requests before copying IDs to CUDA"
     out = []
     for i in range(0, len(ids), chunk):
         c = ids[i:i + chunk]
-        real = c[:, 0].ne(LM_NULL)
-        if real.any():
-            out.append((i, real, trim_ids(c[real], multiple=8)))
+        rows = c[:, 0].ne(LM_NULL).nonzero().flatten()
+        if rows.numel():
+            out.append((i, rows, trim_ids(c[rows], multiple=8)))
     return out
 
 
-def lm_server(te_cfg, clients, device, log):
-    """--lm-rank: this rank holds only the frozen LM and serves the `clients` (each pipeline's stage 0) round-robin
-    until every one of them has said stop. Protocol per request, on each client's own NCCL pair: header
-    [1, rows, width] (or [0] = stop) + the int64 caption rows -> one bf16 tensor per lm_chunk_plan() chunk."""
+def lm_server(te_cfg, clients, device, log, control_group, lm=None):
+    """CPU/Gloo any-source control queue; hidden states still travel directly over NCCL.
+
+    The optional lm argument is a small fake encoder in the distributed protocol test.
+    """
     from aurora.slayer import LM_NULL, LMTextEncoder, hf_lm_part
-    lm = LMTextEncoder(te_cfg).to(device).lm
+    lm = LMTextEncoder(te_cfg).to(device).lm if lm is None else lm
     log(f"LM server: {te_cfg.repo} for ranks {clients}", flush=True)
-    active, served, t0 = list(clients), 0, time.time()
-    # busy share: time from a request's arrival to its last send, over wall time. Near 100% = the LM GPU is the
-    # bottleneck (the trainers wait for it); well below = it keeps up
-    busy, win_t, win_n = 0.0, time.time(), 0
+    active, served, t0 = set(clients), 0, time.perf_counter()
+    idle = compute = transfer = 0.0
+    win_t, win_n = t0, 0
     while active:
-        for r in list(active):
-            hdr = torch.empty(3, dtype=torch.long, device=device)
-            dist.recv(hdr, src=r)
-            if hdr[0].item() == 0:
-                active.remove(r)
-                continue
-            ids = torch.empty(int(hdr[1]), int(hdr[2]), dtype=torch.long, device=device)
-            dist.recv(ids, src=r)
-            t_req = time.time()
-            sends = []
-            for _, _, sub in lm_chunk_plan(ids):
-                h = hf_lm_part(lm, sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0), True, True).contiguous()
-                sends.append((dist.isend(h, dst=r), h))
-            for req, _ in sends:
-                req.wait()
-            torch.cuda.synchronize(device) if device.type == "cuda" else None
-            busy += time.time() - t_req
-            served += len(ids)
-            win_n += len(ids)
-            if time.time() - win_t > 60:
-                dt = time.time() - win_t
-                log(f"LM server (rank {dist.get_rank()}): busy {100 * busy / dt:.0f}% over the last {dt:.0f} s, {win_n / dt:.0f} captions/s",
-                    flush=True)
-                busy, win_t, win_n = 0.0, time.time(), 0
-    log(f"LM server: {served:,} captions in {time.time() - t0:.0f} s, done", flush=True)
+        hdr = torch.empty(3, dtype=torch.long)
+        start = time.perf_counter()
+        r = dist.recv(hdr, group=control_group, tag=1)  # any ready client, not a fixed round-robin slot
+        assert r in active, f"unexpected LM client {r}"
+        if hdr[0].item() == 0:
+            active.remove(r)
+            idle += time.perf_counter() - start
+            continue
+        ids = torch.empty(int(hdr[1]), int(hdr[2]), dtype=torch.long)
+        dist.recv(ids, src=r, group=control_group, tag=2)
+        idle += time.perf_counter() - start
+        start = time.perf_counter()
+        sends, events = [], []
+        for _, _, sub in lm_chunk_plan(ids):
+            sub = sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0).to(device)
+            if device.type == "cuda":
+                begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                begin.record()
+            h = hf_lm_part(lm, sub, True, True).contiguous()
+            if device.type == "cuda":
+                end.record()
+                events.append((begin, end))
+            sends.append((dist.isend(h, dst=r), h))
+        for req, _ in sends:
+            req.wait()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - start
+        gpu_compute = sum(a.elapsed_time(b) for a, b in events) / 1000 if events else 0.0
+        compute += gpu_compute
+        transfer += max(0.0, elapsed - gpu_compute)  # residual: planning, transfer and CPU dispatch, can overlap
+        served += len(ids)
+        win_n += len(ids)
+        if time.perf_counter() - win_t > 60:
+            dt = time.perf_counter() - win_t
+            log(f"LM server (rank {dist.get_rank()}): LM forward (CUDA events) {100 * compute / dt:.0f}%, "
+                f"transfer/dispatch residual {100 * transfer / dt:.0f}%, waiting for requests {100 * idle / dt:.0f}%, "
+                f"{win_n / dt:.0f} captions/s", flush=True)
+            idle = compute = transfer = 0.0
+            win_t, win_n = time.perf_counter(), 0
+    log(f"LM server: {served:,} captions in {time.perf_counter() - t0:.0f} s, done", flush=True)
 
 
 class LMClient:
-    """--lm-rank, on a pipeline's stage 0: request(ids) sends caption rows to the LM server and posts the receives
-    (non-blocking, so the server works while this rank trains); collect() waits and returns the (rows, width, H)
-    states, zeros for null prompts."""
+    """One outstanding request per client. Control tensors stay on CPU; results use the training backend."""
 
-    def __init__(self, server, hidden, device):
+    def __init__(self, server, hidden, device, control_group):
         self.server, self.hidden, self.device = server, hidden, device
+        self.control_group = control_group
 
     def request(self, ids):
+        assert ids.device.type == "cpu"
         ids = ids.contiguous()
-        hdr = torch.tensor([1, ids.shape[0], ids.shape[1]], dtype=torch.long, device=self.device)
-        reqs = [dist.isend(hdr, dst=self.server), dist.isend(ids, dst=self.server)]
+        hdr = torch.tensor([1, ids.shape[0], ids.shape[1]], dtype=torch.long)
+        reqs = [dist.isend(hdr, dst=self.server, group=self.control_group, tag=1),
+                dist.isend(ids, dst=self.server, group=self.control_group, tag=2)]
         plans, bufs = lm_chunk_plan(ids), []
         for _, _, sub in plans:
             bufs.append(torch.empty(*sub.shape, self.hidden, dtype=torch.bfloat16, device=self.device))
@@ -339,13 +369,43 @@ class LMClient:
             r.wait()
         ids = h["ids"]
         full = torch.zeros(*ids.shape, self.hidden, dtype=torch.bfloat16, device=out_device or self.device)
-        for (i, real, sub), buf in zip(h["plans"], h["bufs"]):
-            block = full[i:i + real.shape[0]]
-            block[real, : sub.shape[1]] = buf.to(full.device)
+        for (i, rows, sub), buf in zip(h["plans"], h["bufs"]):
+            full[:, :sub.shape[1]].index_copy_(0, (rows + i).to(full.device), buf.to(full.device))
         return full
 
     def stop(self):
-        dist.send(torch.tensor([0, 0, 0], dtype=torch.long, device=self.device), dst=self.server)
+        dist.send(torch.tensor([0, 0, 0]), dst=self.server, group=self.control_group, tag=1)
+
+
+def text_widths(ids_cpu, microbatch, multiple=64):
+    """A small set of compile shapes for PP=1; remove only trailing LM_PAD, never valid text."""
+    assert ids_cpu.device.type == "cpu"
+    return [trim_ids(c, multiple=multiple).shape[1] for c in ids_cpu.split(microbatch)]
+
+
+def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None):
+    """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch."""
+    count = z.shape[0] // microbatch
+    states = stage.lm_states
+    try:
+        for k in range(count):
+            sl = slice(k * microbatch, (k + 1) * microbatch)
+            width = widths[k] if widths is not None else ids.shape[1]
+            stage._mb = k
+            if states is not None:
+                # Stage indexes this list by _mb; do not retain padded views after the step.
+                stage.lm_states = [None] * count
+                stage.lm_states[k] = states[k][:, :width]
+            pred = stage(z[sl], t[sl], ids[sl, :width])
+            loss = F.mse_loss(pred.float(), target[sl])
+            losses.append(loss.detach())
+            # AddAux's auxiliary gradient is 1; divide ALL accumulated gradients after backward,
+            # matching Schedule1F1B.perform_reduce_grad, including REPA.
+            loss.backward()
+        grads = [p.grad for p in stage.parameters() if p.grad is not None]
+        torch._foreach_div_(grads, count)
+    finally:
+        stage.lm_states = states
 
 
 def owned_den_names(den, s, pp, ranges):
@@ -393,6 +453,7 @@ def main():
     # every rank creates every group in the same order
     pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp))) for r in range(replicas)]
     stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
+    control_group = dist.new_group(backend="gloo") if args.lm_rank else None
     train_group = dist.new_group(list(range(world))) if args.lm_rank else None  # None = everyone
     pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
 
@@ -430,7 +491,7 @@ def main():
             "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
         if rank >= world:
             k = rank - world
-            lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print)
+            lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print, control_group)
             dist.destroy_process_group()
             return
     assert M >= pp, f"need at least {pp} micro-batches"
@@ -610,23 +671,25 @@ def main():
         if outer_state is not None:
             load_opt_state(outer_opt, outer_state)
 
-    pstage = PipelineStage(stage_mod, s, pp, device, group=pipe_group)
+    pstage = PipelineStage(stage_mod, s, pp, device, group=pipe_group) if pp > 1 else None
     # the REPA stage needs to know which micro-batch it is computing: take it from the schedule, not a counter
     # (pipelining also runs extra forwards, e.g. shape inference on the first step)
-    _fwd_chunk = pstage.forward_one_chunk
+    sched = None
+    if pstage is not None:
+        _fwd_chunk = pstage.forward_one_chunk
 
-    def forward_one_chunk(fwd_chunk_id, *a, **k):
-        stage_mod._mb = fwd_chunk_id
-        return _fwd_chunk(fwd_chunk_id, *a, **k)
-    pstage.forward_one_chunk = forward_one_chunk
-    loss_fn = lambda v, target: F.mse_loss(v.float(), target)
-    # every stage needs loss_fn: the schedule only enables backward (and gradient exchange) when it is set
-    sched = Schedule1F1B(pstage, M, loss_fn=loss_fn)
+        def forward_one_chunk(fwd_chunk_id, *a, **k):
+            stage_mod._mb = fwd_chunk_id
+            return _fwd_chunk(fwd_chunk_id, *a, **k)
+        pstage.forward_one_chunk = forward_one_chunk
+        loss_fn = lambda v, target: F.mse_loss(v.float(), target)
+        sched = Schedule1F1B(pstage, M, loss_fn=loss_fn)
 
     # ---- data: only the stages that need it ------------------------------------------------------------------------
     tok_suffix = getattr(te_cfg, "tok_suffix", "")
     ids_enc = te if first else lm_enc  # null prompt row (same on every stage that reads captions)
-    null_row = torch.from_numpy(ids_enc.null_ids()).to(device) if ids_enc is not None else None
+    null_cpu = torch.from_numpy(ids_enc.null_ids()) if ids_enc is not None else None
+    null_row = null_cpu.to(device) if null_cpu is not None else None
     needs_data = first or last or args.repa_weight > 0 or lm_offload  # REPA targets / LM states: every stage
     alt_suffix = f"{tok_suffix}_pl" if args.pl_prob > 0 else ""
     assert not alt_suffix or tok_suffix, "--pl-prob needs a frozen-LM text encoder (--te-size poziomka)"
@@ -661,11 +724,11 @@ def main():
             val_lm = [h.cpu() for h in got]
             log(f"--lm-split: LM layers {lm_lo}-{lm_hi - 1} of {n_lm} on this stage; held-out LM states for "
                 f"{len(ids_val)} captions precomputed")
-    lm_client = (LMClient(lm_servers[replica % args.lm_rank], te_cfg.lm_dim, device) if args.lm_rank and first
+    lm_client = (LMClient(lm_servers[replica % args.lm_rank], te_cfg.lm_dim, device, control_group) if args.lm_rank and first
                  else None)
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
-        h = lm_client.request(ids_val)
+        h = lm_client.request(val[1])
         full = lm_client.collect(h)
         ch = 64  # evaluate()'s chunk for transformers LMs
         val_lm = []
@@ -825,11 +888,12 @@ def main():
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
-            return None, None, None, None, None
+            return None, None, None, None, None, None
         lat, ids = next(loader)
         if hf_lm:  # micro-batches of similar caption length (same order on every stage that reads data)
             order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
             lat, ids = lat[order], ids[order]
+        ids_cpu = ids
         x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
@@ -837,25 +901,31 @@ def main():
         eps = torch.randn(x0.shape, device=device, generator=g)
         drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
         cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
-        return x0, ids, t, eps, cond
+        # Preserve the exact CUDA RNG sequence. Copy just the dropout mask once, rather than reading
+        # scalars / boolean-indexed shapes back from CUDA for every LM chunk on both peers.
+        cond_cpu = (torch.where(drop.cpu()[:, None], null_cpu, ids_cpu)
+                    if hf_lm and null_row is not None else None)
+        return x0, ids, t, eps, cond, cond_cpu
 
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     while step < args.steps:
         if lm_client is not None:
             if pending is None:
                 nb = next_batch(step)
-                pending = (nb, lm_client.request(nb[4]))
-            (x0, ids, t, eps, cond_ids), req = pending
+                pending = (nb, lm_client.request(nb[5]))
+            (x0, ids, t, eps, cond_ids, cond_cpu), req = pending
             lm_full = lm_client.collect(req)
+            del req
             pending = None
             if step + 1 < args.steps:
                 nb = next_batch(step + 1)
-                pending = (nb, lm_client.request(nb[4]))
+                pending = (nb, lm_client.request(nb[5]))
         else:
-            x0, ids, t, eps, cond_ids = next_batch(step)
+            x0, ids, t, eps, cond_ids, cond_cpu = next_batch(step)
         stage_mod.lm_states = None
         if lm_client is not None:
             stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
+            del lm_full
         if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
             per = max(1, 32 // mb)
             groups = [list(range(i, min(M, i + per))) for i in range(0, M, per)]
@@ -890,18 +960,23 @@ def main():
                 if first:
                     tt = t.view(-1, 1, 1, 1)
                     z_t = (1 - tt) * x0 + tt * eps
-                    if last:
-                        sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses)
+                    if pp == 1:
+                        widths = (text_widths(cond_cpu, mb, args.text_bucket)
+                                  if cond_cpu is not None and args.text_bucket else None)
+                        local_train_step(stage_mod, z_t, t, cond_ids, eps - x0, mb, losses, widths)
+                    elif last:
+                        sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses, return_outputs=False)
                     else:
-                        sched.step(z_t, t, cond_ids)
+                        sched.step(z_t, t, cond_ids, return_outputs=False)
                 elif last:
-                    sched.step(target=eps - x0, losses=losses)
+                    sched.step(target=eps - x0, losses=losses, return_outputs=False)
                 else:
-                    sched.step()
+                    sched.step(return_outputs=False)
         except torch.OutOfMemoryError:
             mem_report(f"OOM at step {step + 1}")  # no barrier: the other ranks may be stuck in communication
             dump_snapshot("OOM")
             raise
+        stage_mod.lm_states = None  # backward has finished; release current LM states before optimizer temporaries
         if losses:
             acc[0] += torch.stack([l.detach().float() for l in losses]).mean()
             acc[1] += 1
@@ -916,14 +991,14 @@ def main():
             flat = flat.float() / replicas
             for gr, d in zip(grads, flat.split([gr.numel() for gr in grads])):
                 gr.copy_(d.view_as(gr))
-        sq = torch.zeros((), device=device)
-        for p in params:
-            if p.grad is not None:
-                sq += p.grad.float().pow(2).sum()
-        dist.all_reduce(sq, group=pipe_group)
+        grads = [p.grad for p in params if p.grad is not None]
+        sq = torch.stack(torch._foreach_norm(grads)).float().square().sum()
+        if pp > 1:
+            dist.all_reduce(sq, group=pipe_group)
         gnorm = sq.sqrt()
         coef = (args.clip / (gnorm + 1e-6)).clamp(max=1.0)
-        torch._foreach_mul_([p.grad for p in params if p.grad is not None], coef)
+        torch._foreach_mul_(grads, coef)
+        del grads
         mult = lr_mult(step, args.steps, warmup, args.schedule)
         try:
             for o in opts:
@@ -959,19 +1034,17 @@ def main():
             n = step - t_last
             if device.type == "cuda":
                 torch.cuda.synchronize(device)  # else the CPU runs ahead and short windows look too fast
-            dt = time.time() - t0
             stats = {"train/samples": step * args.batch, "train/loss_fm": (acc[0] / acc[1].clamp(min=1)).item(),
                      "train/loss_repa": (acc[2] / acc[3].clamp(min=1)).item(), "train/grad_norm": gnorm.item(),
-                     "lr_mult": mult, "steps_per_s": n / dt, "imgs_per_s": n * args.batch / dt,
-                     "tflops_per_gpu": flops_sample * args.batch * n / dt / world / 1e12}
+                     "lr_mult": mult}
             mfu = ""
-            if peak:
-                stats["mfu"] = stats["tflops_per_gpu"] / peak
-                mfu = f" MFU {stats['mfu']:.0%}"
             repa_s = f"repa {stats['train/loss_repa']:.3f} | " if acc[3] > 0 else ""
-            wsq = weight_sq(named, device)  # this pipeline's stages together (MuLoCo: replica 0's weights)
-            dist.all_reduce(wsq, group=pipe_group)
-            stats.update(wrms_stats(wsq))
+            if replica == 0:
+                wsq = weight_sq(named, device)
+                if pp > 1:
+                    dist.all_reduce(wsq, group=pipe_group)
+                if master:
+                    stats.update(wrms_stats(wsq))
             # peak memory and allocator retries (cudaFree + retry = memory pressure, stalls the whole pipeline)
             mem_s = ""
             if device.type == "cuda":
@@ -985,6 +1058,15 @@ def main():
                 retries = int(all_mem[:, 1].sum())
                 stats.update({"mem_peak_gb": all_mem[worst, 0].item(), "alloc_retries": retries})
                 mem_s = f" | mem {all_mem[worst, 0]:.1f} GB (GPU {worst}){f', ALLOC RETRIES {retries}' if retries else ''}"
+            # Include statistics / communication in the window. The timestamp is taken before print;
+            # printing, W&B and any following eval/checkpoint are included in the next window.
+            stamp = time.time()
+            dt = stamp - t0
+            stats.update(steps_per_s=n / dt, imgs_per_s=n * args.batch / dt,
+                         tflops_per_gpu=flops_sample * args.batch * n / dt / world / 1e12)
+            if peak:
+                stats["mfu"] = stats["tflops_per_gpu"] / peak
+                mfu = f" MFU {stats['mfu']:.0%}"
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"{f'lr x{mult:.3f} | ' if mult != 1.0 else ''}{stats['imgs_per_s']:.0f} img/s | "
                 f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
@@ -992,7 +1074,7 @@ def main():
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
-            t0, t_last = time.time(), step
+            t0, t_last = stamp, step
 
         if args.bench:
             continue

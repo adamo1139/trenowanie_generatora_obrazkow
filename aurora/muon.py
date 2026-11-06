@@ -69,6 +69,17 @@ def stochastic_round_bf16(x: torch.Tensor) -> torch.Tensor:
     return ((bits + noise) & -65536).view(torch.float32).to(torch.bfloat16)
 
 
+def update_bf16_momentum(buf, grad, momentum):
+    """Compile the conversion, EMA and stochastic rounding together (no full int32 temporaries)."""
+    buf.copy_(stochastic_round_bf16(buf.float().lerp(grad.float(), 1 - momentum)))
+
+
+def pack_directions(grads, bufs, momentum, nesterov):
+    """Build the NS input eagerly: variable bucket lengths would create many compiled list specialisations."""
+    return torch.stack([g.lerp(b.to(g.dtype), momentum) if nesterov else b
+                        for g, b in zip(grads, bufs)])
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, compile_ns=False,
                  shard=True, splits=None, period=1, gamma=0.15, momentum_dtype=None):
@@ -101,6 +112,7 @@ class Muon(torch.optim.Optimizer):
                     r0 += n
             self._buckets.append(list(by_shape.values()))
         self._ns = torch.compile(zeropower_via_newtonschulz5) if compile_ns else zeropower_via_newtonschulz5
+        self._momentum = torch.compile(update_bf16_momentum) if compile_ns else update_bf16_momentum
 
     @torch.no_grad()
     def step(self):
@@ -120,7 +132,7 @@ class Muon(torch.optim.Optimizer):
             else:  # bf16 momentum: the EMA step in fp32, stored with stochastic rounding, one matrix at a time.
                 # (1 - mom) * (g - m) is often below a bf16 ulp of m; round-to-nearest would drop it every step.
                 for b, g in zip(bufs, grads):
-                    b.copy_(stochastic_round_bf16(b.float().lerp_(g.float(), 1 - mom)))
+                    self._momentum(b, g, mom)
             torch._foreach_mul_(ps, 1 - lr * wd)
             for entries in buckets:
                 rows, cols = entries[0][2] - entries[0][1], entries[0][0].shape[1]
@@ -136,7 +148,10 @@ class Muon(torch.optim.Optimizer):
                     step = max(1, self.chunk_elems // (rows * cols))
                     for c0 in range(0, len(entries), step):
                         idx = range(c0, min(len(entries), c0 + step))
-                        X = torch.stack([direction(i) for i in idx])
+                        slices = [(entries[i][0], entries[i][1], entries[i][2]) for i in idx]
+                        X = pack_directions([p.grad[r0:r1] for p, r0, r1 in slices],
+                                       [self.state[p]["momentum_buffer"][r0:r1] for p, r0, r1 in slices],
+                                       mom, group["nesterov"])
                         X = (self._ns(X, group["ns_steps"]) if refresh else rownorm(X) * self.gamma)
                         for j, i in enumerate(idx):
                             p, r0, r1, s = entries[i]

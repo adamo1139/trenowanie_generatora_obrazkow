@@ -240,7 +240,7 @@ def weight_sq(named, device):
     for prefix, name, p in named:
         if p.ndim != 2 or ".blocks." not in f".{name}" or name.endswith("mod_table") or not p.requires_grad:
             continue
-        sq = p.detach().float().square().sum()
+        sq = torch.linalg.vector_norm(p.detach(), dtype=torch.float32).square()
         if prefix == "te":
             rows = [WRMS_KEYS.index("te_refiner")]
         else:
