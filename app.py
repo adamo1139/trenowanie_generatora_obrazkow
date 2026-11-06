@@ -42,6 +42,8 @@ def main():
     p.add_argument("--model", default="cpral/IMG-50M", help="Hub repo or local export dir")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--cfg", type=float, default=3.0,
+                   help="default CFG slider value; 1 for guidance-distilled models (train_pp.py --opd)")
     args = p.parse_args()
 
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
@@ -68,7 +70,7 @@ def main():
         info = gr.Markdown()
         with gr.Accordion("Settings", open=False):
             steps = gr.Slider(4, 100, value=50, step=1, label="Steps (20 = fast, 50 = best)")
-            cfg = gr.Slider(1.0, 8.0, value=3.0, step=0.25, label="CFG scale")
+            cfg = gr.Slider(1.0, 8.0, value=args.cfg, step=0.25, label="CFG scale")
             count = gr.Slider(1, 8, value=4, step=1, label="Images")
             seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
         gr.Examples(EXAMPLES, inputs=prompt)
