@@ -712,6 +712,20 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
             outs.append(vae.decode(z.to(vae.dtype)).sample.float().clamp(-1, 1))
         return torch.cat(outs, dim=0)
 
+    def _denoise(self, z, ts, b, do_cfg, guidance_scale, context, context_valid):
+        """Euler over the time grid ts from z, with classifier-free guidance if do_cfg."""
+        for i in self.progress_bar(range(len(ts) - 1)):
+            t0, t1 = ts[i], ts[i + 1]
+            with self._autocast():
+                if do_cfg:
+                    v = self.transformer(torch.cat([z, z], dim=0), t0.expand(2 * b), context, context_valid)
+                    v_uncond, v_cond = v.chunk(2, dim=0)
+                    velocity = v_uncond + guidance_scale * (v_cond - v_uncond)
+                else:
+                    velocity = self.transformer(z, t0.expand(b), context, context_valid)
+            z = z + (t1 - t0) * velocity.float()
+        return z
+
     # ---- main entry point ----------------------------------------------------------------------
     @torch.no_grad()
     def __call__(
@@ -769,16 +783,17 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
 
         u = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
         ts = shift * u / (1 + (shift - 1) * u)
-        for i in self.progress_bar(range(num_inference_steps)):
-            t0, t1 = ts[i], ts[i + 1]
-            with self._autocast():
-                if do_cfg:
-                    v = self.transformer(torch.cat([z, z], dim=0), t0.expand(2 * b), context, context_valid)
-                    v_uncond, v_cond = v.chunk(2, dim=0)
-                    velocity = v_uncond + guidance_scale * (v_cond - v_uncond)
-                else:
-                    velocity = self.transformer(z, t0.expand(b), context, context_valid)
-            z = z + (t1 - t0) * velocity.float()
+        # RoPE for this grid, set on the transformer for the call (works with transformer classes loaded from an older
+        # copy of this file too, whose forward always uses its buffers)
+        tr = self.transformer
+        trained_rope = (tr.rope_cos, tr.rope_sin)
+        if side != tcfg.latent_size:
+            cos, sin = build_rope_2d(side, tcfg.dim // tcfg.heads)
+            tr.rope_cos, tr.rope_sin = cos.to(tr.rope_cos), sin.to(tr.rope_sin)
+        try:
+            z = self._denoise(z, ts, b, do_cfg, guidance_scale, context, context_valid)
+        finally:
+            tr.rope_cos, tr.rope_sin = trained_rope
 
         if output_type == "latent":
             images = z
