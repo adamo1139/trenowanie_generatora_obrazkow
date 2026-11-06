@@ -319,3 +319,85 @@ def hf_lm_part(lm, x, first, last):
         if last:
             x = m.norm(x)
     return x
+
+
+def _packed_attention(att, h, pe, cu, max_len):
+    """BailingMoeV2Attention.forward for (1, T, d) hidden states of several captions packed back to back: the same
+    projections, qk-norm and partial RoPE, then causal attention within each caption (varlen flash, GQA native)."""
+    import sys
+    rotate_half = sys.modules[type(att).__module__].rotate_half
+    T = h.shape[1]
+    qkv = att.query_key_value(h).view(T, att.num_heads + 2 * att.num_key_value_heads, att.head_dim)
+    q, k, v = qkv.split([att.num_heads, att.num_key_value_heads, att.num_key_value_heads], dim=1)
+    if att.config.use_qk_norm:
+        q, k = att.query_layernorm(q), att.key_layernorm(k)
+    cos, sin = pe[0][0, :, None], pe[1][0, :, None]  # (T, 1, rotary dims)
+    r = cos.shape[-1]
+    q = torch.cat([q[..., :r] * cos + rotate_half(q[..., :r]) * sin, q[..., r:]], dim=-1)
+    k = torch.cat([k[..., :r] * cos + rotate_half(k[..., :r]) * sin, k[..., r:]], dim=-1)
+    o = torch.ops.aten._flash_attention_forward(q, k.contiguous(), v.contiguous(), cu, cu, max_len, max_len, 0.0,
+                                                True, False, scale=att.head_dim ** -0.5)[0]
+    return att.dense(o.reshape(1, T, -1))
+
+
+def enable_packed(lm, compile=False):
+    """Let every attention module of an HF BailingMoeV2 run packed captions (hf_lm_packed); unpacked calls are
+    unchanged. compile: torch.compile (dynamic shapes) the elementwise-heavy parts around the MoE kernel: norms,
+    router, shared expert and the packed attention (~1.3x on the LM; the router's numerics shift slightly, so a few
+    tokens flip experts, as with padding changes)."""
+    global _packed_attention
+    if compile and not getattr(lm, "_packed_compiled", False):
+        c = lambda mod: torch.compile(mod, dynamic=True)
+        for layer in lm.model.layers:
+            layer.input_layernorm, layer.post_attention_layernorm = c(layer.input_layernorm), c(
+                layer.post_attention_layernorm)
+            att = layer.attention
+            if att.config.use_qk_norm:
+                att.query_layernorm, att.key_layernorm = c(att.query_layernorm), c(att.key_layernorm)
+            if hasattr(layer.mlp, "gate"):
+                layer.mlp.gate = c(layer.mlp.gate)
+            if getattr(layer.mlp, "shared_experts", None) is not None:
+                layer.mlp.shared_experts = c(layer.mlp.shared_experts)
+        lm.model.norm = c(lm.model.norm)
+        if not hasattr(_packed_attention, "_torchdynamo_orig_callable"):
+            _packed_attention = torch.compile(_packed_attention, dynamic=True)
+        lm._packed_compiled = True
+    for layer in lm.model.layers:
+        att = layer.attention
+        if getattr(att, "_packed_ready", False):
+            continue
+        orig = att.forward
+
+        def forward(*a, _att=att, _orig=orig, **k):
+            if getattr(_att, "_packed", None) is None:
+                return _orig(*a, **k)
+            h = k.pop("hidden_states") if "hidden_states" in k else a[0]
+            return _packed_attention(_att, h, k["position_embeddings"], *_att._packed), None, None
+        att.forward, att._packed_ready, att._packed = forward, True, None
+    return lm
+
+
+@torch.no_grad()
+def hf_lm_packed(lm, seqs, device):
+    """Whole LM (embedding -> layers -> final norm) on captions without padding: `seqs` is a list of 1-D CPU id
+    tensors, run as one packed sequence with attention kept inside each caption (positions restart per caption).
+    -> (sum of lengths, H) states, captions back to back. MoE / dense layers see only real tokens, in large
+    matmuls; for real tokens the result equals the padded, causal hf_lm_part. Needs enable_packed(lm)."""
+    m = lm.model
+    lens = [len(s) for s in seqs]
+    ids = torch.cat(seqs).to(device, non_blocking=True)[None]
+    pos = torch.cat([torch.arange(n) for n in lens]).to(device, non_blocking=True)[None]
+    cu = torch.tensor([0] + lens, dtype=torch.int32).cumsum(0, dtype=torch.int32).to(device)
+    with torch.autocast("cuda", enabled=False):
+        x = m.word_embeddings(ids)
+        pe = m.rotary_emb(x, pos)
+        for layer in m.layers:
+            layer.attention._packed = (cu, max(lens))
+        try:
+            for layer in m.layers:
+                x = layer(x, position_ids=pos, position_embeddings=pe, use_cache=False)[0]
+        finally:
+            for layer in m.layers:
+                layer.attention._packed = None
+        x = m.norm(x)
+    return x[0]
