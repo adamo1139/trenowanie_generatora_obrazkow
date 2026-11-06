@@ -906,6 +906,7 @@ def main():
                     if hf_lm and null_row is not None else None)
         return x0, ids, t, eps, cond, cond_cpu
 
+    opt_ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if device.type == "cuda" else None
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     while step < args.steps:
         if lm_client is not None:
@@ -999,12 +1000,16 @@ def main():
         torch._foreach_mul_(grads, coef)
         del grads
         mult = lr_mult(step, args.steps, warmup, args.schedule)
+        if device.type == "cuda":
+            opt_ev[0].record()
         try:
             for o in opts:
                 for gr in o.param_groups:
                     gr["lr"] = gr["base_lr"] * mult
                 o.step()
                 o.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                opt_ev[1].record()
         except torch.OutOfMemoryError:
             mem_report(f"OOM in the optimizer step {step + 1}")
             dump_snapshot("OOM")
@@ -1033,7 +1038,8 @@ def main():
             n = step - t_last
             if device.type == "cuda":
                 torch.cuda.synchronize(device)  # else the CPU runs ahead and short windows look too fast
-            stats = {"train/samples": step * args.batch, "train/loss_fm": (acc[0] / acc[1].clamp(min=1)).item(),
+            opt_ms = opt_ev[0].elapsed_time(opt_ev[1]) if device.type == "cuda" else 0.0  # GPU time, last step
+            stats = {"opt_ms": opt_ms, "train/samples": step * args.batch, "train/loss_fm": (acc[0] / acc[1].clamp(min=1)).item(),
                      "train/loss_repa": (acc[2] / acc[3].clamp(min=1)).item(), "train/grad_norm": gnorm.item(),
                      "lr_mult": mult}
             mfu = ""
@@ -1068,7 +1074,7 @@ def main():
                 mfu = f" MFU {stats['mfu']:.0%}"
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"{f'lr x{mult:.3f} | ' if mult != 1.0 else ''}{stats['imgs_per_s']:.0f} img/s | "
-                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
+                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | opt {opt_ms:.0f} ms | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
                 flush=True)
             if wb:
                 wb.log(stats, step=step)

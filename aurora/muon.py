@@ -80,6 +80,12 @@ def pack_directions(grads, bufs, momentum, nesterov):
                         for g, b in zip(grads, bufs)])
 
 
+try:  # Triton Newton-Schulz with half-cost symmetric products (aurora/ns_triton.py), on CUDA tensors
+    from aurora.ns_triton import newtonschulz5_sym as _ns_cuda
+except ImportError:
+    _ns_cuda = None
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-2, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0, compile_ns=False,
                  shard=True, splits=None, period=1, gamma=0.15, momentum_dtype=None):
@@ -111,7 +117,8 @@ class Muon(torch.optim.Optimizer):
                     by_shape.setdefault((n, cols), []).append((p, r0, r0 + n, scale))
                     r0 += n
             self._buckets.append(list(by_shape.values()))
-        self._ns = torch.compile(zeropower_via_newtonschulz5) if compile_ns else zeropower_via_newtonschulz5
+        ns_torch = torch.compile(zeropower_via_newtonschulz5) if compile_ns else zeropower_via_newtonschulz5
+        self._ns = lambda X, steps: _ns_cuda(X, steps) if X.is_cuda and _ns_cuda is not None else ns_torch(X, steps)
         self._momentum = torch.compile(update_bf16_momentum) if compile_ns else update_bf16_momentum
 
     @torch.no_grad()
