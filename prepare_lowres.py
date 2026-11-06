@@ -131,16 +131,18 @@ def main():
     if a.bench:
         bench(shards, vae, mean, std, a, device, rank)
         return
+    def outs_of(path):
+        name = os.path.basename(path)[: -len(".lat.npy")]
+        return {s: (os.path.join(a.out_dir, f"{s}px", f"{name}.lat{s}.npy") if a.out_dir
+                    else f"{path[: -len('.lat.npy')]}.lat{s}.npy") for s in a.sizes}
+
+    todo = [p_ for p_ in shards if not all(os.path.exists(o) for o in outs_of(p_).values())]
+    print(f"rank {rank}: {len(todo)} of {len(shards)} shards to convert", flush=True)
     t0, done = time.time(), 0
-    for path in shards:
-        stem = path[: -len(".lat.npy")]
-        name = os.path.basename(stem)
-        outs = {s: (os.path.join(a.out_dir, f"{s}px", f"{name}.lat{s}.npy") if a.out_dir else f"{stem}.lat{s}.npy")
-                for s in a.sizes}
+    for k, path in enumerate(todo):
+        outs = outs_of(path)
         for o in outs.values():
             os.makedirs(os.path.dirname(o) or ".", exist_ok=True)
-        if all(os.path.exists(o) for o in outs.values()):
-            continue
         lat = np.load(path, mmap_mode="r")
         res = {s: np.empty((len(lat), 128, s // 16, s // 16), dtype=np.float16) for s in a.sizes}
         for i in range(0, len(lat), a.batch):
@@ -150,8 +152,10 @@ def main():
             np.save(o + ".tmp.npy", res[s])
             os.replace(o + ".tmp.npy", o)
         done += len(lat)
-        print(f"rank {rank}: {os.path.basename(stem)} ({len(lat)} images), {done / (time.time() - t0):.0f} img/s",
-              flush=True)
+        el = time.time() - t0
+        eta = el / (k + 1) * (len(todo) - k - 1)
+        print(f"rank {rank}: [{k + 1}/{len(todo)}] {os.path.basename(path)[: -len('.lat.npy')]} ({len(lat)} images), "
+              f"{done / el:.0f} img/s, eta {eta / 3600:.1f} h", flush=True)
 
 
 if __name__ == "__main__":
