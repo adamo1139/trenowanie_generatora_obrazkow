@@ -52,14 +52,15 @@ def main():
         pipe.vae.to(torch.bfloat16)
     pipe.set_progress_bar_config(disable=True)
 
-    def generate(prompt, steps, cfg, seed, count):
+    def generate(prompt, steps, cfg, seed, count, res):
         if not prompt.strip():
             raise gr.Error("Type a prompt first")
         seed = random.randrange(2**31) if seed < 0 else int(seed)
         images = []
         for i in range(int(count)):  # one call per image so "seed + i" reproduces each one on its own
             g = torch.Generator(device=device).manual_seed(seed + i)
-            images.append(pipe(prompt, num_inference_steps=int(steps), guidance_scale=float(cfg), generator=g).images[0])
+            images.append(pipe(prompt, num_inference_steps=int(steps), guidance_scale=float(cfg), generator=g,
+                               resolution=int(res)).images[0])
         return images, f"seed {seed}" + (f" … {seed + int(count) - 1}" if count > 1 else "")
 
     with gr.Blocks(title="IMG-50M") as demo:
@@ -72,9 +73,10 @@ def main():
             steps = gr.Slider(4, 100, value=50, step=1, label="Steps (20 = fast, 50 = best)")
             cfg = gr.Slider(1.0, 8.0, value=args.cfg, step=0.25, label="CFG scale")
             count = gr.Slider(1, 8, value=4, step=1, label="Images")
+            res = gr.Slider(64, 1024, value=256, step=64, label="Resolution (square; trained at 256)")
             seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
         gr.Examples(EXAMPLES, inputs=prompt)
-        inputs = [prompt, steps, cfg, seed, count]
+        inputs = [prompt, steps, cfg, seed, count, res]
         go.click(generate, inputs, [gallery, info], api_name="generate")
         prompt.submit(generate, inputs, [gallery, info])
 

@@ -591,14 +591,26 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+    def _rope(self, side: int, device):
+        """2D RoPE for a side x side latent grid (any size; the trained one is a registered buffer)."""
+        if side == self.config.latent_size:
+            return self.rope_cos, self.rope_sin
+        cache = self.__dict__.setdefault("_rope_cache", {})
+        if side not in cache:
+            cos, sin = build_rope_2d(side, self.config.dim // self.config.heads)
+            cache[side] = (cos.to(device), sin.to(device))
+        return cache[side]
+
     def forward(self, z_t: torch.Tensor, t: torch.Tensor, text: torch.Tensor, text_valid: torch.Tensor):
         b, c, h, w = z_t.shape
+        assert h == w, "square latents only"
         dim = self.config.dim
         x = self.patch_in(z_t.flatten(2).transpose(1, 2))
         t_emb = self.time_mlp(timestep_embedding(t, 256))
         t6 = self.ada(F.silu(t_emb)).view(b, 6, dim)
+        cos, sin = self._rope(h, z_t.device)
         for block in self.blocks:
-            x = block(x, t6, text, text_valid, self.rope_cos, self.rope_sin)
+            x = block(x, t6, text, text_valid, cos, sin)
         return self.patch_out(self.norm(x)).transpose(1, 2).reshape(b, c, h, w)
 
 
@@ -713,6 +725,8 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         latents: Optional[torch.Tensor] = None,
         output_type: str = "pil",
         return_dict: bool = True,
+        resolution: Optional[int] = None,
+        time_shift: Optional[float] = None,
     ):
         """
         Args:
@@ -723,6 +737,10 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
             num_inference_steps: Euler steps. 50 = recommended (used for the benchmarks), 20 = fast.
             guidance_scale: classifier-free guidance scale. 3.0 recommended.
             output_type: "pil", "np", "pt" (tensor in [0,1]) or "latent" (raw model latents).
+            resolution: square output size in pixels, a multiple of 16 (default: the trained one, 256). Other sizes
+                were not trained (any of them may come out poorly).
+            time_shift: t -> s t / (1 + (s - 1) t) on the time grid (more steps at high noise); default: the side
+                relative to the trained one (SD3's sqrt(tokens) rule), 1 at the trained resolution.
         """
         base = [prompt] if isinstance(prompt, str) else list(prompt)
         prompts = [p for p in base for _ in range(num_images_per_prompt)]
@@ -739,13 +757,18 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         context, context_valid = self.encode_prompt(prompts, negs, do_cfg, device)
 
         tcfg = self.transformer.config
-        shape = (b, tcfg.latent_channels, tcfg.latent_size, tcfg.latent_size)
+        side = tcfg.latent_size if resolution is None else int(resolution) // 16
+        if side < 1 or (resolution is not None and int(resolution) % 16):
+            raise ValueError("resolution must be a positive multiple of 16")
+        shift = side / tcfg.latent_size if time_shift is None else float(time_shift)
+        shape = (b, tcfg.latent_channels, side, side)
         if latents is None:
             z = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
         else:
             z = latents.to(device=device, dtype=torch.float32)
 
-        ts = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        u = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        ts = shift * u / (1 + (shift - 1) * u)
         for i in self.progress_bar(range(num_inference_steps)):
             t0, t1 = ts[i], ts[i + 1]
             with self._autocast():
