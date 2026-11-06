@@ -20,7 +20,9 @@ def export_profile(prof, prefix, metadata=None):
                          device_total_us=e.device_time_total, device_self_us=e.self_device_time_total))
     kernels = defaultdict(lambda: [0, 0.0])
     for e in prof.events():
-        if e.device_type == torch.autograd.DeviceType.CUDA:
+        # CUDA user annotations span whole graphs/phases and overlap their kernels.
+        # Including them here double-counts work (and can even dominate the table).
+        if e.device_type == torch.autograd.DeviceType.CUDA and not e.is_user_annotation:
             kernels[e.name][0] += 1
             kernels[e.name][1] += e.time_range.elapsed_us()
     kernel_rows = [dict(name=k, count=v[0], total_us=v[1]) for k, v in kernels.items()]

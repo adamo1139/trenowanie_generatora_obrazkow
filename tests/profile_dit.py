@@ -216,6 +216,13 @@ def build_case(part, cfg, te, ck, mb, width, backend, cp, device, dtype):
                 return F.scaled_dot_product_attention(q,k,v,attn_mask=bias)
         if backend == 'varlen':
             fn = lambda q,k,v: pack_attention(q,k,v,idx,cu,tq,tk)
+        elif backend in BACKENDS:
+            selected_backend = BACKENDS[backend]
+            def fn(q, k, v):
+                # Make backend selection explicit in the traced graph, rather than
+                # relying on external global flags across compilation/cache reuse.
+                with sdpa_kernel(selected_backend):
+                    return F.scaled_dot_product_attention(q,k,v,attn_mask=bias)
         else:
             fn = lambda q,k,v: F.scaled_dot_product_attention(q,k,v,attn_mask=bias)
         flops = 12*mb*heads*dim*tq*tk
@@ -294,11 +301,11 @@ def main():
             torch._dynamo.reset()  # isolate compile variants and avoid recompile_limit across the sweep
             torch.manual_seed(123)
             fn,inputs,params,flops,reference=build_case(part,cfg,te,ck,mb,width,backend,cp,device,dtype)
+            if mode != 'eager':
+                fn=torch.compile(fn,dynamic=False,mode=mode)
             if reference is not None:
                 with backend_context(backend):
                     row.update(validate(fn,reference,inputs,amp))
-            if mode != 'eager':
-                fn=torch.compile(fn,dynamic=False,mode=mode)
             with backend_context(backend):
                 timing,trace_step=measure(fn,inputs,params,amp,device,args.warmup,args.iterations)
                 row.update(timing,status='ok',useful_flops=flops,
