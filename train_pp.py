@@ -512,7 +512,10 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
     picks = torch.stack([torch.randperm(K, generator=g)[:m] for _ in range(B)])  # distinct steps per trajectory
-    u = torch.linspace(1.0, 0.0, K + 1, device=eps.device)
+    # the grid's inner points shifted by a random fraction of a step every training step: the trained t cover [0, 1]
+    # instead of K fixed values (the trajectories still start at pure noise and end at t = 0)
+    d = torch.rand((), generator=g).item()
+    u = torch.cat([torch.ones(1), 1 - (torch.arange(1, K) - d) / K, torch.zeros(1)]).clamp(0, 1).to(eps.device)
     ts = args.t_shift * u / (1 + (args.t_shift - 1) * u)
     widths = text_widths(ids_cpu, mb, args.text_bucket) if ids_cpu is not None and args.text_bucket else None
     x = opd_rollout(stage, eps, ids, mb, ts, picks, widths).flatten(0, 1)  # (B m, C, h, w), sample-major
