@@ -42,7 +42,7 @@ def main():
     p.add_argument("--data", required=True)
     p.add_argument("--vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 with encoder and full decoder")
     p.add_argument("--sizes", type=int, nargs="+", default=[128, 64, 32])
-    p.add_argument("--batch", type=int, default=128)
+    p.add_argument("--batch", type=int, default=32)
     a = p.parse_args()
     assert all(s % 16 == 0 and s < 256 for s in a.sizes), "sizes must be multiples of 16, below 256"
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
