@@ -88,7 +88,7 @@ def bench(paths, vae, mean, std, a, device, rank):
     imgs = a.batch * a.bench
     parts = ", ".join(f"{k} {v / a.bench:.0f} ms" for k, v in ph.ms.items())
     print(f"rank {rank}: {imgs / dt:.1f} img/s (batch {a.batch}, sizes {a.sizes}, decoder {a.decoder or a.vae}, "
-          f"compile {a.compile}, channels_last "
+          f"compile {a.compile or 'off'}, cudnn.benchmark {a.cudnn_benchmark}, channels_last "
           f"{a.channels_last}, peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GB) | per batch: {parts}",
           flush=True)
 
@@ -105,7 +105,9 @@ def main():
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--bench", type=int, default=0,
                    help="time this many batches of the first shard per rank (img/s and per-phase ms), write nothing")
-    p.add_argument("--compile", action="store_true", help="torch.compile the decoder and the encoder")
+    p.add_argument("--compile", nargs="?", const="default", default="",
+                   help="torch.compile the decoder and the encoder (optionally a mode, e.g. max-autotune)")
+    p.add_argument("--cudnn-benchmark", action="store_true", help="let cuDNN pick its fastest conv algorithms")
     p.add_argument("--channels-last", action="store_true", help="NHWC activations (often faster convs on Ampere)")
     a = p.parse_args()
     assert all(s % 16 == 0 and s < 256 for s in a.sizes), "sizes must be multiples of 16, below 256"
@@ -121,8 +123,10 @@ def main():
         vae.decoder = AutoencoderKLFlux2.from_pretrained(a.decoder, torch_dtype=torch.bfloat16).decoder.to(device).eval()
     if a.channels_last:
         vae.to(memory_format=torch.channels_last)
+    torch.backends.cudnn.benchmark = a.cudnn_benchmark
     if a.compile:
-        vae.decoder, vae.encoder = torch.compile(vae.decoder), torch.compile(vae.encoder)
+        vae.decoder, vae.encoder = (torch.compile(m, mode=None if a.compile == "default" else a.compile)
+                                    for m in (vae.decoder, vae.encoder))
     shards = sorted(glob.glob(os.path.join(a.data, "*.lat.npy")))[rank::world]
     if a.bench:
         bench(shards, vae, mean, std, a, device, rank)
