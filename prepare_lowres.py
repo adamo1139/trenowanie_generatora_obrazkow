@@ -5,6 +5,7 @@ Writes <shard>.lat<size>.npy, (N, 128, size/16, size/16) float16, next to each s
 so an interrupted run resumes. Shards are split over the ranks; no collectives.
 
   torchrun --nproc_per_node 8 prepare_lowres.py --data data/aurora_full --vae FLUX.2-dev-vae --sizes 128 64 32
+  python prepare_lowres.py --data data/aurora_full --vae FLUX.2-dev-vae --sizes 128 64 --bench 20 --batch 64
 """
 import argparse
 import glob
@@ -24,25 +25,88 @@ def patchify_flux2(z):
     return z.view(b, c, h2 // 2, 2, w2 // 2, 2).permute(0, 1, 3, 5, 2, 4).reshape(b, c * 4, h2 // 2, w2 // 2)
 
 
+class Phases:
+    """CUDA-event timing of named phases (--bench); a no-op when disabled."""
+
+    def __init__(self, on: bool):
+        self.on, self.ev, self.ms = on, [], {}
+
+    def __call__(self, name):
+        if self.on:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            self.ev.append((name, e))
+
+    def flush(self):
+        if self.on and self.ev:
+            torch.cuda.synchronize()
+            for (_, a), (name, b) in zip(self.ev[:-1], self.ev[1:]):
+                self.ms[name] = self.ms.get(name, 0.0) + a.elapsed_time(b)
+        self.ev = []
+
+
 @torch.no_grad()
-def convert(lat, vae, mean, std, sizes, device):
+def convert(lat, vae, mean, std, sizes, device, phases=None, channels_last=False):
     """(B, 128, 16, 16) normalised latents -> {size: (B, 128, size/16, size/16) normalised latents}, float16."""
+    ph = phases or Phases(False)
+    ph("start")
     x = torch.from_numpy(np.ascontiguousarray(lat)).to(device).float()
-    img = vae.decode(unpatchify_flux2(x * std + mean).to(torch.bfloat16)).sample.float().clamp(-1, 1)
+    z = unpatchify_flux2(x * std + mean).to(torch.bfloat16)
+    if channels_last:
+        z = z.contiguous(memory_format=torch.channels_last)
+    ph("upload")
+    img = vae.decode(z).sample.float().clamp(-1, 1)
+    ph("decode 256")
     out = {}
     for s in sizes:
         small = F.interpolate(img, size=(s, s), mode="bicubic", antialias=True, align_corners=False).clamp(-1, 1)
-        z = patchify_flux2(vae.encode(small.to(torch.bfloat16)).latent_dist.mode().float())
+        small = small.to(torch.bfloat16)
+        if channels_last:
+            small = small.contiguous(memory_format=torch.channels_last)
+        ph(f"resize {s}")
+        z = patchify_flux2(vae.encode(small).latent_dist.mode().float())
+        ph(f"encode {s}")
         out[s] = ((z - mean) / std).half().cpu().numpy()
+        ph(f"download {s}")
+    ph.flush()
     return out
+
+
+def bench(paths, vae, mean, std, a, device, rank):
+    """--bench: --bench batches of the first shard (after 2 warm-up batches), nothing written."""
+    lat = np.load(paths[0], mmap_mode="r")
+    n = a.batch * (a.bench + 2)
+    lat = np.concatenate([lat] * (-(-n // len(lat))))[:n]
+    for i in range(2):
+        convert(lat[i * a.batch:(i + 1) * a.batch], vae, mean, std, a.sizes, device, None, a.channels_last)
+    ph = Phases(True)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for i in range(2, a.bench + 2):
+        convert(lat[i * a.batch:(i + 1) * a.batch], vae, mean, std, a.sizes, device, ph, a.channels_last)
+    dt = time.perf_counter() - t0
+    imgs = a.batch * a.bench
+    parts = ", ".join(f"{k} {v / a.bench:.0f} ms" for k, v in ph.ms.items())
+    print(f"rank {rank}: {imgs / dt:.1f} img/s (batch {a.batch}, sizes {a.sizes}, decoder {a.decoder or a.vae}, "
+          f"compile {a.compile}, channels_last "
+          f"{a.channels_last}, peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GB) | per batch: {parts}",
+          flush=True)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True)
     p.add_argument("--vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 with encoder and full decoder")
+    p.add_argument("--decoder", default="", help="another AutoencoderKLFlux2 whose decoder makes the 256 px images, e.g. "
+                   "the small decoder (~1.8x cheaper; its differences mostly vanish after a 2-4x downscale); default --vae")
+    p.add_argument("--out-dir", default="", help="write <out-dir>/<size>px/<shard>.lat<size>.npy (one folder per size, "
+                   "e.g. for a Hub upload; train_pp.py --lat-dir <out-dir>/<size>px); default: next to the shards")
     p.add_argument("--sizes", type=int, nargs="+", default=[128, 64, 32])
     p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--bench", type=int, default=0,
+                   help="time this many batches of the first shard per rank (img/s and per-phase ms), write nothing")
+    p.add_argument("--compile", action="store_true", help="torch.compile the decoder and the encoder")
+    p.add_argument("--channels-last", action="store_true", help="NHWC activations (often faster convs on Ampere)")
     a = p.parse_args()
     assert all(s % 16 == 0 and s < 256 for s in a.sizes), "sizes must be multiples of 16, below 256"
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -53,17 +117,30 @@ def main():
     eps = float(getattr(vae.config, "batch_norm_eps", 1e-4))
     mean = vae.bn.running_mean.float().view(1, -1, 1, 1).to(device)
     std = torch.sqrt(vae.bn.running_var.float() + eps).view(1, -1, 1, 1).to(device)
+    if a.decoder:  # same encoder and latent statistics (FLUX.2), only the decoding differs
+        vae.decoder = AutoencoderKLFlux2.from_pretrained(a.decoder, torch_dtype=torch.bfloat16).decoder.to(device).eval()
+    if a.channels_last:
+        vae.to(memory_format=torch.channels_last)
+    if a.compile:
+        vae.decoder, vae.encoder = torch.compile(vae.decoder), torch.compile(vae.encoder)
     shards = sorted(glob.glob(os.path.join(a.data, "*.lat.npy")))[rank::world]
+    if a.bench:
+        bench(shards, vae, mean, std, a, device, rank)
+        return
     t0, done = time.time(), 0
     for path in shards:
         stem = path[: -len(".lat.npy")]
-        outs = {s: f"{stem}.lat{s}.npy" for s in a.sizes}
+        name = os.path.basename(stem)
+        outs = {s: (os.path.join(a.out_dir, f"{s}px", f"{name}.lat{s}.npy") if a.out_dir else f"{stem}.lat{s}.npy")
+                for s in a.sizes}
+        for o in outs.values():
+            os.makedirs(os.path.dirname(o) or ".", exist_ok=True)
         if all(os.path.exists(o) for o in outs.values()):
             continue
         lat = np.load(path, mmap_mode="r")
         res = {s: np.empty((len(lat), 128, s // 16, s // 16), dtype=np.float16) for s in a.sizes}
         for i in range(0, len(lat), a.batch):
-            for s, z in convert(lat[i:i + a.batch], vae, mean, std, a.sizes, device).items():
+            for s, z in convert(lat[i:i + a.batch], vae, mean, std, a.sizes, device, None, a.channels_last).items():
                 res[s][i:i + len(z)] = z
         for s, o in outs.items():
             np.save(o + ".tmp.npy", res[s])

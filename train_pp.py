@@ -87,6 +87,8 @@ def get_args():
                    help="training resolution in pixels: latents of (res/16)^2 tokens, from <shard>.lat<res>.npy "
                         "(prepare_lowres.py) unless 256; the weights are resolution-free (per-token stem / head, RoPE "
                         "built for the grid), checkpoints record the grid")
+    p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
+                   "prepare_lowres.py --out-dir X -> X/128px)")
     p.add_argument("--t-shift", type=float, default=None,
                    help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn): more steps at high noise "
                         "for more tokens. Default sqrt(tokens / 256) (SD3's resolution rule): 1 at 256 px, 0.5 at 128, "
@@ -912,7 +914,7 @@ def main():
     loader = store = None
     if needs_data:
         store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None,
-                           alt_suffix, args.pl_prob, lat_kind)
+                           alt_suffix, args.pl_prob, lat_kind, args.lat_dir)
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
@@ -930,10 +932,10 @@ def main():
 
     val, val_lm = None, None
     if master and val_names:
-        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(), lat_kind)
+        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(), lat_kind, args.lat_dir)
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
         ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
-                                                ids_enc.null_ids(), lat_kind))[1]
+                                                ids_enc.null_ids(), lat_kind, args.lat_dir))[1]
         ch = 64  # evaluate()'s chunk for transformers LMs
         got = lm_split_forward_([trim_ids(ids_val[i:i + ch].to(device)) for i in range(0, len(ids_val), ch)])
         if master:

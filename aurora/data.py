@@ -103,11 +103,12 @@ def ensure_open_files(needed: int):
 
 class ShardStore:
     def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0,
-                 lat_kind: str = "lat"):
+                 lat_kind: str = "lat", lat_root: str = ""):
         """alt_suffix / alt_prob: with probability alt_prob a sample's caption comes from <name>.tok_<alt_suffix>.npy
         (the same caption translated, e.g. poziomka_pl) instead. lat_kind: which latents, e.g. "lat128" for the
         <name>.lat128.npy files of prepare_lowres.py (any grid; the shape is read from the files)."""
         self.root, self.names, self.lat_kind = root, list(names), lat_kind
+        self.lat_root = lat_root or root  # latents may live in another folder (prepare_lowres.py --out-dir)
         self.tok = tok_kind(tok_suffix)
         self.alt = tok_kind(alt_suffix) if alt_suffix and alt_prob > 0 else None
         self.alt_prob = alt_prob
@@ -126,7 +127,8 @@ class ShardStore:
 
     def _open(self):  # lazily, so every DataLoader worker gets its own handles
         if self._lat is None:
-            self._lat = [np.load(self._p(n, self.lat_kind), mmap_mode="r") for n in self.names]
+            self._lat = [np.load(os.path.join(self.lat_root, f"{n}.{self.lat_kind}.npy"), mmap_mode="r")
+                         for n in self.names]
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
@@ -215,9 +217,9 @@ class TrainStream(IterableDataset):
             m += nw
 
 
-def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat"):
+def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat", lat_root: str = ""):
     """First n images of the held-out shards (round-robin across shards), first caption each."""
-    store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind)
+    store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind, lat_root=lat_root)
     per = -(-n // len(names))
     idx = np.concatenate([store.starts[s] + np.arange(min(per, store.sizes[s])) for s in range(len(names))])[:n]
     lat, ids = store.fetch(idx, None)
