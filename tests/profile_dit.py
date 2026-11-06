@@ -312,7 +312,9 @@ def main():
             if reference is not None:
                 with backend_context(backend):
                     row.update(validate(fn,reference,inputs,amp))
-            with backend_context(backend):
+            # A block selects only its cross-attention backend internally. A global
+            # context here would also switch self-attention, unlike train_pp.py.
+            with backend_context(backend) if part != 'block' else nullcontext():
                 timing,trace_step=measure(fn,inputs,params,amp,device,args.warmup,args.iterations)
                 row.update(timing,status='ok',useful_flops=flops,
                            useful_tflops=flops/timing['total_ms']/1e9)
