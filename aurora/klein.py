@@ -162,30 +162,44 @@ def teacher_server(repo, clients, device, log, control_group, cfg: float = 4.0, 
 
 
 class TeacherClient:
-    """A training rank's side: request() sends the states and captions without waiting, collect() returns the
-    teacher's guided velocity (n, 128, h, w) fp32."""
+    """A training rank's side: request() splits the trajectories over all teacher ranks (each gets whole
+    trajectories, so a caption is encoded once) and sends them without waiting; collect() returns the teachers'
+    guided velocity (n, 128, h, w) fp32 in the request's order."""
 
-    def __init__(self, server, device, control_group):
-        self.server, self.device, self.group = server, device, control_group
+    def __init__(self, servers, device, control_group):
+        self.servers, self.device, self.group = list(servers), device, control_group
 
     def request(self, ids, mask, x, t, cap):
+        """cap: caption index of every state, non-decreasing (states grouped by trajectory)."""
         import torch.distributed as dist
         n, _, h, w = x.shape
-        hdr = torch.tensor([1, n, len(ids), h, w], dtype=torch.long)
-        reqs = [dist.isend(hdr, dst=self.server, group=self.group, tag=TAG_HDR),
-                dist.isend(ids.contiguous(), dst=self.server, group=self.group, tag=TAG_IDS),
-                dist.isend(mask.contiguous(), dst=self.server, group=self.group, tag=TAG_MASK)]
-        bufs = [x.to(torch.bfloat16).contiguous(), t.float().contiguous(), cap.long().contiguous()]
-        reqs += [dist.isend(b, dst=self.server) for b in bufs]
-        out = torch.empty(n, 128, h, w, dtype=torch.bfloat16, device=self.device)
-        reqs.append(dist.irecv(out, src=self.server))
-        return dict(reqs=reqs, keep=(hdr, ids, mask, bufs), out=out)
+        parts = []
+        bounds = torch.linspace(0, len(ids), len(self.servers) + 1).round().long().tolist()
+        cap_cpu = cap.cpu()
+        for server, c0, c1 in zip(self.servers, bounds[:-1], bounds[1:]):
+            if c1 == c0:
+                continue
+            s0, s1 = int(torch.searchsorted(cap_cpu, c0)), int(torch.searchsorted(cap_cpu, c1))
+            hdr = torch.tensor([1, s1 - s0, c1 - c0, h, w], dtype=torch.long)
+            p_ids, p_mask = ids[c0:c1].contiguous(), mask[c0:c1].contiguous()
+            reqs = [dist.isend(hdr, dst=server, group=self.group, tag=TAG_HDR),
+                    dist.isend(p_ids, dst=server, group=self.group, tag=TAG_IDS),
+                    dist.isend(p_mask, dst=server, group=self.group, tag=TAG_MASK)]
+            bufs = [x[s0:s1].to(torch.bfloat16).contiguous(), t[s0:s1].float().contiguous(),
+                    (cap[s0:s1] - c0).long().contiguous()]
+            reqs += [dist.isend(b, dst=server) for b in bufs]
+            out = torch.empty(s1 - s0, 128, h, w, dtype=torch.bfloat16, device=self.device)
+            reqs.append(dist.irecv(out, src=server))
+            parts.append(dict(reqs=reqs, keep=(hdr, p_ids, p_mask, bufs), out=out))
+        return parts
 
-    def collect(self, h):
-        for r in h["reqs"]:
-            r.wait()
-        return h["out"].float()
+    def collect(self, parts):
+        for p in parts:
+            for r in p["reqs"]:
+                r.wait()
+        return torch.cat([p["out"] for p in parts]).float()
 
     def stop(self):
         import torch.distributed as dist
-        dist.send(torch.tensor([0, 0, 0, 0, 0]), dst=self.server, group=self.group, tag=TAG_HDR)
+        for server in self.servers:
+            dist.send(torch.tensor([0, 0, 0, 0, 0]), dst=server, group=self.group, tag=TAG_HDR)

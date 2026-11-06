@@ -100,7 +100,8 @@ def get_args():
                         "sees (Polish or English). The student becomes guidance-distilled: sample it with CFG 1")
     p.add_argument("--teacher-ranks", type=int, default=0,
                    help="--opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
-                        "training ranks and before the --lm-rank ones; training rank r uses teacher r mod N")
+                        "training ranks and before the --lm-rank ones; every training rank splits its trajectories "
+                        "over all of them")
     p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--opd: klein base repo or dir")
     p.add_argument("--opd-cfg", type=float, default=4.0, help="--opd: the teacher's CFG scale (klein base: 4)")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
@@ -634,9 +635,7 @@ def main():
         args.cfg_drop = 0.0  # the target is the teacher's guided velocity for the caption; no null-prompt branch
         if rank in teachers:
             from aurora.klein import teacher_server
-            k = rank - world
-            teacher_server(args.klein, [r for r in range(replicas) if r % args.teacher_ranks == k], device, print,
-                           control_group, args.opd_cfg)
+            teacher_server(args.klein, list(range(replicas)), device, print, control_group, args.opd_cfg)
             dist.destroy_process_group()
             return
     if args.lm_rank:
@@ -888,7 +887,7 @@ def main():
     if args.opd:
         from aurora.data import CaptionText
         from aurora.klein import TeacherClient, tokenizer as klein_tokenizer
-        teacher_client = TeacherClient(teachers[replica % args.teacher_ranks], device, control_group)
+        teacher_client = TeacherClient(teachers, device, control_group)
         qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
         log(f"--opd: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
             f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per step")
