@@ -108,10 +108,13 @@ def main():
     p.add_argument("--compile", nargs="?", const="default", default="",
                    help="torch.compile the decoder and the encoder (optionally a mode, e.g. max-autotune)")
     p.add_argument("--cudnn-benchmark", action="store_true", help="let cuDNN pick its fastest conv algorithms")
+    p.add_argument("--cpu-threads", type=int, default=3,
+                   help="torch CPU threads per rank (torchrun sets 1); 3 x 8 ranks = 24")
     p.add_argument("--channels-last", action="store_true", help="NHWC activations (often faster convs on Ampere)")
     a = p.parse_args()
     assert all(s % 16 == 0 and s < 256 for s in a.sizes), "sizes must be multiples of 16, below 256"
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+    torch.set_num_threads(a.cpu_threads)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
     torch.cuda.set_device(device)
     from diffusers import AutoencoderKLFlux2
@@ -138,24 +141,39 @@ def main():
 
     todo = [p_ for p_ in shards if not all(os.path.exists(o) for o in outs_of(p_).values())]
     print(f"rank {rank}: {len(todo)} of {len(shards)} shards to convert", flush=True)
-    t0, done = time.time(), 0
+    from concurrent.futures import ThreadPoolExecutor
+    io = ThreadPoolExecutor(2)  # the next shard is read and the last one written while the GPU converts
+
+    def save(outs, res):
+        for s, o in outs.items():
+            np.save(o + ".tmp.npy", res[s])
+            os.replace(o + ".tmp.npy", o)
+
+    t0, done, writes = time.time(), 0, []
+    nxt = io.submit(np.load, todo[0]) if todo else None
     for k, path in enumerate(todo):
         outs = outs_of(path)
         for o in outs.values():
             os.makedirs(os.path.dirname(o) or ".", exist_ok=True)
-        lat = np.load(path, mmap_mode="r")
+        lat = nxt.result()
+        nxt = io.submit(np.load, todo[k + 1]) if k + 1 < len(todo) else None
         res = {s: np.empty((len(lat), 128, s // 16, s // 16), dtype=np.float16) for s in a.sizes}
         for i in range(0, len(lat), a.batch):
-            for s, z in convert(lat[i:i + a.batch], vae, mean, std, a.sizes, device, None, a.channels_last).items():
-                res[s][i:i + len(z)] = z
-        for s, o in outs.items():
-            np.save(o + ".tmp.npy", res[s])
-            os.replace(o + ".tmp.npy", o)
+            chunk = lat[i:i + a.batch]
+            n = len(chunk)
+            if n < a.batch:  # pad the shard's last batch: one shape for the compiled models, no recompile
+                chunk = np.concatenate([chunk, np.repeat(chunk[-1:], a.batch - n, axis=0)])
+            for s, z in convert(chunk, vae, mean, std, a.sizes, device, None, a.channels_last).items():
+                res[s][i:i + n] = z[:n]
+        writes.append(io.submit(save, outs, res))
         done += len(lat)
         el = time.time() - t0
         eta = el / (k + 1) * (len(todo) - k - 1)
         print(f"rank {rank}: [{k + 1}/{len(todo)}] {os.path.basename(path)[: -len('.lat.npy')]} ({len(lat)} images), "
               f"{done / el:.0f} img/s, eta {eta / 3600:.1f} h", flush=True)
+    for w in writes:
+        w.result()
+    io.shutdown()
 
 
 if __name__ == "__main__":
