@@ -104,6 +104,12 @@ def get_args():
                         "over all of them")
     p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--opd: klein base repo or dir")
     p.add_argument("--opd-cfg", type=float, default=4.0, help="--opd: the teacher's CFG scale (klein base: 4)")
+    p.add_argument("--klein-quant", default="", choices=["", "int8", "fp8"],
+                   help="--opd: teacher linear weights in 8 bits (aurora/klein.py QLinear; ~8 GB instead of ~16, bf16 "
+                        "matmuls). int8 (one scale per 128 inputs) is ~3x more accurate than fp8")
+    p.add_argument("--teacher-on-lm", action="store_true",
+                   help="--opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
+                        "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during --opd")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-states", type=int, default=4,
                    help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
@@ -192,11 +198,14 @@ class Stage(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
         self.repa_targets, self.repa_losses, self._mb = None, [], 0
         self.lm_states = None  # frozen-LM hidden states per micro-batch, computed on all stages (see main)
+        self.text_cache = None  # (text, valid) to use instead of running the text encoder (--opd rollouts)
 
     def forward(self, *args):
         if self.first:
             z, t, ids = args
-            if self.lm_states is not None and not ids.is_meta:
+            if self.text_cache is not None:
+                text, valid = self.text_cache
+            elif self.lm_states is not None and not ids.is_meta:
                 text, valid = self.te(ids, lm_states=self.lm_states[self._mb])
             else:
                 text, valid = self.te(ids)
@@ -354,7 +363,7 @@ def lm_packed_chunks(lm, plan, device, max_tokens=8192):
     return chunks
 
 
-def lm_server(te_cfg, clients, device, log, control_group, lm=None):
+def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None, opd_cfg=4.0, teacher_clients=()):
     """CPU/Gloo any-source control queue; hidden states still travel directly over NCCL.
 
     The optional lm argument is a small fake encoder in the distributed protocol test.
@@ -364,8 +373,12 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None):
     lm = LMTextEncoder(te_cfg).to(device).lm if lm is None else lm
     if packed:
         enable_packed(lm, compile=True)
-    log(f"LM server: {te_cfg.repo} for ranks {clients}", flush=True)
-    active, served, t0 = set(clients), 0, time.perf_counter()
+    log(f"LM server: {te_cfg.repo} for ranks {clients}{' (+ the --opd teacher)' if teacher else ''}", flush=True)
+    # one stop per LM client, and one per teacher client when this rank also serves klein (--teacher-on-lm: every
+    # training rank, not only this server's LM clients)
+    stops = {c: (c in clients) + (c in teacher_clients) for c in set(clients) | set(teacher_clients)}
+    null = teacher.encode([""]) if teacher else None
+    active, served, t0 = set(stops), 0, time.perf_counter()
     idle = compute = transfer = 0.0
     win_t, win_n = t0, 0
     while active:
@@ -374,8 +387,17 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None):
         r = dist.recv(hdr, group=control_group, tag=1)  # any ready client, not a fixed round-robin slot
         assert r in active, f"unexpected LM client {r}"
         if hdr[0].item() == 0:
-            active.remove(r)
+            stops[r] -= 1
+            if not stops[r]:
+                active.remove(r)
             idle += time.perf_counter() - start
+            continue
+        if hdr[0].item() == 2:  # a teacher request (aurora/klein.py protocol, header on this tag)
+            from aurora.klein import serve_request
+            idle += time.perf_counter() - start
+            start = time.perf_counter()
+            serve_request(teacher, null, r, hdr, control_group, device, opd_cfg)
+            compute += time.perf_counter() - start
             continue
         ids = torch.empty(int(hdr[1]), int(hdr[2]), dtype=torch.long)
         dist.recv(ids, src=r, group=control_group, tag=2)
@@ -457,8 +479,9 @@ def text_widths(ids_cpu, microbatch, multiple=64):
     return [trim_ids(c, multiple=multiple).shape[1] for c in ids_cpu.split(microbatch)]
 
 
-def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None):
-    """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch."""
+def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, divide=True):
+    """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch. divide=False:
+    leave the summed gradients (the caller divides once after several calls) and return the micro-batch count."""
     count = z.shape[0] // microbatch
     states = stage.lm_states
     try:
@@ -476,19 +499,29 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None):
             # AddAux's auxiliary gradient is 1; divide ALL accumulated gradients after backward,
             # matching Schedule1F1B.perform_reduce_grad, including REPA.
             loss.backward()
-        grads = [p.grad for p in stage.parameters() if p.grad is not None]
-        torch._foreach_div_(grads, count)
+        if divide:
+            grads = [p.grad for p in stage.parameters() if p.grad is not None]
+            torch._foreach_div_(grads, count)
     finally:
         stage.lm_states = states
+    return count
 
 
 @torch.no_grad()
-def opd_rollout(stage, z, ids, mb, ts, picks, widths=None):
+def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     """The student's own Euler trajectories from noise z (B, C, h, w): conditional velocity (no CFG) for the
-    captions ids, time grid ts (K + 1,), micro-batches of mb as the step's LM states. -> states (B, m, C, h, w) at
-    the step indices picks (B, m) (CPU)."""
+    captions ids (lm_states: their (B, L, H) LM states or None), time grid ts (K + 1,), in micro-batches of mb; the
+    text encoder runs once per micro-batch, not once per step. -> states (B, m, C, h, w) at the step indices picks
+    (B, m) (CPU)."""
     B, m = picks.shape
-    states = stage.lm_states
+    chunks = []
+    for j in range(0, B, mb):
+        w = widths[j // mb] if widths is not None else ids.shape[1]
+        if lm_states is not None:
+            text, valid = stage.te(ids[j:j + mb, :w], lm_states=lm_states[j:j + mb, :w])
+        else:
+            text, valid = stage.te(ids[j:j + mb, :w])
+        chunks.append((slice(j, j + mb), (text, valid), ids[j:j + mb, :w]))
     out = torch.empty(B, m, *z.shape[1:], device=z.device)
     try:
         for k in range(len(ts) - 1):
@@ -496,19 +529,19 @@ def opd_rollout(stage, z, ids, mb, ts, picks, widths=None):
             if len(b_idx):
                 out[b_idx.to(z.device), r_idx.to(z.device)] = z[b_idx.to(z.device)]
             v = []
-            for j in range(0, B, mb):
-                w = widths[j // mb] if widths is not None else ids.shape[1]
-                stage._mb = 0
-                stage.lm_states = [states[j // mb][:, :w]] if states is not None else None
-                v.append(stage(z[j:j + mb], ts[k].expand(min(mb, B - j)), ids[j:j + mb, :w]).float())
+            for sl, cache, ids_j in chunks:
+                stage.text_cache = cache
+                v.append(stage(z[sl], ts[k].expand(ids_j.shape[0]), ids_j).float())
             z = z + (ts[k + 1] - ts[k]) * torch.cat(v)
     finally:
-        stage.lm_states = states
+        stage.text_cache = None
     return out
 
 
-def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses):
-    """One --opd step for this replica's batch (see --opd): roll out, have the teacher score the states, regress."""
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2):
+    """One --opd step for this replica's batch (see --opd). The batch is cut into `parts`: part p+1 is rolled out
+    (and later trained on) while the teachers score part p, so neither side waits for the other; all parts use
+    this step's weights, so it stays on-policy."""
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
@@ -518,22 +551,37 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     d = torch.rand((), generator=g).item()
     u = torch.cat([torch.ones(1), 1 - (torch.arange(1, K) - d) / K, torch.zeros(1)]).clamp(0, 1).to(eps.device)
     ts = args.t_shift * u / (1 + (args.t_shift - 1) * u)
-    widths = text_widths(ids_cpu, mb, args.text_bucket) if ids_cpu is not None and args.text_bucket else None
-    x = opd_rollout(stage, eps, ids, mb, ts, picks, widths).flatten(0, 1)  # (B m, C, h, w), sample-major
-    t = ts[picks.to(eps.device)].flatten()
     q_ids, q_mask = tokenize(qwen_tok, texts_en)
-    h = teacher.request(q_ids, q_mask, x, t, torch.arange(B, device=eps.device).repeat_interleave(m))
-    rep = lambda a: a.repeat_interleave(m, dim=0)
     states = stage.lm_states
-    if states is not None:  # per-sample LM states, repeated per state and re-cut into micro-batches of mb states
-        full = rep(torch.cat(states))
-        stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
-    w_rep = text_widths(rep(ids_cpu), mb, args.text_bucket) if ids_cpu is not None and args.text_bucket else None
-    target = teacher.collect(h)
+    lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
+    per = -(-B // parts)
+    assert (per * m) % mb == 0 or parts == 1, \
+        f"--opd: {per} trajectories x {m} states must split into micro-batches of {mb}"
+    rep = lambda a: a.repeat_interleave(m, dim=0)
+    pending = []
+    for b0 in range(0, B, per):  # roll out every part and send it; the teachers start on part 0 at once
+        b1 = min(B, b0 + per)
+        ids_c = ids_cpu[b0:b1] if ids_cpu is not None else None
+        widths = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
+        x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
+                        picks[b0:b1], widths).flatten(0, 1)
+        t = ts[picks[b0:b1].to(eps.device)].flatten()
+        cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
+        pending.append((b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap)))
+    count = 0
     try:
-        local_train_step(stage, x, t, rep(ids), target, mb, losses, w_rep)
+        for b0, b1, x, t, h in pending:  # then train on each part as its targets arrive
+            if lm_full is not None:
+                full = rep(lm_full[b0:b1])
+                stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
+            ids_c = rep(ids_cpu[b0:b1]) if ids_cpu is not None else None
+            w_rep = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
+            count += local_train_step(stage, x, t, rep(ids[b0:b1]), teacher.collect(h), mb, losses, w_rep,
+                                      divide=False)
     finally:
         stage.lm_states = states
+    grads = [p.grad for p in stage.parameters() if p.grad is not None]
+    torch._foreach_div_(grads, count)
 
 
 def owned_den_names(den, s, pp, ranges):
@@ -562,8 +610,8 @@ def main():
     pp = args.pp
     # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers
     world = world_all - args.lm_rank - args.teacher_ranks
-    teachers = list(range(world, world + args.teacher_ranks))
     lm_servers = list(range(world + args.teacher_ranks, world_all))
+    teachers = list(range(world, world + args.teacher_ranks)) + (lm_servers if args.teacher_on_lm else [])
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
@@ -631,11 +679,14 @@ def main():
             f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     if args.opd:
-        assert pp == 1 and args.teacher_ranks > 0, "--opd needs --pp 1 and --teacher-ranks"
+        assert pp == 1 and teachers, "--opd needs --pp 1 and --teacher-ranks (or --teacher-on-lm)"
+        assert not args.teacher_on_lm or (args.lm_rank and args.klein_quant), \
+            "--teacher-on-lm needs --lm-rank and --klein-quant (klein in bf16 does not fit next to the LM)"
         args.cfg_drop = 0.0  # the target is the teacher's guided velocity for the caption; no null-prompt branch
-        if rank in teachers:
+        if rank in teachers and rank not in lm_servers:
             from aurora.klein import teacher_server
-            teacher_server(args.klein, list(range(replicas)), device, print, control_group, args.opd_cfg)
+            teacher_server(args.klein, list(range(replicas)), device, print, control_group, args.opd_cfg,
+                           args.klein_quant, compile=not args.no_compile)
             dist.destroy_process_group()
             return
     if args.lm_rank:
@@ -643,7 +694,12 @@ def main():
             "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
         if rank >= world:
             k = rank - world - args.teacher_ranks
-            lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print, control_group)
+            teacher = None
+            if args.opd and args.teacher_on_lm:
+                from aurora.klein import KleinTeacher
+                teacher = KleinTeacher(device, args.klein, quant=args.klein_quant, compile=not args.no_compile)
+            lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print, control_group,
+                      teacher=teacher, opd_cfg=args.opd_cfg, teacher_clients=list(range(replicas)) if teacher else ())
             dist.destroy_process_group()
             return
     assert M >= pp, f"need at least {pp} micro-batches"
@@ -811,6 +867,9 @@ def main():
                 blk.compile(dynamic=False)
         if first:
             te.compile(dynamic=False)
+            # one graph per text width bucket and batch size (training, --opd rollout parts, evaluation chunks):
+            # more than dynamo's default 8, which would leave the rest eager
+            torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
     hf_lm = getattr(te_cfg, "backend", "") == "hf"  # remote code + MoE routing: runs eager (see aurora/slayer.py)
     lm_fn = torch.compile(lm_enc.lm_states, dynamic=False) if lm_offload and not args.no_compile and not hf_lm else \
         (lm_enc.lm_states if lm_offload else None)
@@ -887,7 +946,7 @@ def main():
     if args.opd:
         from aurora.data import CaptionText
         from aurora.klein import TeacherClient, tokenizer as klein_tokenizer
-        teacher_client = TeacherClient(teachers, device, control_group)
+        teacher_client = TeacherClient(teachers, device, control_group, shared=lm_servers if args.teacher_on_lm else ())
         qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
         log(f"--opd: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
             f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per step")
