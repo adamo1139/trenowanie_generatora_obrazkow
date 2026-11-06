@@ -59,6 +59,9 @@ from aurora.slayer import LM_PAD, trim_ids
 from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
                    peak_tflops, resolve_defaults, wandb_logged_in, weight_sq, wrms_stats)
 
+# GPU numbers as in nvidia-smi (--lm-gpu); CUDA reads this when it initialises, after the imports
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 
 def get_args():
     p = build_parser()
@@ -80,6 +83,10 @@ def get_args():
                         "which hold no LM at all: each pipeline's stage 0 sends the next step's captions while it trains "
                         "the current one and gets their LM states back; pipeline r uses LM rank r mod N "
                         "(world = N + pipelines x pp, e.g. 8 GPUs = 1 + 7 x pp 1 or 2 + 6 x pp 1)")
+    p.add_argument("--lm-gpu", type=int, default=2,
+                   help="--lm-rank: physical GPU (nvidia-smi / PCI bus order) of the (last) LM server rank, the training "
+                        "ranks take the others; on adamo-rigga GPU 2 runs hottest and the LM GPU is only ~50%% busy. "
+                        "-1 = plain rank order")
     p.add_argument("--lm-split", action="store_true",
                    help="frozen transformers LM (Poziomka) split by layers over the pipeline's stages: each GPU holds "
                         "1/pp of it, the hidden states go stage 0 -> 1 -> ... -> back to stage 0 (chunks of ~32 "
@@ -479,7 +486,13 @@ def main():
     replicas = world // pp
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
     first, last = s == 0, s == pp - 1
-    local = int(os.environ.get("LOCAL_RANK", 0)) % max(1, torch.cuda.device_count())
+    n_dev = max(1, torch.cuda.device_count())
+    local = int(os.environ.get("LOCAL_RANK", 0)) % n_dev
+    if args.lm_rank and args.lm_gpu >= 0 and n_dev == world_all and args.lm_gpu < n_dev:
+        # the LM server(s) are the last rank(s): give the last one GPU --lm-gpu (nvidia-smi numbering), the training
+        # ranks the others in order
+        order = [d for d in range(n_dev) if d != args.lm_gpu] + [args.lm_gpu]
+        local = order[local]
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
         device = torch.device("cpu")
     else:
