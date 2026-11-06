@@ -509,6 +509,8 @@ def main():
     stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
     control_group = dist.new_group(backend="gloo") if args.lm_rank else None
     train_group = dist.new_group(list(range(world))) if args.lm_rank else None  # None = everyone
+    # Every barrier below specifies device_ids: with --lm-gpu, rank % device_count
+    # may select another process's GPU and poison this group's first NCCL communicator.
     pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
 
     per_pipe = args.batch // replicas
@@ -857,7 +859,7 @@ def main():
                             repa_proj={k: v.cpu() for k, v in repa_proj.state_dict().items()} if repa_proj else None),
                        opt_path + ".tmp")
             os.replace(opt_path + ".tmp", opt_path)
-        dist.barrier(group=train_group)
+        dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
         if master:
             ema_list = [emas[("te", n)] for n in te_names] + [emas[("den", n)] for n, _ in den.named_parameters()]
             torch.save(dict(meta, ema=ema_list, args=vars(args), opts=None), ckpt_path + ".tmp")
@@ -923,7 +925,7 @@ def main():
         for r in range(world):  # one rank after another, so the lines don't interleave
             if r == rank:
                 mem_report(tag)
-            dist.barrier(group=train_group)
+            dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
 
     lm_owner = te if first else lm_enc
     lm_mod = getattr(lm_owner, "lm", None) if lm_owner is not None else None
@@ -1163,13 +1165,13 @@ def main():
                 log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
                 if wb:
                     wb.log({**res, "train/samples": step * args.batch}, step=step)
-            dist.barrier(group=train_group)
+            dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
         if step % args.ckpt_every == 0 or step == args.steps:
             save()
         if args.merge_every and step >= args.merge_start * args.steps and (
                 step % args.merge_every == 0 or step == args.steps):
             save(merge_only=True)
-            dist.barrier(group=train_group)
+            dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
 
     profile.close()
     if lm_client is not None:
