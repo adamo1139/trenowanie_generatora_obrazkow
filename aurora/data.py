@@ -102,10 +102,12 @@ def ensure_open_files(needed: int):
 
 
 class ShardStore:
-    def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0):
+    def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0,
+                 lat_kind: str = "lat"):
         """alt_suffix / alt_prob: with probability alt_prob a sample's caption comes from <name>.tok_<alt_suffix>.npy
-        (the same caption translated, e.g. poziomka_pl) instead."""
-        self.root, self.names = root, list(names)
+        (the same caption translated, e.g. poziomka_pl) instead. lat_kind: which latents, e.g. "lat128" for the
+        <name>.lat128.npy files of prepare_lowres.py (any grid; the shape is read from the files)."""
+        self.root, self.names, self.lat_kind = root, list(names), lat_kind
         self.tok = tok_kind(tok_suffix)
         self.alt = tok_kind(alt_suffix) if alt_suffix and alt_prob > 0 else None
         self.alt_prob = alt_prob
@@ -124,7 +126,7 @@ class ShardStore:
 
     def _open(self):  # lazily, so every DataLoader worker gets its own handles
         if self._lat is None:
-            self._lat = [np.load(self._p(n, "lat"), mmap_mode="r") for n in self.names]
+            self._lat = [np.load(self._p(n, self.lat_kind), mmap_mode="r") for n in self.names]
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
@@ -132,7 +134,7 @@ class ShardStore:
     def fetch(self, indices: np.ndarray, rng: np.random.Generator | None):
         """Latents + one caption per image (random if rng is given, else the first one)."""
         self._open()
-        lat = np.empty((len(indices), 128, 16, 16), dtype=np.float16)
+        lat = np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16)
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         shard = np.searchsorted(self.starts, indices, side="right") - 1
         for j, (s, gi) in enumerate(zip(shard, indices)):
@@ -186,9 +188,9 @@ class TrainStream(IterableDataset):
             m += nw
 
 
-def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None):
+def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat"):
     """First n images of the held-out shards (round-robin across shards), first caption each."""
-    store = ShardStore(root, names, tok_suffix, null_row)
+    store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind)
     per = -(-n // len(names))
     idx = np.concatenate([store.starts[s] + np.arange(min(per, store.sizes[s])) for s in range(len(names))])[:n]
     lat, ids = store.fetch(idx, None)

@@ -83,6 +83,14 @@ def get_args():
                         "which hold no LM at all: each pipeline's stage 0 sends the next step's captions while it trains "
                         "the current one and gets their LM states back; pipeline r uses LM rank r mod N "
                         "(world = N + pipelines x pp, e.g. 8 GPUs = 1 + 7 x pp 1 or 2 + 6 x pp 1)")
+    p.add_argument("--res", type=int, default=256,
+                   help="training resolution in pixels: latents of (res/16)^2 tokens, from <shard>.lat<res>.npy "
+                        "(prepare_lowres.py) unless 256; the weights are resolution-free (per-token stem / head, RoPE "
+                        "built for the grid), checkpoints record the grid")
+    p.add_argument("--t-shift", type=float, default=None,
+                   help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn): more steps at high noise "
+                        "for more tokens. Default sqrt(tokens / 256) (SD3's resolution rule): 1 at 256 px, 0.5 at 128, "
+                        "2 at 512, 4 at 1024")
     p.add_argument("--lm-gpu", type=int, default=2,
                    help="--lm-rank: physical GPU (nvidia-smi / PCI bus order) of the (last) LM server rank, the training "
                         "ranks take the others; on adamo-rigga GPU 2 runs hottest and the LM GPU is only ~50%% busy. "
@@ -527,6 +535,11 @@ def main():
     # ---- model: a meta skeleton everywhere, only this stage's parts are materialised -------------------------------
     den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth,
                                    args.te_experts, args.te_quant)
+    assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
+    den_cfg = replace(den_cfg, latent_size=args.res // 16)
+    lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
+    if args.t_shift is None:
+        args.t_shift = (den_cfg.latent_size ** 2 / 256) ** 0.5
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
     resuming = os.path.exists(os.path.join(args.out, "latest.pt"))
@@ -541,8 +554,8 @@ def main():
         if keep_te:  # the refiner comes from the checkpoint; experts / quantisation of the frozen LM may change
             te_cfg = replace(init_te, experts=te_cfg.experts if args.te_experts else init_te.experts,
                              quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
-        assert asdict(replace(old, depth=den_cfg.depth)) == asdict(den_cfg), \
-            f"--init denoiser {old} differs from {den_cfg} in more than the depth"
+        assert asdict(replace(old, depth=den_cfg.depth, latent_size=den_cfg.latent_size)) == asdict(den_cfg), \
+            f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     if args.lm_rank:
         assert getattr(te_cfg, "backend", "") == "hf" and not args.lm_split and not args.lm_stage0, \
@@ -759,7 +772,7 @@ def main():
     loader = store = None
     if needs_data:
         store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None,
-                           alt_suffix, args.pl_prob)
+                           alt_suffix, args.pl_prob, lat_kind)
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
@@ -777,10 +790,10 @@ def main():
 
     val, val_lm = None, None
     if master and val_names:
-        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids())
+        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(), lat_kind)
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
         ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
-                                                ids_enc.null_ids()))[1]
+                                                ids_enc.null_ids(), lat_kind))[1]
         ch = 64  # evaluate()'s chunk for transformers LMs
         got = lm_split_forward_([trim_ids(ids_val[i:i + ch].to(device)) for i in range(0, len(ids_val), ch)])
         if master:
@@ -897,6 +910,7 @@ def main():
         log(f"REPA{' (iREPA)' if args.irepa else ''}: {args.repa_encoder} <- DiT block {args.repa_layer} "
             f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
             f"step {repa_steps}; decoding spread over all {pp} stages")
+    log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift {args.t_shift:.2f}")
     log(f"lr: {args.schedule} after {warmup} warmup steps, Muon {args.lr_muon}, AdamW x{args.lr_scale:.2f}, "
         f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps%s' % (args.diloco, ' (plain averaging, no global copy)' if plain_avg else '') if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
@@ -959,6 +973,8 @@ def main():
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
+        if args.t_shift != 1.0:
+            t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
         eps = torch.randn(x0.shape, device=device, generator=g)
         # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
