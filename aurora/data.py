@@ -157,9 +157,12 @@ class TrainStream(IterableDataset):
     so resuming from `start_micro` reproduces exactly the same sequence.
     """
 
-    def __init__(self, store: ShardStore, micro_batch: int, rank: int, world: int, seed: int, start_micro: int = 0):
+    def __init__(self, store: ShardStore, micro_batch: int, rank: int, world: int, seed: int, start_micro: int = 0,
+                 sort_pad=None):
+        """sort_pad: caption pad id -> rows ordered by caption length (stable), here in the worker, so the loader's
+        pinned batch reaches the GPU without another copy (train_pp.py's similar-length micro-batches)."""
         self.store, self.mb, self.rank, self.world = store, micro_batch, rank, world
-        self.seed, self.start = seed, start_micro
+        self.seed, self.start, self.sort_pad = seed, start_micro, sort_pad
         self.per_epoch = len(store) // (micro_batch * world)  # micro-batches per rank per epoch
 
     def __iter__(self):
@@ -175,7 +178,11 @@ class TrainStream(IterableDataset):
             g0 = k * self.mb * self.world + self.rank * self.mb
             idx = np.sort(perm[g0:g0 + self.mb])
             lat, ids = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]))
-            yield torch.from_numpy(lat), torch.from_numpy(ids)
+            lat, ids = torch.from_numpy(lat), torch.from_numpy(ids)
+            if self.sort_pad is not None:
+                order = ids.ne(self.sort_pad).sum(1).argsort(stable=True)
+                lat, ids = lat[order], ids[order]
+            yield lat, ids
             m += nw
 
 

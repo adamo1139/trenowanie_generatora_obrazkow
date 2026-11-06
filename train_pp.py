@@ -700,7 +700,8 @@ def main():
                            alt_suffix, args.pl_prob)
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
-        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step)
+        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
+                             sort_pad=LM_PAD if hf_lm else None)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
                                                   prefetch_factor=2 if args.workers else None,
@@ -889,21 +890,19 @@ def main():
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
             return None, None, None, None, None, None
-        lat, ids = next(loader)
-        if hf_lm:  # micro-batches of similar caption length (same order on every stage that reads data)
-            order = ids.ne(LM_PAD).sum(1).argsort(stable=True)
-            lat, ids = lat[order], ids[order]
+        lat, ids = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
         ids_cpu = ids
         x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
         eps = torch.randn(x0.shape, device=device, generator=g)
-        drop = torch.rand(per_pipe, device=device, generator=g) < args.cfg_drop
+        # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
+        g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
+        drop_cpu = torch.rand(per_pipe, generator=g_cpu) < args.cfg_drop
+        drop = drop_cpu.to(device, non_blocking=True)
         cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
-        # Preserve the exact CUDA RNG sequence. Copy just the dropout mask once, rather than reading
-        # scalars / boolean-indexed shapes back from CUDA for every LM chunk on both peers.
-        cond_cpu = (torch.where(drop.cpu()[:, None], null_cpu, ids_cpu)
+        cond_cpu = (torch.where(drop_cpu[:, None], null_cpu, ids_cpu)
                     if hf_lm and null_row is not None else None)
         return x0, ids, t, eps, cond, cond_cpu
 
