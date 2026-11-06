@@ -75,8 +75,8 @@ def main():
 
     if a.check and rank == 0:
         from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
-        pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(a.klein, subfolder="scheduler"),
-                                  vae=AutoencoderKLFlux2.from_pretrained(a.klein, subfolder="vae").to(device),
+        sched = FlowMatchEulerDiscreteScheduler.from_pretrained(a.klein, subfolder="scheduler")
+        pipe = Flux2KleinPipeline(scheduler=sched, vae=AutoencoderKLFlux2.from_pretrained(a.klein, subfolder="vae").to(device),
                                   text_encoder=teacher.te, tokenizer=teacher.tok, transformer=teacher.transformer)
         g = torch.Generator(device=device).manual_seed(123)
         noise = torch.randn(2, 128, 16, 16, device=device, generator=g)
