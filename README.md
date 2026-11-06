@@ -140,6 +140,8 @@ osobny profil po pomiarze każdej konfiguracji: timeline `.trace.json`, tabelę 
 rzeczywistych kerneli oraz kształtów `.json`. Nieobsługiwane backendy są raportowane jako błędy danego przypadku,
 bez cichego powrotu do innego backendu. Attention jest sprawdzane względem SDPA math (wynik i gradienty).
 Wariant `varlen` korzysta z `torch.nn.attention.varlen` i obejmuje koszt pakowania K/V; nie zmienia treningu.
+`--parts block --block-backends auto cudnn` porównuje backendy cross-attention wewnątrz rzeczywistego
+bloku DiT, razem z projekcjami, normami, MLP i checkpointingiem.
 Licznik FLOPs używa faktycznej szerokości tekstu, lecz nie dolicza przeliczeń checkpointingu ani optymalizatora.
 
 Do istniejącej komendy `train_pp.py` można dopisać:
@@ -155,6 +157,12 @@ warto wskazać `--profile-ranks 0 1`, aby zobaczyć obydwa etapy. Rejestruje m.i
 są zagnieżdżone, a kernele mogą się nakładać. Krok z eksportem profilu oraz okno profilowania nie służą
 porównywaniu img/s. Ustaw początek po rozgrzaniu używanych szerokości tekstu.
 `opt avg` pokazuje średnią z całego okna logowania, również przy okresowym Muonie.
+
+`--masked-attention-backend cudnn` wymusza cuDNN dla cross-attention DiT i attention trainowalnego
+refinera tekstu. Domyślnie pozostaje `auto`; self-attention DiT i zamrożony LM zachowują swój backend.
+Wybór jest zapisany wewnątrz kompilowanego grafu. Wymaga obsługi danego kształtu przez cuDNN;
+nie ma cichego fallbacku. Porównuj rozgrzane przebiegi z tym samym microbatchem i checkpointingiem,
+ponieważ przyspieszenie pojedynczego attention nie przekłada się wprost na przyspieszenie całego kroku.
 
 Na 8 GPU legalne konfiguracje do porównania (batch 1008):
 

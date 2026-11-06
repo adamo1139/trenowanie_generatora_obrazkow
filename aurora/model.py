@@ -10,6 +10,15 @@ from dataclasses import dataclass, replace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+def masked_attention(q, k, v, mask, backend):
+    if backend == "cudnn":
+        # Keep the backend choice inside the compiled graph, including backward.
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
 
 # =============================================================================
@@ -68,6 +77,7 @@ class TextAttention(nn.Module):
     def __init__(self, dim: int, heads: int, kv_heads: int, head_dim: int):
         super().__init__()
         self.heads, self.kv_heads, self.head_dim = heads, kv_heads, head_dim
+        self.sdpa_backend = "auto"
         self.qkv = nn.Linear(dim, (heads + 2 * kv_heads) * head_dim, bias=False)
         self.out = nn.Linear(heads * head_dim, dim, bias=False)
 
@@ -81,7 +91,7 @@ class TextAttention(nn.Module):
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         rep = self.heads // self.kv_heads
         k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        h = F.scaled_dot_product_attention(q, k, v, attn_mask=valid_mask[:, None, None, :].bool())
+        h = masked_attention(q, k, v, valid_mask[:, None, None, :].bool(), self.sdpa_backend)
         return self.out(h.transpose(1, 2).reshape(b, t, -1))
 
 
@@ -122,6 +132,7 @@ class CrossAttention(nn.Module):
     def __init__(self, dim: int, heads: int, text_dim: int):
         super().__init__()
         self.heads = heads
+        self.sdpa_backend = "auto"
         self.head_dim = dim // heads
         self.q = nn.Linear(dim, dim, bias=False)
         self.kv = nn.Linear(text_dim, 2 * dim, bias=False)
@@ -134,7 +145,7 @@ class CrossAttention(nn.Module):
         k, v = self.kv(text).chunk(2, dim=-1)
         k = k.view(b, n, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(b, n, self.heads, self.head_dim).transpose(1, 2)
-        h = F.scaled_dot_product_attention(q, k, v, attn_mask=text_valid[:, None, None, :].bool())
+        h = masked_attention(q, k, v, text_valid[:, None, None, :].bool(), self.sdpa_backend)
         return self.out(h.transpose(1, 2).reshape(b, t, c))
 
 

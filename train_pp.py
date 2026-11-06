@@ -51,8 +51,8 @@ from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selectiv
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
 from aurora.data import ShardStore, TrainStream, load_val, select_shards
-from aurora.model import (Denoiser, DenoiserConfig, LMEncoderConfig, TextEncoder, build_rope_2d, make_configs,
-                          te_config_from_dict, timestep_embedding)
+from aurora.model import (CrossAttention, Denoiser, DenoiserConfig, LMEncoderConfig, TextAttention, TextEncoder,
+                          build_rope_2d, make_configs, te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
 from aurora.profiling import TrainingProfile
 from aurora.slayer import LM_PAD, trim_ids
@@ -110,6 +110,8 @@ def get_args():
     p.add_argument("--profile-start", type=int, default=17, help="first training step to trace, 1-based")
     p.add_argument("--profile-steps", type=int, default=4, help="number of training steps to trace")
     p.add_argument("--profile-ranks", type=int, nargs="+", default=[0], help="training ranks to trace (not LM servers)")
+    p.add_argument("--masked-attention-backend", choices=["auto", "cudnn"], default="auto",
+                   help="backend for DiT cross-attention and trainable text refiner; self-attention and frozen LM unchanged")
     p.set_defaults(batch=512, size="1.5b")
     return p.parse_args()
 
@@ -697,6 +699,10 @@ def main():
         log(f"resumed from {ckpt_path} at step {step}")
         del ck
 
+    for module in stage_mod.modules():
+        if isinstance(module, (CrossAttention, TextAttention)):
+            module.sdpa_backend = args.masked_attention_backend
+    log(f"masked attention backend: {args.masked_attention_backend}")
     if not args.no_compile:
         # torch 2.11 inductor bug: compiling a single block's backward fails at some micro-batch sizes (e.g. 8,
         # "AssertionError: 640 v.s. 5120") unless reduction splitting is off; it only affects small reductions here

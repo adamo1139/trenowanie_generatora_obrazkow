@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from aurora.model import DenoiserBlock, DenoiserConfig, LMEncoderConfig, make_configs, te_config_from_dict, build_rope_2d
+from aurora.model import CrossAttention, DenoiserBlock, DenoiserConfig, LMEncoderConfig, make_configs, te_config_from_dict, build_rope_2d
 from aurora.profiling import export_profile
 from train_pp import checkpointed
 
@@ -183,6 +183,9 @@ def build_case(part, cfg, te, ck, mb, width, backend, cp, device, dtype):
     params, reference = [], None
     if part == 'block':
         mod = DenoiserBlock(d, heads, cfg.text_dim, cfg.mlp_hidden).to(device)
+        for module in mod.modules():
+            if isinstance(module, CrossAttention):
+                module.sdpa_backend = backend
         if ck is not None:
             weights = {k[len('blocks.0.'):]: v for k,v in ck['den'].items() if k.startswith('blocks.0.')}
             mod.load_state_dict(weights)
@@ -243,6 +246,8 @@ def main():
     p.add_argument('--mb', nargs='+', type=int, default=[8,16])
     p.add_argument('--text-widths', nargs='+', type=int, default=[64,128])
     p.add_argument('--backends', nargs='+', choices=['auto',*BACKENDS,'varlen'], default=['auto','efficient','cudnn','varlen'])
+    p.add_argument('--block-backends', nargs='+', choices=['auto','cudnn'], default=['auto'],
+                   help='cross-attention backend inside the real denoiser block')
     p.add_argument('--compile-modes', nargs='+', choices=['eager','default','max-autotune-no-cudagraphs'], default=['default'])
     p.add_argument('--checkpoints', nargs='+', choices=['none','full','selective'], default=['selective'])
     p.add_argument('--warmup', type=int, default=5)
@@ -291,7 +296,8 @@ def main():
                         cases.append(('gemm:'+name,mb,width,'auto','none',mode))
                 if 'block' in args.parts:
                     for cp in args.checkpoints:
-                        cases.append(('block',mb,width,'auto',cp,mode))
+                        for backend in args.block_backends:
+                            cases.append(('block',mb,width,backend,cp,mode))
     for number,(part,mb,width,backend,cp,mode) in enumerate(cases):
         label=f'{number:03d}_{part.replace(":","_")}_mb{mb}_t{width}_{backend}_{cp}_{mode}'
         row=dict(part=part,mb=mb,text_width=width,backend=backend,checkpoint=cp,compile_mode=mode)
