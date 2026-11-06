@@ -91,6 +91,21 @@ def get_args():
                    help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn): more steps at high noise "
                         "for more tokens. Default sqrt(tokens / 256) (SD3's resolution rule): 1 at 256 px, 0.5 at 128, "
                         "2 at 512, 4 at 1024")
+    p.add_argument("--opd", action="store_true",
+                   help="on-policy distillation from FLUX.2 klein base (DiffusionOPD, arXiv:2605.15055) instead of flow "
+                        "matching on the data, --pp 1 only: each step the student samples its own Euler trajectories "
+                        "(conditional velocity, no CFG) from noise for the batch's captions, --opd-states states per "
+                        "trajectory are sent to a teacher rank, and the student's velocity there is regressed onto "
+                        "klein's CFG-guided one. The teacher always gets the ENGLISH original of the caption the student "
+                        "sees (Polish or English). The student becomes guidance-distilled: sample it with CFG 1")
+    p.add_argument("--teacher-ranks", type=int, default=0,
+                   help="--opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
+                        "training ranks and before the --lm-rank ones; training rank r uses teacher r mod N")
+    p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--opd: klein base repo or dir")
+    p.add_argument("--opd-cfg", type=float, default=4.0, help="--opd: the teacher's CFG scale (klein base: 4)")
+    p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-states", type=int, default=4,
+                   help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
     p.add_argument("--lm-gpu", type=int, default=2,
                    help="--lm-rank: physical GPU (nvidia-smi / PCI bus order) of the (last) LM server rank, the training "
                         "ranks take the others; on adamo-rigga GPU 2 runs hottest and the LM GPU is only ~50%% busy. "
@@ -466,6 +481,57 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None):
         stage.lm_states = states
 
 
+@torch.no_grad()
+def opd_rollout(stage, z, ids, mb, ts, picks, widths=None):
+    """The student's own Euler trajectories from noise z (B, C, h, w): conditional velocity (no CFG) for the
+    captions ids, time grid ts (K + 1,), micro-batches of mb as the step's LM states. -> states (B, m, C, h, w) at
+    the step indices picks (B, m) (CPU)."""
+    B, m = picks.shape
+    states = stage.lm_states
+    out = torch.empty(B, m, *z.shape[1:], device=z.device)
+    try:
+        for k in range(len(ts) - 1):
+            b_idx, r_idx = (picks == k).nonzero(as_tuple=True)  # CPU: no GPU sync
+            if len(b_idx):
+                out[b_idx.to(z.device), r_idx.to(z.device)] = z[b_idx.to(z.device)]
+            v = []
+            for j in range(0, B, mb):
+                w = widths[j // mb] if widths is not None else ids.shape[1]
+                stage._mb = 0
+                stage.lm_states = [states[j // mb][:, :w]] if states is not None else None
+                v.append(stage(z[j:j + mb], ts[k].expand(min(mb, B - j)), ids[j:j + mb, :w]).float())
+            z = z + (ts[k + 1] - ts[k]) * torch.cat(v)
+    finally:
+        stage.lm_states = states
+    return out
+
+
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses):
+    """One --opd step for this replica's batch (see --opd): roll out, have the teacher score the states, regress."""
+    from aurora.klein import tokenize
+    B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
+    g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
+    picks = torch.stack([torch.randperm(K, generator=g)[:m] for _ in range(B)])  # distinct steps per trajectory
+    u = torch.linspace(1.0, 0.0, K + 1, device=eps.device)
+    ts = args.t_shift * u / (1 + (args.t_shift - 1) * u)
+    widths = text_widths(ids_cpu, mb, args.text_bucket) if ids_cpu is not None and args.text_bucket else None
+    x = opd_rollout(stage, eps, ids, mb, ts, picks, widths).flatten(0, 1)  # (B m, C, h, w), sample-major
+    t = ts[picks.to(eps.device)].flatten()
+    q_ids, q_mask = tokenize(qwen_tok, texts_en)
+    h = teacher.request(q_ids, q_mask, x, t, torch.arange(B, device=eps.device).repeat_interleave(m))
+    rep = lambda a: a.repeat_interleave(m, dim=0)
+    states = stage.lm_states
+    if states is not None:  # per-sample LM states, repeated per state and re-cut into micro-batches of mb states
+        full = rep(torch.cat(states))
+        stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
+    w_rep = text_widths(rep(ids_cpu), mb, args.text_bucket) if ids_cpu is not None and args.text_bucket else None
+    target = teacher.collect(h)
+    try:
+        local_train_step(stage, x, t, rep(ids), target, mb, losses, w_rep)
+    finally:
+        stage.lm_states = states
+
+
 def owned_den_names(den, s, pp, ranges):
     lo, hi = ranges[s]
     out = []
@@ -490,8 +556,10 @@ def main():
     dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
-    world = world_all - args.lm_rank  # training ranks; with --lm-rank N the last N serve the LM
-    lm_servers = list(range(world, world_all))
+    # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers
+    world = world_all - args.lm_rank - args.teacher_ranks
+    teachers = list(range(world, world + args.teacher_ranks))
+    lm_servers = list(range(world + args.teacher_ranks, world_all))
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
@@ -517,8 +585,9 @@ def main():
     # every rank creates every group in the same order
     pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp))) for r in range(replicas)]
     stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
-    control_group = dist.new_group(backend="gloo") if args.lm_rank else None
-    train_group = dist.new_group(list(range(world))) if args.lm_rank else None  # None = everyone
+    servers = args.lm_rank or args.teacher_ranks
+    control_group = dist.new_group(backend="gloo") if servers else None
+    train_group = dist.new_group(list(range(world))) if servers else None  # None = everyone
     # Every barrier below specifies device_ids: with --lm-gpu, rank % device_count
     # may select another process's GPU and poison this group's first NCCL communicator.
     pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
@@ -557,11 +626,21 @@ def main():
         assert asdict(replace(old, depth=den_cfg.depth, latent_size=den_cfg.latent_size)) == asdict(den_cfg), \
             f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
+    if args.opd:
+        assert pp == 1 and args.teacher_ranks > 0, "--opd needs --pp 1 and --teacher-ranks"
+        args.cfg_drop = 0.0  # the target is the teacher's guided velocity for the caption; no null-prompt branch
+        if rank in teachers:
+            from aurora.klein import teacher_server
+            k = rank - world
+            teacher_server(args.klein, [r for r in range(replicas) if r % args.teacher_ranks == k], device, print,
+                           control_group, args.opd_cfg)
+            dist.destroy_process_group()
+            return
     if args.lm_rank:
         assert getattr(te_cfg, "backend", "") == "hf" and not args.lm_split and not args.lm_stage0, \
             "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
         if rank >= world:
-            k = rank - world
+            k = rank - world - args.teacher_ranks
             lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print, control_group)
             dist.destroy_process_group()
             return
@@ -776,7 +855,7 @@ def main():
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
-                             sort_pad=LM_PAD if hf_lm else None)
+                             sort_pad=LM_PAD if hf_lm else None, rows=args.opd)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
                                                   prefetch_factor=2 if args.workers else None,
@@ -802,6 +881,14 @@ def main():
                 f"{len(ids_val)} captions precomputed")
     lm_client = (LMClient(lm_servers[replica % args.lm_rank], te_cfg.lm_dim, device, control_group) if args.lm_rank and first
                  else None)
+    teacher_client = qwen_tok = captions_en = None
+    if args.opd:
+        from aurora.data import CaptionText
+        from aurora.klein import TeacherClient, tokenizer as klein_tokenizer
+        teacher_client = TeacherClient(teachers[replica % args.teacher_ranks], device, control_group)
+        qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
+        log(f"--opd: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
+            f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per step")
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
         h = lm_client.request(val[1])
@@ -965,9 +1052,10 @@ def main():
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         with profile.phase("data_loader"):
-            lat, ids = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
+            got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
+            lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
         x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
@@ -983,7 +1071,7 @@ def main():
         cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
         cond_cpu = (torch.where(drop_cpu[:, None], null_cpu, ids_cpu)
                     if hf_lm and null_row is not None else None)
-        return x0, ids, t, eps, cond, cond_cpu
+        return x0, ids, t, eps, cond, cond_cpu, rows
 
     profile = TrainingProfile(args.profile_dir, rank, args.profile_ranks, args.profile_start, args.profile_steps,
                               device.type == "cuda", metadata={"args": vars(args), "den_config": asdict(den_cfg),
@@ -997,7 +1085,7 @@ def main():
                 nb = next_batch(step)
                 with profile.phase("lm_request"):
                     pending = (nb, lm_client.request(nb[5]))
-            (x0, ids, t, eps, cond_ids, cond_cpu), req = pending
+            (x0, ids, t, eps, cond_ids, cond_cpu, rows), req = pending
             with profile.phase("lm_wait_collect"):
                 lm_full = lm_client.collect(req)
             del req
@@ -1007,7 +1095,7 @@ def main():
                 with profile.phase("lm_request"):
                     pending = (nb, lm_client.request(nb[5]))
         else:
-            x0, ids, t, eps, cond_ids, cond_cpu = next_batch(step)
+            x0, ids, t, eps, cond_ids, cond_cpu, rows = next_batch(step)
         stage_mod.lm_states = None
         if lm_client is not None:
             stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
@@ -1047,7 +1135,10 @@ def main():
                     if first:
                         tt = t.view(-1, 1, 1, 1)
                         z_t = (1 - tt) * x0 + tt * eps
-                        if pp == 1:
+                        if args.opd:
+                            opd_step(stage_mod, teacher_client, qwen_tok, captions_en(rows.tolist()), eps, cond_ids,
+                                     cond_cpu, mb, args, step, replica, losses)
+                        elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)
                             local_train_step(stage_mod, z_t, t, cond_ids, eps - x0, mb, losses, widths)
@@ -1198,6 +1289,8 @@ def main():
     profile.close()
     if lm_client is not None:
         lm_client.stop()
+    if teacher_client is not None:
+        teacher_client.stop()
     log("done")
     if wb:
         wb.finish()

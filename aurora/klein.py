@@ -29,6 +29,19 @@ def klein_sigmas(steps: int, tokens: int, device=None) -> torch.Tensor:
     return torch.cat([s, s.new_zeros(1)]).float().to(device)
 
 
+def tokenizer(repo: str = REPO):
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(repo, subfolder="tokenizer")
+
+
+def tokenize(tok, prompts, max_len: int = 512):
+    """Qwen3 chat template, padded / truncated to max_len, as the pipeline. -> (B, L) ids, (B, L) mask, int64 CPU."""
+    texts = [tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True,
+                                     enable_thinking=False) for p in prompts]
+    enc = tok(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_len)
+    return enc["input_ids"].long(), enc["attention_mask"].long()
+
+
 class KleinTeacher:
     """Frozen klein transformer (+ its Qwen3 text encoder for encode()); plain object, never trained."""
 
@@ -39,22 +52,28 @@ class KleinTeacher:
         self.transformer.to(device).eval().requires_grad_(False)
         self.te = self.tok = None
         if text_encoder:
-            from transformers import AutoTokenizer, Qwen3ForCausalLM
-            self.tok = AutoTokenizer.from_pretrained(repo, subfolder="tokenizer")
+            from transformers import Qwen3ForCausalLM
+            self.tok = tokenizer(repo)
             self.te = Qwen3ForCausalLM.from_pretrained(repo, subfolder="text_encoder", torch_dtype=dtype)
             self.te.to(device).eval().requires_grad_(False)
 
     @torch.no_grad()
-    def encode(self, prompts, max_len: int = 512, layers=(9, 18, 27)) -> torch.Tensor:
+    def encode(self, prompts, max_len: int = 512) -> torch.Tensor:
         """Prompts -> (B, max_len, 7680) text states, as Flux2KleinPipeline._get_qwen3_prompt_embeds."""
-        texts = [self.tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
-                                              add_generation_prompt=True, enable_thinking=False) for p in prompts]
-        enc = self.tok(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_len)
-        out = self.te(input_ids=enc["input_ids"].to(self.device), attention_mask=enc["attention_mask"].to(self.device),
-                      output_hidden_states=True, use_cache=False)
-        h = torch.stack([out.hidden_states[k] for k in layers], dim=1)  # (B, 3, L, 2560)
-        b, c, l, d = h.shape
-        return h.permute(0, 2, 1, 3).reshape(b, l, c * d).to(self.dtype)
+        ids, mask = tokenize(self.tok, prompts, max_len)
+        return self.encode_ids(ids, mask)
+
+    @torch.no_grad()
+    def encode_ids(self, ids, mask, layers=(9, 18, 27), chunk: int = 16) -> torch.Tensor:
+        """tokenize()'s (B, L) ids and attention mask -> (B, L, 7680) text states."""
+        outs = []
+        for i in range(0, len(ids), chunk):
+            out = self.te(input_ids=ids[i:i + chunk].to(self.device), attention_mask=mask[i:i + chunk].to(self.device),
+                          output_hidden_states=True, use_cache=False)
+            h = torch.stack([out.hidden_states[k] for k in layers], dim=1)  # (b, 3, L, 2560)
+            b, c, l, d = h.shape
+            outs.append(h.permute(0, 2, 1, 3).reshape(b, l, c * d).to(self.dtype))
+        return torch.cat(outs)
 
     @staticmethod
     def _ids(b, h, w, l_txt, device):
@@ -80,7 +99,7 @@ class KleinTeacher:
         if guided:
             v_text, v_null = v.chunk(2)
             v = v_null + cfg * (v_text - v_null)
-        return v.transpose(1, 2).reshape(b, c, h, w)
+        return v.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
     @torch.no_grad()
     def sample(self, text, null_text, noise, steps: int = 50, cfg: float = 4.0) -> torch.Tensor:
@@ -91,3 +110,82 @@ class KleinTeacher:
             v = self.velocity(z, sig[k].expand(z.shape[0]), text, null_text, cfg)
             z = z + (sig[k + 1] - sig[k]) * v
         return z
+
+
+# ---- teacher server (train_pp.py --opd): ranks holding klein, serving the training ranks' on-policy states ----------
+# Protocol per request, control on the gloo group (any ready client), tensors on each pair's NCCL link:
+#   gloo:  header [1, n_states, n_captions, h, w] (or [0] = stop), caption ids (n_captions, L), mask (n_captions, L)
+#   NCCL:  states (n, 128, h, w) bf16, t (n,) fp32, caption index per state (n,) int64  ->  guided velocity (n, 128, h, w)
+TAG_HDR, TAG_IDS, TAG_MASK = 21, 22, 23
+
+
+def teacher_server(repo, clients, device, log, control_group, cfg: float = 4.0, micro: int = 32):
+    import time
+    import torch.distributed as dist
+    teacher = KleinTeacher(device, repo)
+    null = teacher.encode([""])
+    log(f"teacher server (rank {dist.get_rank()}): {repo}, CFG {cfg}, for ranks {sorted(clients)}", flush=True)
+    active, served, t0 = set(clients), 0, time.perf_counter()
+    busy, win_t, win_n = 0.0, t0, 0
+    while active:
+        hdr = torch.empty(5, dtype=torch.long)
+        r = dist.recv(hdr, group=control_group, tag=TAG_HDR)
+        if hdr[0].item() == 0:
+            active.remove(r)
+            continue
+        n, nc, h, w = (int(v) for v in hdr[1:])
+        ids, mask = torch.empty(nc, 512, dtype=torch.long), torch.empty(nc, 512, dtype=torch.long)
+        dist.recv(ids, src=r, group=control_group, tag=TAG_IDS)
+        dist.recv(mask, src=r, group=control_group, tag=TAG_MASK)
+        x = torch.empty(n, 128, h, w, dtype=torch.bfloat16, device=device)
+        t = torch.empty(n, dtype=torch.float32, device=device)
+        cap = torch.empty(n, dtype=torch.long, device=device)
+        for buf in (x, t, cap):
+            dist.recv(buf, src=r)
+        start = time.perf_counter()
+        text = teacher.encode_ids(ids, mask)
+        v = torch.cat([teacher.velocity(x[i:i + micro].float(), t[i:i + micro], text[cap[i:i + micro]], null, cfg)
+                       for i in range(0, n, micro)]).to(torch.bfloat16).contiguous()
+        dist.send(v, dst=r)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        busy += time.perf_counter() - start
+        served += n
+        win_n += n
+        if time.perf_counter() - win_t > 60:
+            dt = time.perf_counter() - win_t
+            log(f"teacher server (rank {dist.get_rank()}): busy {100 * busy / dt:.0f}%, {win_n / dt:.1f} states/s",
+                flush=True)
+            busy, win_t, win_n = 0.0, time.perf_counter(), 0
+    log(f"teacher server (rank {dist.get_rank()}): {served:,} states in {time.perf_counter() - t0:.0f} s, done",
+        flush=True)
+
+
+class TeacherClient:
+    """A training rank's side: request() sends the states and captions without waiting, collect() returns the
+    teacher's guided velocity (n, 128, h, w) fp32."""
+
+    def __init__(self, server, device, control_group):
+        self.server, self.device, self.group = server, device, control_group
+
+    def request(self, ids, mask, x, t, cap):
+        import torch.distributed as dist
+        n, _, h, w = x.shape
+        hdr = torch.tensor([1, n, len(ids), h, w], dtype=torch.long)
+        reqs = [dist.isend(hdr, dst=self.server, group=self.group, tag=TAG_HDR),
+                dist.isend(ids.contiguous(), dst=self.server, group=self.group, tag=TAG_IDS),
+                dist.isend(mask.contiguous(), dst=self.server, group=self.group, tag=TAG_MASK)]
+        bufs = [x.to(torch.bfloat16).contiguous(), t.float().contiguous(), cap.long().contiguous()]
+        reqs += [dist.isend(b, dst=self.server) for b in bufs]
+        out = torch.empty(n, 128, h, w, dtype=torch.bfloat16, device=self.device)
+        reqs.append(dist.irecv(out, src=self.server))
+        return dict(reqs=reqs, keep=(hdr, ids, mask, bufs), out=out)
+
+    def collect(self, h):
+        for r in h["reqs"]:
+            r.wait()
+        return h["out"].float()
+
+    def stop(self):
+        import torch.distributed as dist
+        dist.send(torch.tensor([0, 0, 0, 0, 0]), dst=self.server, group=self.group, tag=TAG_HDR)

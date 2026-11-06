@@ -131,9 +131,12 @@ class ShardStore:
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
 
-    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None):
-        """Latents + one caption per image (random if rng is given, else the first one)."""
+    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False):
+        """Latents + one caption per image (random if rng is given, else the first one). rows: also (B, 2) [shard,
+        caption row] of the caption picked (-1 for images without one); the row is the same in the translated files,
+        so it also finds the English original of a Polish caption (CaptionText)."""
         self._open()
+        picked = np.full((len(indices), 2), -1, dtype=np.int64)
         lat = np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16)
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         shard = np.searchsorted(self.starts, indices, side="right") - 1
@@ -143,12 +146,35 @@ class ShardStore:
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
             if hi == lo:
                 ids[j] = self.null_row
-            elif rng is None:
-                ids[j] = self._tok[s][lo]
+                continue
+            c = lo if rng is None else rng.integers(lo, hi)
+            if rng is None:
+                ids[j] = self._tok[s][c]
             else:
-                c = rng.integers(lo, hi)
                 ids[j] = (self._alt if self.alt and rng.random() < self.alt_prob else self._tok)[s][c]
-        return lat, ids
+            picked[j] = s, c
+        return (lat, ids, picked) if rows else (lat, ids)
+
+
+class CaptionText:
+    """Caption strings by (shard, caption row) from <shard>.caps[_<lang>].json, the files the token rows were made
+    from (prepare_data.py flattens them in the same order); a few shards kept parsed."""
+
+    def __init__(self, root: str, names, lang: str = "", keep: int = 8):
+        self.root, self.names, self.lang, self.keep = root, list(names), lang, keep
+        self._cache = {}
+
+    def _flat(self, s: int):
+        if s not in self._cache:
+            if len(self._cache) >= self.keep:
+                self._cache.pop(next(iter(self._cache)))
+            suffix = f"caps_{self.lang}" if self.lang else "caps"
+            with open(os.path.join(self.root, f"{self.names[s]}.{suffix}.json")) as f:
+                self._cache[s] = [c for caps in json.load(f) for c in caps]
+        return self._cache[s]
+
+    def __call__(self, rows) -> list:
+        return ["" if s < 0 else self._flat(int(s))[int(c)] for s, c in rows]
 
 
 class TrainStream(IterableDataset):
@@ -160,11 +186,12 @@ class TrainStream(IterableDataset):
     """
 
     def __init__(self, store: ShardStore, micro_batch: int, rank: int, world: int, seed: int, start_micro: int = 0,
-                 sort_pad=None):
+                 sort_pad=None, rows: bool = False):
         """sort_pad: caption pad id -> rows ordered by caption length (stable), here in the worker, so the loader's
-        pinned batch reaches the GPU without another copy (train_pp.py's similar-length micro-batches)."""
+        pinned batch reaches the GPU without another copy (train_pp.py's similar-length micro-batches). rows: also
+        yield ShardStore.fetch's (B, 2) caption rows."""
         self.store, self.mb, self.rank, self.world = store, micro_batch, rank, world
-        self.seed, self.start, self.sort_pad = seed, start_micro, sort_pad
+        self.seed, self.start, self.sort_pad, self.rows = seed, start_micro, sort_pad, rows
         self.per_epoch = len(store) // (micro_batch * world)  # micro-batches per rank per epoch
 
     def __iter__(self):
@@ -179,12 +206,12 @@ class TrainStream(IterableDataset):
                 perm_epoch = epoch
             g0 = k * self.mb * self.world + self.rank * self.mb
             idx = np.sort(perm[g0:g0 + self.mb])
-            lat, ids = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]))
-            lat, ids = torch.from_numpy(lat), torch.from_numpy(ids)
+            got = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]), rows=True)
+            lat, ids, picked = (torch.from_numpy(x) for x in got)
             if self.sort_pad is not None:
                 order = ids.ne(self.sort_pad).sum(1).argsort(stable=True)
-                lat, ids = lat[order], ids[order]
-            yield lat, ids
+                lat, ids, picked = lat[order], ids[order], picked[order]
+            yield (lat, ids, picked) if self.rows else (lat, ids)
             m += nw
 
 
