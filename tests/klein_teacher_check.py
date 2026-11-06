@@ -55,6 +55,7 @@ def main():
     p.add_argument("--data", required=True)
     p.add_argument("--out-dir", default="klein_check")
     p.add_argument("--vae", default="AuroraIMG2-50M-Preview/vae", help="decoder, as fid_eval.py")
+    p.add_argument("--klein", default=REPO, help="klein base repo id or a local download of it")
     p.add_argument("--cfg", type=float, default=4.0, help="klein base's recommended guidance")
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--samples", type=int, default=4096, help="FD prompts (0 = skip FD)")
@@ -68,14 +69,14 @@ def main():
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
     torch.cuda.set_device(device)
     os.makedirs(a.out_dir, exist_ok=True)
-    teacher = KleinTeacher(device)
+    teacher = KleinTeacher(device, a.klein)
     null = teacher.encode([""])
     enc = REPATarget(a.vae, "vit_base_patch14_reg4_dinov2.lvd142m", device)
 
     if a.check and rank == 0:
         from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
-        pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(REPO, subfolder="scheduler"),
-                                  vae=AutoencoderKLFlux2.from_pretrained(REPO, subfolder="vae").to(device),
+        pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(a.klein, subfolder="scheduler"),
+                                  vae=AutoencoderKLFlux2.from_pretrained(a.klein, subfolder="vae").to(device),
                                   text_encoder=teacher.te, tokenizer=teacher.tok, transformer=teacher.transformer)
         g = torch.Generator(device=device).manual_seed(123)
         noise = torch.randn(2, 128, 16, 16, device=device, generator=g)
