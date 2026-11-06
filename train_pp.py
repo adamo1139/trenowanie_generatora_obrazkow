@@ -68,10 +68,11 @@ def get_args():
                    help="frozen LM text encoder only on stage 0, run inside its pipeline forward (classic PP; pair with "
                         "--te-cost ~2 so stage 0 gets fewer blocks). Default: the LM runs on every stage for 1/pp of "
                         "the micro-batches before each step and its states are sent to stage 0")
-    p.add_argument("--lm-rank", action="store_true",
-                   help="the LAST rank only runs the frozen transformers LM (Poziomka) for all the others, which hold no "
-                        "LM at all: each pipeline's stage 0 sends the next step's captions while it trains the current "
-                        "one and gets their LM states back (world = 1 + pipelines x pp, e.g. 8 GPUs = 7 x pp 1)")
+    p.add_argument("--lm-rank", type=int, nargs="?", const=1, default=0,
+                   help="the LAST N ranks (default 1) only run the frozen transformers LM (Poziomka) for all the others, "
+                        "which hold no LM at all: each pipeline's stage 0 sends the next step's captions while it trains "
+                        "the current one and gets their LM states back; pipeline r uses LM rank r mod N "
+                        "(world = N + pipelines x pp, e.g. 8 GPUs = 1 + 7 x pp 1 or 2 + 6 x pp 1)")
     p.add_argument("--lm-split", action="store_true",
                    help="frozen transformers LM (Poziomka) split by layers over the pipeline's stages: each GPU holds "
                         "1/pp of it, the hidden states go stage 0 -> 1 -> ... -> back to stage 0 (chunks of ~32 "
@@ -309,7 +310,7 @@ def lm_server(te_cfg, clients, device, log):
             win_n += len(ids)
             if time.time() - win_t > 60:
                 dt = time.time() - win_t
-                log(f"LM server: busy {100 * busy / dt:.0f}% over the last {dt:.0f} s, {win_n / dt:.0f} captions/s",
+                log(f"LM server (rank {dist.get_rank()}): busy {100 * busy / dt:.0f}% over the last {dt:.0f} s, {win_n / dt:.0f} captions/s",
                     flush=True)
                 busy, win_t, win_n = 0.0, time.time(), 0
     log(f"LM server: {served:,} captions in {time.time() - t0:.0f} s, done", flush=True)
@@ -371,8 +372,8 @@ def main():
     dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
-    world = world_all - 1 if args.lm_rank else world_all  # training ranks; with --lm-rank the last one serves the LM
-    lm_server_rank = world if args.lm_rank else None
+    world = world_all - args.lm_rank  # training ranks; with --lm-rank N the last N serve the LM
+    lm_servers = list(range(world, world_all))
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
@@ -427,8 +428,9 @@ def main():
     if args.lm_rank:
         assert getattr(te_cfg, "backend", "") == "hf" and not args.lm_split and not args.lm_stage0, \
             "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
-        if rank == lm_server_rank:
-            lm_server(te_cfg, [r * pp for r in range(replicas)], device, print)
+        if rank >= world:
+            k = rank - world
+            lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print)
             dist.destroy_process_group()
             return
     assert M >= pp, f"need at least {pp} micro-batches"
@@ -659,7 +661,8 @@ def main():
             val_lm = [h.cpu() for h in got]
             log(f"--lm-split: LM layers {lm_lo}-{lm_hi - 1} of {n_lm} on this stage; held-out LM states for "
                 f"{len(ids_val)} captions precomputed")
-    lm_client = LMClient(lm_server_rank, te_cfg.lm_dim, device) if args.lm_rank and first else None
+    lm_client = (LMClient(lm_servers[replica % args.lm_rank], te_cfg.lm_dim, device) if args.lm_rank and first
+                 else None)
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
         h = lm_client.request(ids_val)
@@ -670,7 +673,7 @@ def main():
             w = trim_ids(ids_val[i:i + ch]).shape[1]
             val_lm.append(full[i:i + ch, :w].cpu())
         del full, h
-        log(f"--lm-rank: LM on rank {lm_server_rank}; held-out LM states for {len(ids_val)} captions precomputed")
+        log(f"--lm-rank: LM on ranks {lm_servers}; held-out LM states for {len(ids_val)} captions precomputed")
 
     # FLOPs per sample (fwd + bwd), analytic: matmuls 6 N T, attention 12 L d T (T + T_text), frozen LM forward 2 N T
     T, Tt = den_cfg.latent_size ** 2, getattr(te_cfg, "max_tokens", 64)
