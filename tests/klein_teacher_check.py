@@ -80,7 +80,7 @@ def main():
                                   text_encoder=teacher.te, tokenizer=teacher.tok, transformer=teacher.transformer)
         g = torch.Generator(device=device).manual_seed(123)
         noise = torch.randn(2, 128, 16, 16, device=device, generator=g)
-        ref = pipe(PROMPTS[:2], height=256, width=256, latents=noise.to(torch.bfloat16), num_inference_steps=a.steps,
+        ref = pipe(prompt=PROMPTS[:2], height=256, width=256, latents=noise.to(torch.bfloat16), num_inference_steps=a.steps,
                    guidance_scale=a.cfg, output_type="latent").images.float()  # denormalised, unpatchified
         ours = teacher.sample(teacher.encode(PROMPTS[:2]), null, noise, a.steps, a.cfg)
         ours = unpatchify_flux2(ours * enc.std + enc.mean)
