@@ -753,8 +753,8 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
             output_type: "pil", "np", "pt" (tensor in [0,1]) or "latent" (raw model latents).
             resolution: square output size in pixels, a multiple of 16 (default: the trained one, 256). Other sizes
                 were not trained (any of them may come out poorly).
-            time_shift: t -> s t / (1 + (s - 1) t) on the time grid (more steps at high noise); default: the side
-                relative to the trained one (SD3's sqrt(tokens) rule), 1 at the trained resolution.
+            time_shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise); default 1
+                (none), as the released models were trained.
         """
         base = [prompt] if isinstance(prompt, str) else list(prompt)
         prompts = [p for p in base for _ in range(num_images_per_prompt)]
@@ -774,7 +774,7 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         side = tcfg.latent_size if resolution is None else int(resolution) // 16
         if side < 1 or (resolution is not None and int(resolution) % 16):
             raise ValueError("resolution must be a positive multiple of 16")
-        shift = side / tcfg.latent_size if time_shift is None else float(time_shift)
+        shift = 1.0 if time_shift is None else float(time_shift)
         shape = (b, tcfg.latent_channels, side, side)
         if latents is None:
             z = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)

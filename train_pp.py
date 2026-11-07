@@ -89,10 +89,9 @@ def get_args():
                         "built for the grid), checkpoints record the grid")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
-    p.add_argument("--t-shift", type=float, default=None,
-                   help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn): more steps at high noise "
-                        "for more tokens. Default sqrt(tokens / 256) (SD3's resolution rule): 1 at 256 px, 0.5 at 128, "
-                        "2 at 512, 4 at 1024")
+    p.add_argument("--t-shift", type=float, default=1.0,
+                   help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn); 1 = none. SD3's "
+                        "resolution rule would be sqrt(tokens / 256): 0.25 at 64 px, 0.5 at 128, 2 at 512, 4 at 1024")
     p.add_argument("--opd", action="store_true",
                    help="on-policy distillation from FLUX.2 klein base (DiffusionOPD, arXiv:2605.15055) instead of flow "
                         "matching on the data, --pp 1 only: each step the student samples its own Euler trajectories "
@@ -661,8 +660,6 @@ def main():
     assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
     den_cfg = replace(den_cfg, latent_size=args.res // 16)
     lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
-    if args.t_shift is None:
-        args.t_shift = (den_cfg.latent_size ** 2 / 256) ** 0.5
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
     resuming = os.path.exists(os.path.join(args.out, "latest.pt"))
