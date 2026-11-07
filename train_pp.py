@@ -125,7 +125,7 @@ def get_args():
     p.add_argument("--te-checkpoint", action="store_true",
                    help="activation checkpointing of the text encoder's refiner blocks (stage 0): stage 0 holds the most "
                         "micro-batches in flight under 1F1B; PP=1 trims text using --text-bucket")
-    p.add_argument("--text-bucket", type=int, choices=[0, 64, 128, 256], default=64,
+    p.add_argument("--text-bucket", type=int, choices=[0, 16, 32, 64, 128, 256], default=64,
                    help="PP=1 HF text widths rounded to this bucket (default 64; 0 disables trimming). "
                         "With static compilation each new width needs its own forward/backward warmup; "
                         "benchmark only after all encountered widths have compiled.")
@@ -1173,7 +1173,8 @@ def main():
             mine = {}
             ks = [k for k in range(M) if k % pp == s]
             if hf_lm and pp == 1:  # the whole batch in one packed LM call (hf_states_packed cuts it to ~8k tokens)
-                h = lm_fn(cond_ids)
+                with profile.phase("lm_local"):
+                    h = lm_fn(cond_ids)
                 mine = {k: h[k * mb:(k + 1) * mb] for k in range(M)}
             elif hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
                 per = max(1, 32 // mb)
