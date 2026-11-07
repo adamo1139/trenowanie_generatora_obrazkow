@@ -732,7 +732,10 @@ def main():
         te.checkpoint_blocks = args.te_checkpoint
     # the frozen LM (no gradients) runs on every stage: micro-batch k on stage k % pp, hidden states sent to stage 0;
     # stage 0 keeps only the trainable refiner
-    lm_offload = isinstance(te_cfg, LMEncoderConfig) and pp > 1 and not args.lm_stage0 and not args.lm_rank
+    # pp = 1 with a transformers LM too: computed before the step (eager, packed: aurora.slayer.hf_states_packed),
+    # outside the compiled refiner, which keeps the LM out of its graph
+    lm_offload = isinstance(te_cfg, LMEncoderConfig) and not args.lm_stage0 and not args.lm_rank and (
+        pp > 1 or getattr(te_cfg, "backend", "") == "hf")
     lm_enc = te
     if lm_offload and not first:
         from aurora.slayer import LMTextEncoder
@@ -1169,7 +1172,10 @@ def main():
         elif lm_offload:
             mine = {}
             ks = [k for k in range(M) if k % pp == s]
-            if hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
+            if hf_lm and pp == 1:  # the whole batch in one packed LM call (hf_states_packed cuts it to ~8k tokens)
+                h = lm_fn(cond_ids)
+                mine = {k: h[k * mb:(k + 1) * mb] for k in range(M)}
+            elif hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
                 per = max(1, 32 // mb)
                 for i in range(0, len(ks), per):
                     group = ks[i:i + per]

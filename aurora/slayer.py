@@ -212,6 +212,8 @@ class LMTextEncoder(nn.Module):
         # pads / null marker -> any real id; attention is causal and padding is on the right, so real tokens never
         # see them, and their positions are masked out downstream
         if getattr(self.config, "backend", "slayer") == "hf":
+            if ids.is_cuda and not torch.compiler.is_compiling():  # eager caller (train_pp.py computes these first)
+                return hf_states_packed(self.lm, ids)
             return _hf_states(self.lm, ids)
         ids = ids.masked_fill(ids.eq(LM_PAD) | ids.eq(LM_NULL), 0)
         return self.lm.hidden(ids, self.n_blocks)
@@ -401,3 +403,28 @@ def hf_lm_packed(lm, seqs, device):
                 layer.attention._packed = None
         x = m.norm(x)
     return x[0]
+
+
+@torch.no_grad()
+def hf_states_packed(lm, ids, max_tokens: int = 8192):
+    """_hf_states via hf_lm_packed: the batch's real captions back to back without padding (varlen attention; norms,
+    router, shared expert and attention compiled on first use), up to max_tokens per LM call, scattered back into
+    (B, T, H) with zeros at pads and null-prompt rows. Same states as _hf_states up to bf16 / routing noise."""
+    enable_packed(lm, compile=True)
+    B, T = ids.shape
+    ids_c = ids.cpu()
+    keep = ids_c.ne(LM_PAD) & ids_c[:, :1].ne(LM_NULL)  # real tokens of real (non-null) rows
+    seqs = [ids_c[r][keep[r]] for r in range(B) if keep[r].any()]
+    H = lm.config.hidden_size
+    out = torch.zeros(B * T, H, device=ids.device, dtype=torch.bfloat16)
+    if seqs:
+        flat, pack, n = [], [], 0
+        for sq in seqs + [None]:
+            if sq is None or (pack and n + len(sq) > max_tokens):
+                flat.append(hf_lm_packed(lm, pack, ids.device))
+                pack, n = [], 0
+            if sq is not None:
+                pack.append(sq)
+                n += len(sq)
+        out.index_copy_(0, keep.flatten().nonzero().flatten().to(ids.device), torch.cat(flat).to(out.dtype))
+    return out.view(B, T, H)
