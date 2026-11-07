@@ -16,23 +16,31 @@ def main():
     p.add_argument("--depth", type=int, default=10, help="innermost Python frames to show")
     p.add_argument("--top", type=int, default=8)
     a = p.parse_args()
+    print(f"reading {a.trace} ...", flush=True)
     events = json.load(open(a.trace))["traceEvents"]
-    py, ops = {}, []
+    per_tid = {}  # tid -> [(start, -end, kind, name)]: frames before the ops they enclose at the same start
+    n_ops = 0
     for e in events:
         if e.get("ph") != "X":
             continue
         if e.get("cat") == "python_function":
-            py.setdefault(e["tid"], []).append((e["ts"], e["ts"] + e["dur"], e["name"]))
+            per_tid.setdefault(e["tid"], []).append((e["ts"], -(e["ts"] + e["dur"]), 0, e["name"]))
         elif e.get("name") == a.op:
-            ops.append(e)
-    for frames in py.values():
-        frames.sort()
+            per_tid.setdefault(e["tid"], []).append((e["ts"], -(e["ts"] + e["dur"]), 1, e["name"]))
+            n_ops += 1
+    del events
     paths = Counter()
-    for op in ops:
-        t = op["ts"]
-        enclosing = [f for f in py.get(op["tid"], []) if f[0] <= t <= f[1]]
-        enclosing.sort(key=lambda f: f[1] - f[0])  # innermost first
-        paths[tuple(f[2] for f in enclosing[: a.depth])] += 1
+    for items in per_tid.values():  # one sweep per thread: a stack of the Python frames still open
+        items.sort()
+        stack = []
+        for start, neg_end, kind, name in items:
+            while stack and stack[-1][0] < start:
+                stack.pop()
+            if kind == 0:
+                stack.append((-neg_end, name))
+            else:
+                paths[tuple(f[1] for f in reversed(stack[-a.depth:]))] += 1
+    ops = range(n_ops)
     print(f"{len(ops)} x {a.op}")
     for path, n in paths.most_common(a.top):
         print(f"\n{n} calls:")
