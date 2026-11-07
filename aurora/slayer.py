@@ -414,7 +414,9 @@ def hf_states_packed(lm, ids, max_tokens: int = 8192):
     B, T = ids.shape
     ids_c = ids.cpu()
     keep = ids_c.ne(LM_PAD) & ids_c[:, :1].ne(LM_NULL)  # real tokens of real (non-null) rows
-    seqs = [ids_c[r][keep[r]] for r in range(B) if keep[r].any()]
+    lens = keep.sum(1)
+    flat_ids = ids_c[keep]  # real tokens of all rows, row-major
+    seqs = [s_ for s_ in flat_ids.split(lens.tolist()) if len(s_)]
     H = lm.config.hidden_size
     out = torch.zeros(B * T, H, device=ids.device, dtype=torch.bfloat16)
     if seqs:

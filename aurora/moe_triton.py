@@ -56,6 +56,12 @@ def _grouped_kernel(a_ptr, w_ptr, y_ptr, block_e_ptr, block_row_ptr, row_end_ptr
     tl.store(y_ptrs, acc.to(y_ptr.dtype.element_ty), mask=row_ok[:, None] & (rn[None, :] < N))
 
 
+def m_bucket(M: int, E: int) -> int:
+    """Autotune key for the rows per expert: a power of two in [16, 1024]. Every new key benchmarks all configs (with
+    an L2 flush per run), so packed LM calls, whose token counts vary call by call, must not keep hitting new ones."""
+    return min(1024, max(16, triton.next_power_of_2(max(1, M // E))))
+
+
 def grouped_mm(a: torch.Tensor, w: torch.Tensor, counts: torch.Tensor, sched=None, a_idx=None, y_idx=None,
                scale=None, w_scale=None) -> torch.Tensor:
     """a (M, K) sorted by expert, w (E, K, N) contiguous, counts (E,) rows per expert (sum = M) -> (M, N).
@@ -76,7 +82,7 @@ def grouped_mm(a: torch.Tensor, w: torch.Tensor, counts: torch.Tensor, sched=Non
     dummy = block_e
     _grouped_kernel[grid](a, w, y, block_e, block_row, row_end,
                           dummy if a_idx is None else a_idx, dummy if y_idx is None else y_idx,
-                          dummy if scale is None else scale, dummy if w_scale is None else w_scale, N, K, triton.next_power_of_2(max(1, M // E)),
+                          dummy if scale is None else scale, dummy if w_scale is None else w_scale, N, K, m_bucket(M, E),
                           a.stride(0), w.stride(0), w.stride(1), y.stride(0),
                           GATHER_A=a_idx is not None, SCATTER_Y=y_idx is not None, SCALE=scale is not None,
                           W_INT8=w_scale is not None,
