@@ -34,8 +34,12 @@ def export_profile(prof, prefix, metadata=None):
     tables = averages.table(sort_by='self_device_time_total' if kernels else 'self_cpu_time_total', row_limit=50)
     Path(str(prefix) + '.txt').write_text(tables)
     if os.environ.get("PROFILE_STACK") == "1":  # where the top device-time operators are called from
-        stacks = prof.key_averages(group_by_stack_n=8).table(sort_by='self_device_time_total', row_limit=40)
-        Path(str(prefix) + '.stack.txt').write_text(stacks)
+        groups = sorted(prof.key_averages(group_by_stack_n=12), key=lambda e: e.self_device_time_total, reverse=True)
+        lines = []
+        for e in groups[:40]:
+            lines.append(f"{e.self_device_time_total / 1e3:10.1f} ms  x{e.count:<6d} {e.key}")
+            lines += [f"              {frame}" for frame in e.stack] or ["              (no Python stack)"]
+        Path(str(prefix) + '.stack.txt').write_text("\n".join(lines) + "\n")
     print(f'profile -> {prefix}.trace.json / .json / .txt', flush=True)
 
 
