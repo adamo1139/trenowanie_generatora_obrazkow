@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 import torch
@@ -39,11 +39,13 @@ def tokenize(texts, te_cfg):
     return torch.from_numpy(rows)
 
 
-def load(src, raw=False):
+def load(src, raw=False, res=None):
     """(te, den, info) from a .pt checkpoint, or an exported dir / Hub repo (text_encoder/, transformer/)."""
     if src.endswith(".pt"):
         ck = torch.load(src, map_location="cpu", weights_only=False, mmap=True)
         den_cfg, te_cfg = configs_from_ckpt(ck)
+        if res:  # the weights are resolution-free: build the denoiser (RoPE) for this grid
+            den_cfg = replace(den_cfg, latent_size=res // 16)
         assert getattr(te_cfg, "kind", "") == "lm", "for the released text encoders use sample.py on an export"
         te, den = build_models(den_cfg, te_cfg)
         te.load_state_dict(ck["te"]), den.load_state_dict(ck["den"])
@@ -76,12 +78,15 @@ def main():
     p.add_argument("--vae", default=None, help="FLUX.2 decoder dir (default: the model's vae/, else "
                    "AuroraIMG2-50M-Preview/vae)")
     p.add_argument("--prompt", nargs="+", default=None, help="your own prompts (any language) instead of the grids")
+    p.add_argument("--res", type=int, default=None,
+                   help="sample at this square resolution (multiple of 16) instead of the checkpoint's; grids get a "
+                        "_<res>px suffix")
     p.add_argument("--export", action="store_true", help="also write text_encoder / transformer safetensors + configs")
     a = p.parse_args()
     device = torch.device("cuda")
     os.makedirs(a.out_dir, exist_ok=True)
 
-    te, den, info = load(a.ckpt, a.raw)
+    te, den, info = load(a.ckpt, a.raw, a.res)
     te_cfg, den_cfg = te.config, den.config
     src = info["weights"]
     print(f"{a.ckpt}: step {info['step']}, {src} weights, text encoder {te_cfg.repo} "
@@ -109,7 +114,7 @@ def main():
             grid = Image.new("RGB", (4 * w, 2 * h))
             for i, im in enumerate(imgs):
                 grid.paste(Image.fromarray(im), ((i % 4) * w, (i // 4) * h))
-            path = os.path.join(a.out_dir, f"grid_{lang}.png")
+            path = os.path.join(a.out_dir, f"grid_{lang}{f'_{a.res}px' if a.res else ''}.png")
             grid.save(path)
             print(f"saved {path}")
 
