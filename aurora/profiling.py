@@ -1,5 +1,6 @@
 """Opt-in training traces. No CUDA events, synchronisation or profiler scopes when disabled."""
 import json
+import os
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,6 +33,9 @@ def export_profile(prof, prefix, metadata=None):
     Path(str(prefix) + '.json').write_text(json.dumps(payload, indent=2))
     tables = averages.table(sort_by='self_device_time_total' if kernels else 'self_cpu_time_total', row_limit=50)
     Path(str(prefix) + '.txt').write_text(tables)
+    if os.environ.get("PROFILE_STACK") == "1":  # where the top device-time operators are called from
+        stacks = prof.key_averages(group_by_stack_n=8).table(sort_by='self_device_time_total', row_limit=40)
+        Path(str(prefix) + '.stack.txt').write_text(stacks)
     print(f'profile -> {prefix}.trace.json / .json / .txt', flush=True)
 
 
@@ -53,7 +57,8 @@ class TrainingProfile:
             if self.cuda:
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             self.prof = torch.profiler.profile(activities=activities, record_shapes=True,
-                                               profile_memory=False, with_stack=False)
+                                               profile_memory=False,
+                                               with_stack=os.environ.get("PROFILE_STACK") == "1")
             self.prof.start()
             self.active = True
             print(f'profile rank {self.rank}: capturing steps {step}..{step + self.steps - 1}; '
