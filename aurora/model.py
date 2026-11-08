@@ -124,12 +124,14 @@ class SelfAttention(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.logit_mult = 1.0  # sampling only: multiplies the attention logits (e.g. sqrt(log n / log n_train))
 
     def forward(self, x, cos, sin):
         b, t, c = x.shape
         q, k, v = self.qkv(x).view(b, t, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
         q, k = apply_rope(self.q_norm(q), cos, sin), apply_rope(self.k_norm(k), cos, sin)
-        h = F.scaled_dot_product_attention(q, k, v)
+        h = F.scaled_dot_product_attention(
+            q, k, v, scale=None if self.logit_mult == 1.0 else self.logit_mult / self.head_dim ** 0.5)
         return self.out(h.transpose(1, 2).reshape(b, t, c))
 
 

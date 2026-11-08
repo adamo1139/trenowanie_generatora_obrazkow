@@ -86,6 +86,9 @@ def main():
     p.add_argument("--rope-ref", type=int, default=None,
                    help="override the RoPE position field (aurora.model.build_rope_2d ref), e.g. the trained grid side "
                         "to sample another resolution with the trained spatial scale; grids get a _rope<ref> suffix")
+    p.add_argument("--attn-scale", type=float, default=1.0,
+                   help="multiply the image self-attention logits (sharper attention when sampling more tokens than "
+                        "trained, e.g. sqrt(ln n / ln n_train): 96 -> 256 px 1.244); grids get an _as<x> suffix")
     p.add_argument("--export", action="store_true", help="also write text_encoder / transformer safetensors + configs")
     a = p.parse_args()
     device = torch.device("cuda")
@@ -97,6 +100,9 @@ def main():
     print(f"{a.ckpt}: step {info['step']}, {src} weights, text encoder {te_cfg.repo} "
           f"({te_cfg.experts or 'all'} experts{', ' + te_cfg.quant if te_cfg.quant else ''})")
     te.to(device).eval(), den.to(device).eval()
+    for m in den.modules():
+        if hasattr(m, "logit_mult"):
+            m.logit_mult = a.attn_scale
     if a.vae is None:
         own = info["root"] and os.path.join(info["root"], "vae")
         a.vae = own if own and os.path.isdir(own) else "AuroraIMG2-50M-Preview/vae"
@@ -119,7 +125,7 @@ def main():
             grid = Image.new("RGB", (4 * w, 2 * h))
             for i, im in enumerate(imgs):
                 grid.paste(Image.fromarray(im), ((i % 4) * w, (i // 4) * h))
-            path = os.path.join(a.out_dir, f"grid_{lang}{f'_{a.res}px' if a.res else ''}{f'_rope{a.rope_ref}' if a.rope_ref is not None else ''}.png")
+            path = os.path.join(a.out_dir, f"grid_{lang}{f'_{a.res}px' if a.res else ''}{f'_rope{a.rope_ref}' if a.rope_ref is not None else ''}{f'_as{a.attn_scale:g}' if a.attn_scale != 1.0 else ''}.png")
             grid.save(path)
             print(f"saved {path}")
 
