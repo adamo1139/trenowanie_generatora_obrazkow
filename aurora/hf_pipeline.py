@@ -617,8 +617,9 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         self.register_buffer("rope_sin", sin, persistent=False)
 
     def _rope(self, side: int, device):
-        """2D RoPE for a side x side latent grid (any size; the trained one is a registered buffer)."""
-        if side == self.config.latent_size:
+        """2D RoPE for a side x side latent grid (any size; the trained one is a registered buffer). Buffers already
+        of this grid's size win: the pipeline sets them for its call, e.g. with another rope_ref."""
+        if side == self.config.latent_size or self.rope_cos.shape[-2] == side * side:
             return self.rope_cos, self.rope_sin
         cache = self.__dict__.setdefault("_rope_cache", {})
         if side not in cache:

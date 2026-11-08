@@ -9,6 +9,7 @@
 import os
 import sys
 import tempfile
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -91,6 +92,16 @@ def check_pipeline(den):
             if type(m).__name__ == "SelfAttention":
                 m.logit_mult = 1.5
         assert not torch.allclose(hf(*x), den(*x), atol=1e-5), "attn_scale has no effect"
+        for m in hf.modules():
+            if type(m).__name__ == "SelfAttention":
+                m.logit_mult = 1.0
+        # another grid with another rope_ref, set on the buffers as the pipeline's __call__ does
+        side, ref = 2 * c.latent_size, 4
+        big = Denoiser(replace(c, latent_size=side, rope_ref=ref))
+        big.load_state_dict(den.state_dict())
+        hf.rope_cos, hf.rope_sin = build_rope_2d(side, c.dim // c.heads, ref)
+        xb = inputs(big.config)
+        assert torch.allclose(hf(*xb), big(*xb), atol=1e-5), "pipeline ignored its rope_ref override at another size"
     print("pipeline parity: ok")
 
 

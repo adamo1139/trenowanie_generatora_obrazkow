@@ -61,7 +61,12 @@ def load(src, raw=False, res=None, rope_ref=None):
     from safetensors.torch import load_file
     root = src if os.path.isdir(src) else snapshot_download(src)
     cfg = lambda sub: json.load(open(os.path.join(root, sub, "config.json")))
-    te, den = build_models(DenoiserConfig(**cfg("transformer")), LMEncoderConfig(**cfg("text_encoder")))
+    den_cfg = DenoiserConfig(**cfg("transformer"))
+    if res:
+        den_cfg = replace(den_cfg, latent_size=res // 16)
+    if rope_ref is not None:
+        den_cfg = replace(den_cfg, rope_ref=rope_ref)
+    te, den = build_models(den_cfg, LMEncoderConfig(**cfg("text_encoder")))
     for sub, mod in (("text_encoder", te), ("transformer", den)):
         mod.load_state_dict(load_file(os.path.join(root, sub, "diffusion_pytorch_model.safetensors")))
     info = json.load(open(os.path.join(root, "prompts.json"))) if os.path.exists(os.path.join(root, "prompts.json")) \
@@ -88,10 +93,13 @@ def main():
                         "to sample another resolution with the trained spatial scale; grids get a _rope<ref> suffix")
     p.add_argument("--attn-scale", type=float, default=1.0,
                    help="multiply the image self-attention logits (sharper attention when sampling more tokens than "
-                        "trained, e.g. sqrt(ln n / ln n_train): 96 -> 256 px 1.244); grids get an _as<x> suffix")
+                        "trained; RPE-2D eq. 7: ln n / ln n_train for n image tokens, e.g. 96 -> 256 px 1.547, "
+                        "128 -> 256 px 1.333); grids get an _as<x> suffix")
     p.add_argument("--t-shift", type=float, default=1.0,
                    help="time shift of the sampling grid (SD3; RPE-2D uses sqrt(n_tokens / n_trained_tokens) above "
                         "the trained resolution, e.g. 96 -> 256 px 2.67); grids get a _ts<x> suffix")
+    p.add_argument("--batch", type=int, default=64,
+                   help="prompts denoised (and decoded) at once; e.g. 2 for 1024 px on a 16 GB card")
     p.add_argument("--export", action="store_true", help="also write text_encoder / transformer safetensors + configs")
     a = p.parse_args()
     device = torch.device("cuda")
@@ -116,8 +124,9 @@ def main():
     with torch.no_grad():
         for lang, prompts in sets:
             z = fidlib.sample(te, den, tokenize(prompts, te_cfg), null_row, a.steps, a.cfg, a.seed, device,
-                              shift=a.t_shift)
-            imgs = ((vae.decode(z) + 1) / 2).clamp(0, 1)
+                              batch=a.batch, shift=a.t_shift)
+            imgs = torch.cat([((vae.decode(z[i:i + a.batch]) + 1) / 2).clamp(0, 1).cpu()
+                              for i in range(0, len(z), a.batch)])
             imgs = (imgs.permute(0, 2, 3, 1).float().cpu().numpy() * 255).round().astype(np.uint8)
             if a.prompt is not None:
                 for i, im in enumerate(imgs):
