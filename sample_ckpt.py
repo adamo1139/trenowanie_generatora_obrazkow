@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 import shutil
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 
 import numpy as np
 import torch
@@ -60,13 +60,15 @@ def load(src, raw=False, res=None, rope_ref=None):
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
     root = src if os.path.isdir(src) else snapshot_download(src)
-    cfg = lambda sub: json.load(open(os.path.join(root, sub, "config.json")))
-    den_cfg = DenoiserConfig(**cfg("transformer"))
+    def cfg(sub, cls):  # the exported configs also carry diffusers keys (_class_name, _diffusers_version, ...)
+        d = json.load(open(os.path.join(root, sub, "config.json")))
+        return cls(**{k: v for k, v in d.items() if k in {f.name for f in fields(cls)}})
+    den_cfg = cfg("transformer", DenoiserConfig)
     if res:
         den_cfg = replace(den_cfg, latent_size=res // 16)
     if rope_ref is not None:
         den_cfg = replace(den_cfg, rope_ref=rope_ref)
-    te, den = build_models(den_cfg, LMEncoderConfig(**cfg("text_encoder")))
+    te, den = build_models(den_cfg, cfg("text_encoder", LMEncoderConfig))
     for sub, mod in (("text_encoder", te), ("transformer", den)):
         mod.load_state_dict(load_file(os.path.join(root, sub, "diffusion_pytorch_model.safetensors")))
     info = json.load(open(os.path.join(root, "prompts.json"))) if os.path.exists(os.path.join(root, "prompts.json")) \
