@@ -153,6 +153,9 @@ def get_args():
     p.add_argument("--mem-snapshot", default="",
                    help="dir: record the CUDA allocator history and dump <dir>/rank<r>.pickle after step 2 or on OOM "
                         "(open in https://pytorch.org/memory_viz)")
+    p.add_argument("--resume-opt-mismatch", action="store_true",
+                   help="resume even if opt_stage*.pt is from another step than latest.pt (a save that died between "
+                        "the two, e.g. on a full disk): its moments are close to the right ones, better than fresh")
     p.add_argument("--bench", action="store_true",
                    help="throughput test: no checkpoints, no merge files, no evaluation (nothing is written to --out)")
     p.add_argument("--profile-dir", default="", help="write opt-in CPU/CUDA traces here (also under --bench)")
@@ -887,8 +890,13 @@ def main():
             and len(os_ck["opts"]) == len(opts) and all(
                 [len(g["params"]) for g in st["param_groups"]] == [len(g["params"]) for g in o.param_groups]
                 for o, st in zip(opts, os_ck["opts"]))
+        if same and os_ck["step"] != ck["step"]:
+            assert args.resume_opt_mismatch, (
+                f"{opt_path} is from step {os_ck['step']}, latest.pt from {ck['step']} (an interrupted save); "
+                f"--resume-opt-mismatch uses it anyway")
+            print(f"rank {rank}: WARNING {opt_path} is from step {os_ck['step']}, latest.pt from {ck['step']}; "
+                  f"using it (--resume-opt-mismatch)", flush=True)
         if same:
-            assert os_ck["step"] == ck["step"], f"{opt_path} is from step {os_ck['step']}, latest.pt from {ck['step']}"
             for o, st in zip(opts, os_ck["opts"]):
                 load_opt_state(o, st)
             if repa_proj is not None and os_ck.get("repa_proj"):
@@ -1077,16 +1085,20 @@ def main():
                 return
         if merge_only:
             return
-        if replica == 0:  # per-stage optimizer state first, then latest.pt (the step marker) on rank 0
+        # two phases: every file is written to .tmp first, and only when all of them are complete are they renamed,
+        # so a failed write (e.g. a full disk) leaves the previous optimizer states and latest.pt together
+        if replica == 0:  # per-stage optimizer state
             torch.save(dict(step=step, ranges=[list(r) for r in ranges], opts=[o.state_dict() for o in opts],
                             outer=outer_opt.state_dict() if outer_opt is not None else None,
                             repa_proj={k: v.cpu() for k, v in repa_proj.state_dict().items()} if repa_proj else None),
                        opt_path + ".tmp")
-            os.replace(opt_path + ".tmp", opt_path)
-        dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
-        if master:
+        if master:  # latest.pt (the step marker)
             ema_list = [emas[("te", n)] for n in te_names] + [emas[("den", n)] for n, _ in den.named_parameters()]
             torch.save(dict(meta, ema=ema_list, args=vars(args), opts=None), ckpt_path + ".tmp")
+        dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
+        if replica == 0:
+            os.replace(opt_path + ".tmp", opt_path)
+        if master:
             os.replace(ckpt_path + ".tmp", ckpt_path)
 
     @torch.no_grad()
