@@ -87,6 +87,10 @@ def get_args():
                    help="training resolution in pixels: latents of (res/16)^2 tokens, from <shard>.lat<res>.npy "
                         "(prepare_lowres.py) unless 256; the weights are resolution-free (per-token stem / head, RoPE "
                         "built for the grid), checkpoints record the grid")
+    p.add_argument("--rope-ref", type=int, default=0,
+                   help="RoPE position field (aurora.model.build_rope_2d): 0 = integer positions per grid (the grid grows "
+                        "with the resolution); 16 = every resolution's tokens spread over the 256 px field, so all "
+                        "curriculum stages share one spatial scale (identical to 0 at 256 px)")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
     p.add_argument("--t-shift", type=float, default=1.0,
@@ -194,7 +198,7 @@ class Stage(nn.Module):
         self.repa_proj, self.repa_block, self.repa_weight = repa_proj, repa_block, repa_weight
         # callables that run each block (plain, or wrapped in activation checkpointing); main() compiles these
         self.block_fns = [checkpointed(b, act_checkpoint) if act_checkpoint else b for b in self.blocks]
-        cos, sin = build_rope_2d(cfg.latent_size, cfg.dim // cfg.heads)
+        cos, sin = build_rope_2d(cfg.latent_size, cfg.dim // cfg.heads, cfg.rope_ref)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.repa_targets, self.repa_losses, self._mb = None, [], 0
@@ -658,7 +662,7 @@ def main():
     den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth,
                                    args.te_experts, args.te_quant)
     assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
-    den_cfg = replace(den_cfg, latent_size=args.res // 16)
+    den_cfg = replace(den_cfg, latent_size=args.res // 16, rope_ref=args.rope_ref)
     lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
@@ -674,7 +678,8 @@ def main():
         if keep_te:  # the refiner comes from the checkpoint; experts / quantisation of the frozen LM may change
             te_cfg = replace(init_te, experts=te_cfg.experts if args.te_experts else init_te.experts,
                              quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
-        assert asdict(replace(old, depth=den_cfg.depth, latent_size=den_cfg.latent_size)) == asdict(den_cfg), \
+        assert asdict(replace(old, depth=den_cfg.depth, latent_size=den_cfg.latent_size,
+                              rope_ref=den_cfg.rope_ref)) == asdict(den_cfg), \
             f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     if args.opd:
@@ -817,7 +822,8 @@ def main():
     step, outer_state = 0, None
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
-        assert ck["den_config"] == asdict(den_cfg), f"checkpoint was trained with {ck['den_config']}"
+        assert asdict(DenoiserConfig(**ck["den_config"])) == asdict(den_cfg), \
+            f"checkpoint was trained with {ck['den_config']}"
         assert asdict(te_config_from_dict(ck.get("te_config", {}))) == asdict(te_cfg), "different text encoder"
         with torch.no_grad():
             for n in den_names:
@@ -1043,7 +1049,7 @@ def main():
             den_eval = Denoiser(den_cfg)
         den_eval.to_empty(device=device)
         den_eval.load_state_dict({n: emas[("den", n)] for n, _ in den_eval.named_parameters()})
-        cos, sin = build_rope_2d(den_cfg.latent_size, den_cfg.dim // den_cfg.heads)
+        cos, sin = build_rope_2d(den_cfg.latent_size, den_cfg.dim // den_cfg.heads, den_cfg.rope_ref)
         den_eval.rope_cos, den_eval.rope_sin = cos.to(device), sin.to(device)
         te_live = [p.detach().clone() for p in te.parameters()]
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])

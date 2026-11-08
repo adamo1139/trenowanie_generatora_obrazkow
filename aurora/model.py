@@ -50,9 +50,14 @@ def build_rope_1d(n: int, d: int):
     return ang.cos().repeat_interleave(2, dim=-1)[None, None], ang.sin().repeat_interleave(2, dim=-1)[None, None]
 
 
-def build_rope_2d(side: int, d: int):
-    """First half of the head dim encodes the row, second half the column. Tokens are row-major."""
-    coords = torch.arange(side)
+def build_rope_2d(side: int, d: int, ref: int = 0):
+    """First half of the head dim encodes the row, second half the column. Tokens are row-major.
+    ref = 0: positions 0 .. side-1 (one unit per token, the grid grows with the resolution). ref > 0: the side tokens
+    are spread over the same field as a ref x ref grid (centres (i + 0.5) ref / side - 0.5; at side == ref exactly
+    0 .. ref-1), so every resolution sees the same spatial scale (position interpolation)."""
+    coords = torch.arange(side).float()
+    if ref and ref != side:
+        coords = (coords + 0.5) * (ref / side) - 0.5
     rows, cols = torch.meshgrid(coords, coords, indexing="ij")
     ang = torch.cat([_angles(rows.reshape(-1), d // 2), _angles(cols.reshape(-1), d // 2)], dim=-1)
     return ang.cos().repeat_interleave(2, dim=-1)[None, None], ang.sin().repeat_interleave(2, dim=-1)[None, None]
@@ -231,6 +236,7 @@ class DenoiserConfig:
     mlp_hidden: int = 1536
     text_dim: int = 384
     latent_layout: str = "flux2_pipeline"
+    rope_ref: int = 0  # build_rope_2d's ref: 0 = integer positions per grid, 16 = every grid on the 256 px field
 
 
 class TextEncoder(nn.Module):
@@ -283,7 +289,7 @@ class Denoiser(nn.Module):
                                      for _ in range(cfg.depth)])
         self.norm = RMSNorm(dim)
         self.patch_out = nn.Linear(dim, cfg.latent_channels, bias=False)
-        cos, sin = build_rope_2d(cfg.latent_size, dim // cfg.heads)
+        cos, sin = build_rope_2d(cfg.latent_size, dim // cfg.heads, cfg.rope_ref)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 

@@ -62,9 +62,14 @@ def build_rope_1d(n: int, d: int):
     return ang.cos().repeat_interleave(2, dim=-1)[None, None], ang.sin().repeat_interleave(2, dim=-1)[None, None]
 
 
-def build_rope_2d(side: int, d: int):
-    """First half of the head dim encodes the row, second half the column. Tokens are row-major."""
-    coords = torch.arange(side)
+def build_rope_2d(side: int, d: int, ref: int = 0):
+    """First half of the head dim encodes the row, second half the column. Tokens are row-major.
+    ref = 0: positions 0 .. side-1 (one unit per token, the grid grows with the resolution). ref > 0: the side tokens
+    are spread over the same field as a ref x ref grid (centres (i + 0.5) ref / side - 0.5; at side == ref exactly
+    0 .. ref-1), so every resolution sees the same spatial scale (position interpolation)."""
+    coords = torch.arange(side).float()
+    if ref and ref != side:
+        coords = (coords + 0.5) * (ref / side) - 0.5
     rows, cols = torch.meshgrid(coords, coords, indexing="ij")
     ang = torch.cat([_angles(rows.reshape(-1), d // 2), _angles(cols.reshape(-1), d // 2)], dim=-1)
     return ang.cos().repeat_interleave(2, dim=-1)[None, None], ang.sin().repeat_interleave(2, dim=-1)[None, None]
@@ -579,6 +584,7 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         mlp_hidden: int = 1536,
         text_dim: int = 384,
         latent_layout: str = "flux2_pipeline",
+        rope_ref: int = 0,
     ):
         super().__init__()
         self.patch_in = nn.Linear(latent_channels, dim, bias=False)
@@ -587,7 +593,7 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([DenoiserBlock(dim, heads, text_dim, mlp_hidden) for _ in range(depth)])
         self.norm = RMSNorm(dim)
         self.patch_out = nn.Linear(dim, latent_channels, bias=False)
-        cos, sin = build_rope_2d(latent_size, dim // heads)
+        cos, sin = build_rope_2d(latent_size, dim // heads, rope_ref)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
@@ -597,7 +603,7 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
             return self.rope_cos, self.rope_sin
         cache = self.__dict__.setdefault("_rope_cache", {})
         if side not in cache:
-            cos, sin = build_rope_2d(side, self.config.dim // self.config.heads)
+            cos, sin = build_rope_2d(side, self.config.dim // self.config.heads, self.config.get("rope_ref", 0))
             cache[side] = (cos.to(device), sin.to(device))
         return cache[side]
 
@@ -741,6 +747,7 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         return_dict: bool = True,
         resolution: Optional[int] = None,
         time_shift: Optional[float] = None,
+        rope_ref: Optional[int] = None,
     ):
         """
         Args:
@@ -755,6 +762,8 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
                 were not trained (any of them may come out poorly).
             time_shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise); default 1
                 (none), as the released models were trained.
+            rope_ref: override the model's RoPE position field (build_rope_2d's ref; 0 = integer positions), e.g.
+                the trained grid side to sample another resolution with the trained spatial scale.
         """
         base = [prompt] if isinstance(prompt, str) else list(prompt)
         prompts = [p for p in base for _ in range(num_images_per_prompt)]
@@ -787,8 +796,9 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         # copy of this file too, whose forward always uses its buffers)
         tr = self.transformer
         trained_rope = (tr.rope_cos, tr.rope_sin)
-        if side != tcfg.latent_size:
-            cos, sin = build_rope_2d(side, tcfg.dim // tcfg.heads)
+        ref = tcfg.get("rope_ref", 0) if rope_ref is None else int(rope_ref)
+        if side != tcfg.latent_size or ref != tcfg.get("rope_ref", 0):
+            cos, sin = build_rope_2d(side, tcfg.dim // tcfg.heads, ref)
             tr.rope_cos, tr.rope_sin = cos.to(tr.rope_cos), sin.to(tr.rope_sin)
         try:
             z = self._denoise(z, ts, b, do_cfg, guidance_scale, context, context_valid)
