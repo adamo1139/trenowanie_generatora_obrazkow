@@ -822,7 +822,10 @@ def main():
     step, outer_state = 0, None
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
-        assert asdict(DenoiserConfig(**ck["den_config"])) == asdict(den_cfg), \
+        ck_cfg = DenoiserConfig(**ck["den_config"])
+        if ck_cfg.rope_ref != den_cfg.rope_ref:  # a new RoPE position field (--rope-ref) for the rest of the run
+            log(f"resume: RoPE field changed from rope_ref {ck_cfg.rope_ref} to {den_cfg.rope_ref}")
+        assert asdict(replace(ck_cfg, rope_ref=den_cfg.rope_ref)) == asdict(den_cfg), \
             f"checkpoint was trained with {ck['den_config']}"
         assert asdict(te_config_from_dict(ck.get("te_config", {}))) == asdict(te_cfg), "different text encoder"
         with torch.no_grad():
