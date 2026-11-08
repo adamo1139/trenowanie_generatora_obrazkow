@@ -121,6 +121,15 @@ class Muon(torch.optim.Optimizer):
         self._ns = lambda X, steps: _ns_cuda(X, steps) if X.is_cuda and _ns_cuda is not None else ns_torch(X, steps)
         self._momentum = torch.compile(update_bf16_momentum) if compile_ns else update_bf16_momentum
 
+    def load_state_dict(self, state_dict):
+        """torch casts every floating state tensor to its parameter's dtype on load; keep the momentum in
+        momentum_dtype (e.g. bf16: an fp32 copy would cost as much memory again as the bf16 one)."""
+        super().load_state_dict(state_dict)
+        if self.momentum_dtype is not None:
+            for st in self.state.values():
+                if "momentum_buffer" in st:
+                    st["momentum_buffer"] = st["momentum_buffer"].to(self.momentum_dtype)
+
     @torch.no_grad()
     def step(self):
         refresh = self._t % self.period == 0  # Newton-Schulz step (always, unless periodic row-wise is on)
