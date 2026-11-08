@@ -841,7 +841,9 @@ def main():
                     e.copy_(lookup[key])
         # the weights in latest.pt are complete (any --pp works); optimizer state is per stage, so it is only reused
         # when the stage layout is the same as when it was saved
-        os_ck = torch.load(opt_path, map_location=device, weights_only=True) if os.path.exists(opt_path) else None
+        # on the CPU: load_state_dict copies each tensor to its parameter's device anyway, and a GPU copy held here
+        # would stay allocated for the whole run (~the optimizer's size)
+        os_ck = torch.load(opt_path, map_location="cpu", weights_only=True) if os.path.exists(opt_path) else None
         same = os_ck is not None and os_ck.get("ranges", [list(r) for r in ranges]) == [list(r) for r in ranges] \
             and len(os_ck["opts"]) == len(opts) and all(
                 [len(g["params"]) for g in st["param_groups"]] == [len(g["params"]) for g in o.param_groups]
@@ -858,7 +860,7 @@ def main():
                   f"optimizer state starts fresh", flush=True)
         step = ck["step"]
         log(f"resumed from {ckpt_path} at step {step}")
-        del ck
+        del ck, os_ck
 
     for module in stage_mod.modules():
         if isinstance(module, (CrossAttention, TextAttention)):
