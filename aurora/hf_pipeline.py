@@ -135,12 +135,14 @@ class SelfAttention(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.logit_mult = 1.0  # multiplies the attention logits (the pipeline's attn_scale)
 
     def forward(self, x, cos, sin):
         b, t, c = x.shape
         q, k, v = self.qkv(x).view(b, t, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
         q, k = apply_rope(self.q_norm(q), cos, sin), apply_rope(self.k_norm(k), cos, sin)
-        h = F.scaled_dot_product_attention(q, k, v)
+        h = F.scaled_dot_product_attention(
+            q, k, v, scale=None if self.logit_mult == 1.0 else self.logit_mult / self.head_dim ** 0.5)
         return self.out(h.transpose(1, 2).reshape(b, t, c))
 
 
@@ -192,6 +194,20 @@ def timestep_embedding(t: torch.Tensor, dim: int = 256) -> torch.Tensor:
     freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device).float() / max(half - 1, 1))
     angles = t[:, None] * freqs[None, :]
     return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+
+def micro_cond_embedding(cond: torch.Tensor, dim: int = 256) -> torch.Tensor:
+    """(B, 8) micro-conditions in pixels -> (B, 8 * dim) sinusoids (RPE-2D / SDXL size and crop conditioning)."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=cond.device).float() / half)
+    ang = cond.float()[:, :, None] * freqs
+    return torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(1)
+
+
+def default_micro_cond(base: int, res: int, b: int, device=None) -> torch.Tensor:
+    """A whole, uncropped image: original size max(base, res), crop = the whole original, target size res."""
+    o = max(base, res)
+    return torch.tensor([o, o, 0, 0, o, o, res, res], dtype=torch.float32, device=device).expand(b, 8)
 
 
 # =============================================================================
@@ -585,11 +601,14 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         text_dim: int = 384,
         latent_layout: str = "flux2_pipeline",
         rope_ref: int = 0,
+        micro_cond: int = 0,
     ):
         super().__init__()
         self.patch_in = nn.Linear(latent_channels, dim, bias=False)
         self.time_mlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.ada = nn.Linear(dim, 6 * dim)
+        if micro_cond:  # RPE-2D micro-conditioning (original size, crop box, target size), added to the time embedding
+            self.cond_mlp = nn.Sequential(nn.Linear(8 * 256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList([DenoiserBlock(dim, heads, text_dim, mlp_hidden) for _ in range(depth)])
         self.norm = RMSNorm(dim)
         self.patch_out = nn.Linear(dim, latent_channels, bias=False)
@@ -613,6 +632,9 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         dim = self.config.dim
         x = self.patch_in(z_t.flatten(2).transpose(1, 2))
         t_emb = self.time_mlp(timestep_embedding(t, 256))
+        if self.config.get("micro_cond", 0):  # sampling always asks for a whole image at the output size
+            cond = default_micro_cond(self.config.micro_cond, 16 * h, b, z_t.device)
+            t_emb = t_emb + self.cond_mlp(micro_cond_embedding(cond).to(t_emb.dtype))
         t6 = self.ada(F.silu(t_emb)).view(b, 6, dim)
         cos, sin = self._rope(h, z_t.device)
         for block in self.blocks:
@@ -748,6 +770,7 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         resolution: Optional[int] = None,
         time_shift: Optional[float] = None,
         rope_ref: Optional[int] = None,
+        attn_scale: float = 1.0,
     ):
         """
         Args:
@@ -764,6 +787,8 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
                 (none), as the released models were trained.
             rope_ref: override the model's RoPE position field (build_rope_2d's ref; 0 = integer positions), e.g.
                 the trained grid side to sample another resolution with the trained spatial scale.
+            attn_scale: multiplies the image self-attention logits, e.g. ln(n) / ln(n_trained) for n image tokens
+                above the trained grid (RPE-2D); default 1.
         """
         base = [prompt] if isinstance(prompt, str) else list(prompt)
         prompts = [p for p in base for _ in range(num_images_per_prompt)]
@@ -800,10 +825,15 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         if side != tcfg.latent_size or ref != tcfg.get("rope_ref", 0):
             cos, sin = build_rope_2d(side, tcfg.dim // tcfg.heads, ref)
             tr.rope_cos, tr.rope_sin = cos.to(tr.rope_cos), sin.to(tr.rope_sin)
+        attns = [m for m in tr.modules() if type(m).__name__ == "SelfAttention"]  # also a class from an older copy
+        for m in attns:
+            m.logit_mult = float(attn_scale)
         try:
             z = self._denoise(z, ts, b, do_cfg, guidance_scale, context, context_valid)
         finally:
             tr.rope_cos, tr.rope_sin = trained_rope
+            for m in attns:
+                m.logit_mult = 1.0
 
         if output_type == "latent":
             images = z

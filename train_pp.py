@@ -52,7 +52,8 @@ from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
 from aurora.data import ShardStore, TrainStream, load_val, select_shards
 from aurora.model import (CrossAttention, Denoiser, DenoiserConfig, LMEncoderConfig, TextAttention, TextEncoder,
-                          build_rope_2d, make_configs, te_config_from_dict, timestep_embedding)
+                          build_rope_2d, default_micro_cond, make_configs, micro_cond_embedding,
+                          random_rope_coords, rope_2d_from_coords, te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
 from aurora.profiling import TrainingProfile
 from aurora.slayer import LM_PAD, trim_ids
@@ -91,6 +92,19 @@ def get_args():
                    help="RoPE position field (aurora.model.build_rope_2d): 0 = integer positions per grid (the grid grows "
                         "with the resolution); 16 = every resolution's tokens spread over the 256 px field, so all "
                         "curriculum stages share one spatial scale (identical to 0 at 256 px)")
+    p.add_argument("--rope-random", action="store_true",
+                   help="RPE-2D (arXiv:2503.18719): every training sample gets random image token positions, per axis "
+                        "--res/16 distinct sorted integers of 0 .. --rope-ref - 1 (row x column grid), so every spacing "
+                        "a larger sampling grid uses has been trained; sampling keeps the even --rope-ref grid. pp = 1")
+    p.add_argument("--micro-cond", type=int, default=0,
+                   help="RPE-2D micro-conditioning: the original size in px of the training images (256); adds the "
+                        "denoiser's cond_mlp (zero output at the start) fed with original size, crop box and target "
+                        "size; needed by --crop-res. 0 = off")
+    p.add_argument("--crop-res", type=int, nargs="*", default=[],
+                   help="RPE-2D resize-and-crop: resolutions of larger latents of the same images to cut random "
+                        "--res windows from (256 = the shards' own .lat.npy; others from <--lat-dir parent>/<res>px), "
+                        "e.g. 256 at --res 128: half of the samples a 128 px crop of the 256 px image (--crop-prob)")
+    p.add_argument("--crop-prob", type=float, default=0.5, help="share of the training samples that are crops")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
     p.add_argument("--t-shift", type=float, default=1.0,
@@ -192,6 +206,8 @@ class Stage(nn.Module):
         self.cfg, self.first, self.last = cfg, first, last
         if first:
             self.te, self.patch_in, self.time_mlp, self.ada = te, den.patch_in, den.time_mlp, den.ada
+            if cfg.micro_cond:
+                self.cond_mlp = den.cond_mlp
         self.blocks = nn.ModuleList(den.blocks[lo:hi])
         if last:
             self.norm, self.patch_out = den.norm, den.patch_out
@@ -204,6 +220,9 @@ class Stage(nn.Module):
         self.repa_targets, self.repa_losses, self._mb = None, [], 0
         self.lm_states = None  # frozen-LM hidden states per micro-batch, computed on all stages (see main)
         self.text_cache = None  # (text, valid) to use instead of running the text encoder (--opd rollouts)
+        # per micro-batch (local_train_step): (B, 8) micro-conditions (None: whole images) and (cos, sin) of random
+        # RPE-2D positions (None: the even grid in the buffers)
+        self.mb_cond, self.mb_rope = None, None
 
     def forward(self, *args):
         if self.first:
@@ -216,14 +235,20 @@ class Stage(nn.Module):
                 text, valid = self.te(ids)
             validf = valid.to(text.dtype)
             x = self.patch_in(z.flatten(2).transpose(1, 2))
-            t6 = self.ada(F.silu(self.time_mlp(timestep_embedding(t, 256)))).view(z.shape[0], 6, self.cfg.dim)
+            t_emb = self.time_mlp(timestep_embedding(t, 256))
+            if self.cfg.micro_cond:
+                cond = self.mb_cond if self.mb_cond is not None else default_micro_cond(
+                    self.cfg.micro_cond, 16 * self.cfg.latent_size, z.shape[0], z.device)
+                t_emb = t_emb + self.cond_mlp(micro_cond_embedding(cond).to(t_emb.dtype))
+            t6 = self.ada(F.silu(t_emb)).view(z.shape[0], 6, self.cfg.dim)
         else:
             x, t6, text, validf = args
             # pipelining sends a gradient back for every stage input; the mask needs a (zero) one
             x = x + 0 * validf.sum()
         valid = validf > 0.5
+        cos, sin = self.mb_rope if self.mb_rope is not None else (self.rope_cos, self.rope_sin)
         for i, fn in enumerate(self.block_fns):
-            x = fn(x, t6, text, valid, self.rope_cos, self.rope_sin)
+            x = fn(x, t6, text, valid, cos, sin)
             if i == self.repa_block and self.repa_targets is not None and not x.is_meta \
                     and self._mb < len(self.repa_targets):
                 target = self.repa_targets[self._mb]
@@ -484,9 +509,11 @@ def text_widths(ids_cpu, microbatch, multiple=64):
     return [trim_ids(c, multiple=multiple).shape[1] for c in ids_cpu.split(microbatch)]
 
 
-def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, divide=True):
+def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, divide=True, cond=None,
+                     rope_field=0, rope_gen=None):
     """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch. divide=False:
-    leave the summed gradients (the caller divides once after several calls) and return the micro-batch count."""
+    leave the summed gradients (the caller divides once after several calls) and return the micro-batch count.
+    cond: (B, 8) micro-conditions; rope_field > 0: random RPE-2D positions of 0 .. rope_field - 1 (rope_gen)."""
     count = z.shape[0] // microbatch
     states = stage.lm_states
     try:
@@ -494,6 +521,10 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, 
             sl = slice(k * microbatch, (k + 1) * microbatch)
             width = widths[k] if widths is not None else ids.shape[1]
             stage._mb = k
+            stage.mb_cond = cond[sl] if cond is not None else None
+            if rope_field:
+                rows, cols = random_rope_coords(microbatch, z.shape[-1], rope_field, z.device, rope_gen)
+                stage.mb_rope = rope_2d_from_coords(rows, cols, stage.cfg.dim // stage.cfg.heads)
             if states is not None:
                 # Stage indexes this list by _mb; do not retain padded views after the step.
                 stage.lm_states = [None] * count
@@ -509,6 +540,7 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, 
             torch._foreach_div_(grads, count)
     finally:
         stage.lm_states = states
+        stage.mb_cond = stage.mb_rope = None
     return count
 
 
@@ -597,7 +629,7 @@ def owned_den_names(den, s, pp, ranges):
         if head == "blocks":
             if lo <= int(name.split(".")[1]) < hi:
                 out.append(name)
-        elif head in ("patch_in", "time_mlp", "ada"):
+        elif head in ("patch_in", "time_mlp", "ada", "cond_mlp"):
             if s == 0:
                 out.append(name)
         elif head in ("norm", "patch_out"):
@@ -662,7 +694,12 @@ def main():
     den_cfg, te_cfg = make_configs(args.size, args.te_size, args.te_dim, args.te_depth, args.depth,
                                    args.te_experts, args.te_quant)
     assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
-    den_cfg = replace(den_cfg, latent_size=args.res // 16, rope_ref=args.rope_ref)
+    den_cfg = replace(den_cfg, latent_size=args.res // 16, rope_ref=args.rope_ref, micro_cond=args.micro_cond)
+    assert not args.rope_random or (args.rope_ref >= args.res // 16 and pp == 1 and not args.opd), \
+        "--rope-random needs --rope-ref >= the grid side (the field to sample from), --pp 1, no --opd"
+    assert not args.crop_res or (args.micro_cond and pp == 1 and not args.opd), \
+        "--crop-res needs --micro-cond, --pp 1, no --opd"
+    assert all(r > args.res for r in args.crop_res), "--crop-res must be larger than --res"
     lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
@@ -679,7 +716,7 @@ def main():
             te_cfg = replace(init_te, experts=te_cfg.experts if args.te_experts else init_te.experts,
                              quant=te_cfg.quant if args.te_quant is not None else init_te.quant)
         assert asdict(replace(old, depth=den_cfg.depth, latent_size=den_cfg.latent_size,
-                              rope_ref=den_cfg.rope_ref)) == asdict(den_cfg), \
+                              rope_ref=den_cfg.rope_ref, micro_cond=den_cfg.micro_cond)) == asdict(den_cfg), \
             f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     if args.opd:
@@ -713,7 +750,7 @@ def main():
         den = Denoiser(den_cfg)
     owned = [den.blocks[i] for i in range(lo, hi)]
     if first:
-        owned += [den.patch_in, den.time_mlp, den.ada]
+        owned += [den.patch_in, den.time_mlp, den.ada] + ([den.cond_mlp] if den_cfg.micro_cond else [])
     if last:
         owned += [den.norm, den.patch_out]
     for mod in owned:
@@ -792,6 +829,8 @@ def main():
             for n in den_names:
                 parts = n.split(".")
                 if parts[0] == "blocks" and int(parts[1]) >= old_depth:
+                    continue
+                if parts[0] == "cond_mlp" and ("den", n) not in lookup:  # new micro-conditioning: no-op init
                     continue
                 den_params[n].copy_(lookup[("den", n)])
             for i in range(max(lo, old_depth), hi):  # appended blocks start as the identity (their gates are not 0:
@@ -924,8 +963,13 @@ def main():
     train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix)
     loader = store = None
     if needs_data:
+        crops = [("lat", "") if r == 256 else
+                 (f"lat{r}", os.path.join(os.path.dirname(args.lat_dir.rstrip("/")), f"{r}px")) for r in args.crop_res]
         store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None,
-                           alt_suffix, args.pl_prob, lat_kind, args.lat_dir)
+                           alt_suffix, args.pl_prob, lat_kind, args.lat_dir, crops, args.crop_prob, args.micro_cond)
+        if crops:
+            log(f"RPE-2D resize-and-crop: {100 * args.crop_prob:.0f}% of the samples {args.res} px windows of "
+                f"{', '.join(f'{r} px' for r in args.crop_res)} latents ({', '.join(k for k, _ in crops)})")
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
@@ -1072,6 +1116,9 @@ def main():
             f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
             f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift {args.t_shift:.2f}")
+    if args.rope_random or args.micro_cond:
+        log(f"RPE-2D: {'random positions of 0..' + str(args.rope_ref - 1) if args.rope_random else 'even positions'}"
+            f", micro-conditioning {'on (original ' + str(args.micro_cond) + ' px)' if args.micro_cond else 'off'}")
     log(f"lr: {args.schedule} after {warmup} warmup steps, Muon {args.lr_muon}, AdamW x{args.lr_scale:.2f}, "
         f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps%s' % (args.diloco, ' (plain averaging, no global copy)' if plain_avg else '') if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
@@ -1126,9 +1173,11 @@ def main():
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
         with profile.phase("data_loader"):
             got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
+            mcond = got[-1].to(device, non_blocking=True) if args.micro_cond else None
+            got = got[:-1] if args.micro_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
         x0 = lat.to(device, non_blocking=True).float()
@@ -1145,7 +1194,7 @@ def main():
         cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
         cond_cpu = (torch.where(drop_cpu[:, None], null_cpu, ids_cpu)
                     if hf_lm and null_row is not None else None)
-        return x0, ids, t, eps, cond, cond_cpu, rows
+        return x0, ids, t, eps, cond, cond_cpu, rows, mcond
 
     profile = TrainingProfile(args.profile_dir, rank, args.profile_ranks, args.profile_start, args.profile_steps,
                               device.type == "cuda", metadata={"args": vars(args), "den_config": asdict(den_cfg),
@@ -1159,7 +1208,7 @@ def main():
                 nb = next_batch(step)
                 with profile.phase("lm_request"):
                     pending = (nb, lm_client.request(nb[5]))
-            (x0, ids, t, eps, cond_ids, cond_cpu, rows), req = pending
+            (x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond), req = pending
             with profile.phase("lm_wait_collect"):
                 lm_full = lm_client.collect(req)
             del req
@@ -1169,7 +1218,7 @@ def main():
                 with profile.phase("lm_request"):
                     pending = (nb, lm_client.request(nb[5]))
         else:
-            x0, ids, t, eps, cond_ids, cond_cpu, rows = next_batch(step)
+            x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond = next_batch(step)
         stage_mod.lm_states = None
         if lm_client is not None:
             stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
@@ -1219,7 +1268,13 @@ def main():
                         elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)
-                            local_train_step(stage_mod, z_t, t, cond_ids, eps - x0, mb, losses, widths)
+                            rope_gen = None
+                            if args.rope_random:
+                                rope_gen = torch.Generator(device=device).manual_seed(
+                                    args.seed * 1_000_003 + replica * 1009 + step + 13)
+                            local_train_step(stage_mod, z_t, t, cond_ids, eps - x0, mb, losses, widths,
+                                             cond=mcond, rope_field=args.rope_ref if args.rope_random else 0,
+                                             rope_gen=rope_gen)
                         elif last:
                             sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses, return_outputs=False)
                         else:

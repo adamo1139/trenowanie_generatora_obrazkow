@@ -89,6 +89,9 @@ def main():
     p.add_argument("--attn-scale", type=float, default=1.0,
                    help="multiply the image self-attention logits (sharper attention when sampling more tokens than "
                         "trained, e.g. sqrt(ln n / ln n_train): 96 -> 256 px 1.244); grids get an _as<x> suffix")
+    p.add_argument("--t-shift", type=float, default=1.0,
+                   help="time shift of the sampling grid (SD3; RPE-2D uses sqrt(n_tokens / n_trained_tokens) above "
+                        "the trained resolution, e.g. 96 -> 256 px 2.67); grids get a _ts<x> suffix")
     p.add_argument("--export", action="store_true", help="also write text_encoder / transformer safetensors + configs")
     a = p.parse_args()
     device = torch.device("cuda")
@@ -112,7 +115,8 @@ def main():
     sets = [("en", PROMPTS), ("pl", PROMPTS_PL)] if a.prompt is None else [("prompt", a.prompt)]
     with torch.no_grad():
         for lang, prompts in sets:
-            z = fidlib.sample(te, den, tokenize(prompts, te_cfg), null_row, a.steps, a.cfg, a.seed, device)
+            z = fidlib.sample(te, den, tokenize(prompts, te_cfg), null_row, a.steps, a.cfg, a.seed, device,
+                              shift=a.t_shift)
             imgs = ((vae.decode(z) + 1) / 2).clamp(0, 1)
             imgs = (imgs.permute(0, 2, 3, 1).float().cpu().numpy() * 255).round().astype(np.uint8)
             if a.prompt is not None:
@@ -125,7 +129,7 @@ def main():
             grid = Image.new("RGB", (4 * w, 2 * h))
             for i, im in enumerate(imgs):
                 grid.paste(Image.fromarray(im), ((i % 4) * w, (i // 4) * h))
-            path = os.path.join(a.out_dir, f"grid_{lang}{f'_{a.res}px' if a.res else ''}{f'_rope{a.rope_ref}' if a.rope_ref is not None else ''}{f'_as{a.attn_scale:g}' if a.attn_scale != 1.0 else ''}.png")
+            path = os.path.join(a.out_dir, f"grid_{lang}{f'_{a.res}px' if a.res else ''}{f'_rope{a.rope_ref}' if a.rope_ref is not None else ''}{f'_as{a.attn_scale:g}' if a.attn_scale != 1.0 else ''}{f'_ts{a.t_shift:g}' if a.t_shift != 1.0 else ''}.png")
             grid.save(path)
             print(f"saved {path}")
 

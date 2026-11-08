@@ -58,9 +58,41 @@ def build_rope_2d(side: int, d: int, ref: int = 0):
     coords = torch.arange(side).float()
     if ref and ref != side:
         coords = (coords + 0.5) * (ref / side) - 0.5
-    rows, cols = torch.meshgrid(coords, coords, indexing="ij")
-    ang = torch.cat([_angles(rows.reshape(-1), d // 2), _angles(cols.reshape(-1), d // 2)], dim=-1)
-    return ang.cos().repeat_interleave(2, dim=-1)[None, None], ang.sin().repeat_interleave(2, dim=-1)[None, None]
+    return rope_2d_from_coords(coords[None], coords[None], d)
+
+
+def rope_2d_from_coords(rows: torch.Tensor, cols: torch.Tensor, d: int):
+    """2D RoPE for (B, h) row and (B, w) column positions (the grid is their Cartesian product, row-major)
+    -> cos, sin of shape (B, 1, h * w, d)."""
+    b, h, w = rows.shape[0], rows.shape[1], cols.shape[1]
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, d // 2, 2, dtype=torch.float32, device=rows.device) / (d // 2)))
+    ar = (rows.float()[:, :, None] * inv_freq)[:, :, None].expand(b, h, w, -1)
+    ac = (cols.float()[:, :, None] * inv_freq)[:, None].expand(b, h, w, -1)
+    ang = torch.cat([ar, ac], dim=-1).reshape(b, 1, h * w, -1)
+    return ang.cos().repeat_interleave(2, dim=-1), ang.sin().repeat_interleave(2, dim=-1)
+
+
+def random_rope_coords(b: int, side: int, field: int, device=None, generator=None):
+    """RPE-2D (arXiv:2503.18719): per sample and axis, `side` distinct integer positions of 0 .. field-1, sorted
+    -> (B, side) rows, (B, side) columns. Sampling uses the even grid of build_rope_2d(side, d, field) instead."""
+    def axis():
+        return torch.rand(b, field, device=device, generator=generator).topk(side, dim=1).indices.sort(dim=1).values
+    return axis(), axis()
+
+
+def micro_cond_embedding(cond: torch.Tensor, dim: int = 256) -> torch.Tensor:
+    """(B, 8) micro-conditions in pixels -> (B, 8 * dim) sinusoids (as SDXL's size / crop conditioning)."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=cond.device).float() / half)
+    ang = cond.float()[:, :, None] * freqs
+    return torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(1)
+
+
+def default_micro_cond(base: int, res: int, b: int, device=None) -> torch.Tensor:
+    """The micro-conditions of a whole, uncropped image: original size max(base, res), crop = the whole original,
+    target size res -> (B, 8) [orig_h, orig_w, top, left, bottom, right, target_h, target_w]."""
+    o = max(base, res)
+    return torch.tensor([o, o, 0, 0, o, o, res, res], dtype=torch.float32, device=device).expand(b, 8)
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -239,6 +271,9 @@ class DenoiserConfig:
     text_dim: int = 384
     latent_layout: str = "flux2_pipeline"
     rope_ref: int = 0  # build_rope_2d's ref: 0 = integer positions per grid, 16 = every grid on the 256 px field
+    # RPE-2D micro-conditioning (arXiv:2503.18719): 0 = off; else the original image size in px of the training data
+    # (crops and resizes are described relative to it); adds cond_mlp, whose output is added to the time embedding
+    micro_cond: int = 0
 
 
 class TextEncoder(nn.Module):
@@ -287,6 +322,8 @@ class Denoiser(nn.Module):
         self.patch_in = nn.Linear(cfg.latent_channels, dim, bias=False)
         self.time_mlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.ada = nn.Linear(dim, 6 * dim)
+        if cfg.micro_cond:
+            self.cond_mlp = nn.Sequential(nn.Linear(8 * 256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.blocks = nn.ModuleList([DenoiserBlock(dim, cfg.heads, cfg.text_dim, cfg.mlp_hidden)
                                      for _ in range(cfg.depth)])
         self.norm = RMSNorm(dim)
@@ -295,13 +332,22 @@ class Denoiser(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+    def time_embedding(self, t: torch.Tensor, cond: torch.Tensor = None, res: int = 0):
+        """Time embedding, plus the micro-conditions (B, 8) with micro_cond (default: a whole image at res px)."""
+        t_emb = self.time_mlp(timestep_embedding(t, 256))
+        if self.config.micro_cond:
+            if cond is None:
+                cond = default_micro_cond(self.config.micro_cond, res, t.shape[0], t.device)
+            t_emb = t_emb + self.cond_mlp(micro_cond_embedding(cond).to(t_emb.dtype))
+        return t_emb
+
     def forward(self, z_t: torch.Tensor, t: torch.Tensor, text: torch.Tensor, text_valid: torch.Tensor,
-                hidden_at: int = 0):
+                hidden_at: int = 0, cond: torch.Tensor = None):
         """hidden_at > 0: also return the token states after that many blocks (for the REPA loss)."""
         b, c, h, w = z_t.shape
         dim = self.config.dim
         x = self.patch_in(z_t.flatten(2).transpose(1, 2))
-        t_emb = self.time_mlp(timestep_embedding(t, 256))
+        t_emb = self.time_embedding(t, cond, 16 * h)
         t6 = self.ada(F.silu(t_emb)).view(b, 6, dim)
         hidden = None
         for i, block in enumerate(self.blocks):
@@ -331,6 +377,16 @@ class Denoiser(nn.Module):
         # other, so self-attention and the MLP would never train (the bug behind the ~1.09 plateau, see PROBLEM.md).
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
+        self.init_cond()
+
+    @torch.no_grad()
+    def init_cond(self):
+        """Micro-conditioning starts as a no-op (zero output layer), also when added to a trained model."""
+        if self.config.micro_cond:
+            nn.init.normal_(self.cond_mlp[0].weight, std=0.02)
+            nn.init.zeros_(self.cond_mlp[0].bias)
+            nn.init.zeros_(self.cond_mlp[2].weight)
+            nn.init.zeros_(self.cond_mlp[2].bias)
 
     @staticmethod
     @torch.no_grad()

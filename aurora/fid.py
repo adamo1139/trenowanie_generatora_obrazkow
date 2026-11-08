@@ -10,11 +10,13 @@ import torch.distributed as dist
 
 
 @torch.no_grad()
-def sample(te, den, ids, null_row, steps, cfg, seed, device, batch=64):
-    """Normalised latents (N, C, H, W) for the prompts `ids` (N, T); noise is fixed by (seed, prompt index)."""
+def sample(te, den, ids, null_row, steps, cfg, seed, device, batch=64, shift=1.0):
+    """Normalised latents (N, C, H, W) for the prompts `ids` (N, T); noise is fixed by (seed, prompt index).
+    shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise, SD3)."""
     c = getattr(den, "_orig_mod", den).config
     out = []
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    u = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    ts = shift * u / (1 + (shift - 1) * u)
     for i in range(0, len(ids), batch):
         b_ids = ids[i:i + batch].to(device)
         b = len(b_ids)

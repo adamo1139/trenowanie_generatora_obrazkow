@@ -103,21 +103,27 @@ def ensure_open_files(needed: int):
 
 class ShardStore:
     def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0,
-                 lat_kind: str = "lat", lat_root: str = ""):
+                 lat_kind: str = "lat", lat_root: str = "", crops=(), crop_prob: float = 0.0, cond_base: int = 0):
         """alt_suffix / alt_prob: with probability alt_prob a sample's caption comes from <name>.tok_<alt_suffix>.npy
         (the same caption translated, e.g. poziomka_pl) instead. lat_kind: which latents, e.g. "lat128" for the
-        <name>.lat128.npy files of prepare_lowres.py (any grid; the shape is read from the files)."""
+        <name>.lat128.npy files of prepare_lowres.py (any grid; the shape is read from the files).
+        RPE-2D's resize-and-crop augmentation (arXiv:2503.18719): with probability crop_prob a training sample is a
+        random window, as large as the lat_kind grid, of the latents of one of `crops` [(lat_kind, lat_root)] (larger
+        grids of the same images, e.g. the 256 px "lat") instead of the whole resized image. cond_base > 0: fetch also
+        returns the (B, 8) micro-conditions in pixels of a cond_base-px original (aurora.model.default_micro_cond)."""
         self.root, self.names, self.lat_kind = root, list(names), lat_kind
+        self.crops, self.crop_prob, self.cond_base = list(crops), crop_prob, cond_base
+        assert not self.crops or cond_base, "crops need micro-conditions (cond_base)"
         self.lat_root = lat_root or root  # latents may live in another folder (prepare_lowres.py --out-dir)
         self.tok = tok_kind(tok_suffix)
         self.alt = tok_kind(alt_suffix) if alt_suffix and alt_prob > 0 else None
         self.alt_prob = alt_prob
         self.null_row = null_ids() if null_row is None else np.asarray(null_row, dtype=np.int64)
-        ensure_open_files((3 if self.alt else 2) * len(self.names) + 512)
+        ensure_open_files(((3 if self.alt else 2) + len(self.crops)) * len(self.names) + 512)
         self.offs = [np.load(self._p(n, "off")) for n in self.names]
         self.sizes = np.array([len(o) - 1 for o in self.offs], dtype=np.int64)
         self.starts = np.concatenate([[0], np.cumsum(self.sizes)])
-        self._lat, self._tok, self._alt = None, None, None
+        self._lat, self._tok, self._alt, self._crop = None, None, None, None
 
     def _p(self, name, kind):
         return os.path.join(self.root, f"{name}.{kind}.npy")
@@ -132,6 +138,8 @@ class ShardStore:
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
+            self._crop = [[np.load(os.path.join(r or self.root, f"{n}.{k}.npy"), mmap_mode="r") for n in self.names]
+                          for k, r in self.crops]
 
     def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False):
         """Latents + one caption per image (random if rng is given, else the first one). rows: also (B, 2) [shard,
@@ -141,10 +149,21 @@ class ShardStore:
         picked = np.full((len(indices), 2), -1, dtype=np.int64)
         lat = np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16)
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
+        n = lat.shape[-1]  # target grid side
+        cond = np.tile(np.array([self.cond_base] * 2 + [0, 0] + [self.cond_base] * 2 + [16 * n] * 2, np.float32),
+                       (len(indices), 1))
         shard = np.searchsorted(self.starts, indices, side="right") - 1
         for j, (s, gi) in enumerate(zip(shard, indices)):
             i = gi - self.starts[s]
-            lat[j] = self._lat[s][i]
+            if self._crop and rng is not None and rng.random() < self.crop_prob:
+                src = self._crop[rng.integers(len(self._crop))][s]
+                side = src.shape[-1]
+                r, c = rng.integers(0, side - n + 1, size=2)
+                lat[j] = src[i, :, r:r + n, c:c + n]
+                px = self.cond_base / side  # original pixels per source token
+                cond[j, 2:6] = r * px, c * px, (r + n) * px, (c + n) * px
+            else:
+                lat[j] = self._lat[s][i]
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
             if hi == lo:
                 ids[j] = self.null_row
@@ -155,7 +174,8 @@ class ShardStore:
             else:
                 ids[j] = (self._alt if self.alt and rng.random() < self.alt_prob else self._tok)[s][c]
             picked[j] = s, c
-        return (lat, ids, picked) if rows else (lat, ids)
+        out = (lat, ids, picked) if rows else (lat, ids)
+        return out + (cond,) if self.cond_base else out
 
 
 class CaptionText:
@@ -209,11 +229,11 @@ class TrainStream(IterableDataset):
             g0 = k * self.mb * self.world + self.rank * self.mb
             idx = np.sort(perm[g0:g0 + self.mb])
             got = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]), rows=True)
-            lat, ids, picked = (torch.from_numpy(x) for x in got)
+            lat, ids, picked, *cond = (torch.from_numpy(x) for x in got)
             if self.sort_pad is not None:
                 order = ids.ne(self.sort_pad).sum(1).argsort(stable=True)
-                lat, ids, picked = lat[order], ids[order], picked[order]
-            yield (lat, ids, picked) if self.rows else (lat, ids)
+                lat, ids, picked, cond = lat[order], ids[order], picked[order], [c[order] for c in cond]
+            yield ((lat, ids, picked) if self.rows else (lat, ids)) + tuple(cond)
             m += nw
 
 
