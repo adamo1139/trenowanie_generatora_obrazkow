@@ -29,8 +29,12 @@ def null_ids() -> np.ndarray:
     return row
 
 
-def list_shards(root: str):
-    names = sorted(os.path.basename(p)[: -len(".off.npy")] for p in glob.glob(os.path.join(root, "*.off.npy")))
+def list_shards(root: str, img_root: str = ""):
+    """Shards with captions (.off.npy) and latents (.lat.npy), or with images (<img_root>/<name>.img.off.npy)."""
+    names = sorted(os.path.basename(p)[: -len(".off.npy")] for p in glob.glob(os.path.join(root, "*.off.npy"))
+                   if not p.endswith(".img.off.npy"))
+    if img_root:
+        return [n for n in names if os.path.exists(os.path.join(img_root, n + ".img.off.npy"))]
     return [n for n in names if os.path.exists(os.path.join(root, n + ".lat.npy"))]
 
 
@@ -72,10 +76,12 @@ def tok_kind(suffix: str = "") -> str:
     return f"tok_{suffix}" if suffix else "tok"
 
 
-def select_shards(root: str, fraction: float, tok_suffix: str = "", alt_suffix: str = ""):
-    """(train, val) shard names for a fraction of the FULL dataset; val shards do not depend on the fraction."""
+def select_shards(root: str, fraction: float, tok_suffix: str = "", alt_suffix: str = "", img_root: str = ""):
+    """(train, val) shard names for a fraction of the FULL dataset; val shards do not depend on the fraction.
+    img_root: shards must have images there (prepare_images.py) instead of latents."""
     kinds = [tok_kind(tok_suffix)] + ([tok_kind(alt_suffix)] if alt_suffix else [])
-    present = [n for n in list_shards(root) if all(os.path.exists(os.path.join(root, f"{n}.{k}.npy")) for k in kinds)]
+    present = [n for n in list_shards(root, img_root)
+               if all(os.path.exists(os.path.join(root, f"{n}.{k}.npy")) for k in kinds)]
     train, val = split_shards(full_shard_list(root))
     train = select_fraction(train, fraction)
     missing = sorted(set(train + val) - set(present))
@@ -103,17 +109,22 @@ def ensure_open_files(needed: int):
 
 class ShardStore:
     def __init__(self, root: str, names, tok_suffix: str = "", null_row=None, alt_suffix: str = "", alt_prob=0.0,
-                 lat_kind: str = "lat", lat_root: str = "", crops=(), crop_prob: float = 0.0, cond_base: int = 0):
+                 lat_kind: str = "lat", lat_root: str = "", crops=(), crop_prob: float = 0.0, cond_base: int = 0,
+                 img_res: int = 0):
         """alt_suffix / alt_prob: with probability alt_prob a sample's caption comes from <name>.tok_<alt_suffix>.npy
         (the same caption translated, e.g. poziomka_pl) instead. lat_kind: which latents, e.g. "lat128" for the
         <name>.lat128.npy files of prepare_lowres.py (any grid; the shape is read from the files).
         RPE-2D's resize-and-crop augmentation (arXiv:2503.18719): with probability crop_prob a training sample is a
         random window, as large as the lat_kind grid, of the latents of one of `crops` [(lat_kind, lat_root)] (larger
         grids of the same images, e.g. the 256 px "lat") instead of the whole resized image. cond_base > 0: fetch also
-        returns the (B, 8) micro-conditions in pixels of a cond_base-px original (aurora.model.default_micro_cond)."""
+        returns the (B, 8) micro-conditions in pixels of a cond_base-px original (aurora.model.default_micro_cond).
+        img_res > 0: images instead of latents, from <lat_root>/<name>.img.bin + .img.off.npy (prepare_images.py),
+        decoded and resized to img_res x img_res here (in the DataLoader workers) -> uint8 (B, 3, img_res, img_res);
+        the latents are made on the GPU (aurora.vae_encode.LatentEncoder)."""
         self.root, self.names, self.lat_kind = root, list(names), lat_kind
-        self.crops, self.crop_prob, self.cond_base = list(crops), crop_prob, cond_base
+        self.crops, self.crop_prob, self.cond_base, self.img_res = list(crops), crop_prob, cond_base, img_res
         assert not self.crops or cond_base, "crops need micro-conditions (cond_base)"
+        assert not (img_res and self.crops), "latent crops and images do not mix"
         self.lat_root = lat_root or root  # latents may live in another folder (prepare_lowres.py --out-dir)
         self.tok = tok_kind(tok_suffix)
         self.alt = tok_kind(alt_suffix) if alt_suffix and alt_prob > 0 else None
@@ -133,8 +144,12 @@ class ShardStore:
 
     def _open(self):  # lazily, so every DataLoader worker gets its own handles
         if self._lat is None:
-            self._lat = [np.load(os.path.join(self.lat_root, f"{n}.{self.lat_kind}.npy"), mmap_mode="r")
-                         for n in self.names]
+            if self.img_res:
+                self._lat = [(np.memmap(os.path.join(self.lat_root, f"{n}.img.bin"), dtype=np.uint8, mode="r"),
+                              np.load(os.path.join(self.lat_root, f"{n}.img.off.npy"))) for n in self.names]
+            else:
+                self._lat = [np.load(os.path.join(self.lat_root, f"{n}.{self.lat_kind}.npy"), mmap_mode="r")
+                             for n in self.names]
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
@@ -147,7 +162,9 @@ class ShardStore:
         so it also finds the English original of a Polish caption (CaptionText)."""
         self._open()
         picked = np.full((len(indices), 2), -1, dtype=np.int64)
-        lat = np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16)
+        r = self.img_res
+        lat = (np.empty((len(indices), 3, r, r), dtype=np.uint8) if r
+               else np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16))
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         n = lat.shape[-1]  # target grid side
         cond = np.tile(np.array([self.cond_base] * 2 + [0, 0] + [self.cond_base] * 2 + [16 * n] * 2, np.float32),
@@ -162,6 +179,9 @@ class ShardStore:
                 lat[j] = src[i, :, r:r + n, c:c + n]
                 px = self.cond_base / side  # original pixels per source token
                 cond[j, 2:6] = r * px, c * px, (r + n) * px, (c + n) * px
+            elif r:
+                blob, off = self._lat[s]
+                lat[j] = decode_image(blob[off[i]:off[i + 1]], r)
             else:
                 lat[j] = self._lat[s][i]
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
@@ -176,6 +196,48 @@ class ShardStore:
             picked[j] = s, c
         out = (lat, ids, picked) if rows else (lat, ids)
         return out + (cond,) if self.cond_base else out
+
+
+def decode_image(data, res: int) -> np.ndarray:
+    """Encoded image bytes -> (3, res, res) uint8 RGB: a JPEG is first decoded at the smallest DCT scale still >= res
+    (cheap), then resized with PIL's antialiased bicubic (as prepare_lowres.py's downscale). Square sources only."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(bytes(data)))
+    im.draft("RGB", (res, res))
+    im = im.convert("RGB")
+    if im.size != (res, res):
+        im = im.resize((res, res), Image.BICUBIC, reducing_gap=None)
+    return np.asarray(im).transpose(2, 0, 1)
+
+
+class ConcatStore:
+    """Several ShardStores as one index space (e.g. FLUX-Reason + MONET images), in their natural proportions. The
+    stores must give the same layout (images of one size, captions of one width, no micro-conditions)."""
+
+    def __init__(self, stores):
+        self.stores = list(stores)
+        self.starts = np.concatenate([[0], np.cumsum([len(s) for s in self.stores])])
+
+    def __len__(self):
+        return int(self.starts[-1])
+
+    def fetch(self, indices: np.ndarray, rng, rows: bool = False):
+        indices = np.asarray(indices)
+        which = np.searchsorted(self.starts, indices, side="right") - 1
+        lat = ids = None
+        for k, store in enumerate(self.stores):
+            pos = np.nonzero(which == k)[0]
+            if not len(pos):
+                continue
+            got = store.fetch(indices[pos] - self.starts[k], rng)
+            assert len(got) == 2, "ConcatStore: stores with micro-conditions are not supported"
+            if lat is None:
+                lat = np.empty((len(indices), *got[0].shape[1:]), dtype=got[0].dtype)
+                ids = np.empty((len(indices), got[1].shape[1]), dtype=got[1].dtype)
+            assert got[1].shape[1] == ids.shape[1], "ConcatStore: caption widths differ between stores"
+            lat[pos], ids[pos] = got
+        return (lat, ids, np.full((len(indices), 2), -1, dtype=np.int64)) if rows else (lat, ids)
 
 
 class CaptionText:
@@ -237,9 +299,11 @@ class TrainStream(IterableDataset):
             m += nw
 
 
-def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat", lat_root: str = ""):
-    """First n images of the held-out shards (round-robin across shards), first caption each."""
-    store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind, lat_root=lat_root)
+def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat", lat_root: str = "",
+             img_res: int = 0):
+    """First n images of the held-out shards (round-robin across shards), first caption each. img_res: uint8 images
+    (ShardStore img_res) instead of latents."""
+    store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind, lat_root=lat_root, img_res=img_res)
     per = -(-n // len(names))
     idx = np.concatenate([store.starts[s] + np.arange(min(per, store.sizes[s])) for s in range(len(names))])[:n]
     lat, ids = store.fetch(idx, None)

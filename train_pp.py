@@ -36,6 +36,7 @@ the grown model starts as exactly the old one. Copying trained blocks instead di
       --batch 1024 --microbatches 16 --diloco 64 --outer-lr 1 --outer-momentum 0 --ema-cpu --out runs/grow12
 """
 import functools
+import glob
 import logging
 import math
 import os
@@ -50,13 +51,14 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
-from aurora.data import ShardStore, TrainStream, load_val, select_shards
+from aurora.data import ConcatStore, ShardStore, TrainStream, load_val, select_shards
 from aurora.model import (CrossAttention, Denoiser, DenoiserConfig, LMEncoderConfig, TextAttention, TextEncoder,
                           build_rope_2d, default_micro_cond, make_configs, micro_cond_embedding,
                           random_rope_coords, rope_2d_from_coords, te_config_from_dict, timestep_embedding)
 from aurora.muon import Muon
 from aurora.profiling import TrainingProfile
 from aurora.slayer import LM_PAD, trim_ids
+from aurora.vae_encode import LatentEncoder
 from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
                    peak_tflops, resolve_defaults, wandb_logged_in, weight_sq, wrms_stats)
 
@@ -105,6 +107,16 @@ def get_args():
                         "--res windows from (256 = the shards' own .lat.npy; others from <--lat-dir parent>/<res>px), "
                         "e.g. 256 at --res 128: half of the samples a 128 px crop of the 256 px image (--crop-prob)")
     p.add_argument("--crop-prob", type=float, default=0.5, help="share of the training samples that are crops")
+    p.add_argument("--img-dir", default="",
+                   help="train from images instead of stored latents: <img-dir>/<shard>.img.bin (prepare_images.py "
+                        "flux-reason), captions / tokens from --data; resized to --res in the loader, encoded by the "
+                        "FLUX.2 encoder (--enc-vae) on every GPU")
+    p.add_argument("--img-extra", nargs="*", default=[],
+                   help="more image sources with their own tokens, e.g. data/monet_z_image (prepare_monet.py + "
+                        "translate_captions.py + prepare_data.py tokenize-parquet + prepare_images.py monet); mixed "
+                        "with --img-dir in their natural proportions")
+    p.add_argument("--enc-vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 whose encoder makes the latents")
+    p.add_argument("--enc-chunk", type=int, default=8, help="images per encoder call (memory)")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
     p.add_argument("--t-shift", type=float, default=1.0,
@@ -703,6 +715,8 @@ def main():
     assert not args.crop_res or (args.micro_cond and pp == 1 and not args.opd), \
         "--crop-res needs --micro-cond, --pp 1, no --opd"
     assert all(r > args.res for r in args.crop_res), "--crop-res must be larger than --res"
+    assert not (args.img_dir and args.crop_res), "--crop-res crops stored latents; not with --img-dir"
+    assert args.img_dir or not args.img_extra, "--img-extra needs --img-dir"
     lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
@@ -968,13 +982,35 @@ def main():
     needs_data = first or last or args.repa_weight > 0 or lm_offload  # REPA targets / LM states: every stage
     alt_suffix = f"{tok_suffix}_pl" if args.pl_prob > 0 else ""
     assert not alt_suffix or tok_suffix, "--pl-prob needs a frozen-LM text encoder (--te-size poziomka)"
-    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix)
+    train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix, img_root=args.img_dir)
+    # images: every sample is a whole image, so no micro-conditions from the loader (the model's default ones)
+    has_cond = bool(args.micro_cond) and not args.img_dir
+    img_res = args.res if args.img_dir else 0
+    encoder = None
     loader = store = None
     if needs_data:
+        null_np = ids_enc.null_ids() if ids_enc is not None else None
         crops = [("lat", "") if r == 256 else
                  (f"lat{r}", os.path.join(os.path.dirname(args.lat_dir.rstrip("/")), f"{r}px")) for r in args.crop_res]
-        store = ShardStore(args.data, train_names, tok_suffix, ids_enc.null_ids() if ids_enc is not None else None,
-                           alt_suffix, args.pl_prob, lat_kind, args.lat_dir, crops, args.crop_prob, args.micro_cond)
+        store = ShardStore(args.data, train_names, tok_suffix, null_np, alt_suffix, args.pl_prob,
+                           "img" if img_res else lat_kind, args.img_dir or args.lat_dir, crops, args.crop_prob,
+                           args.micro_cond if has_cond else 0, img_res)
+        if args.img_dir:
+            sources = [f"{args.img_dir}: {len(store):,}"]
+            stores = [store]
+            for d in args.img_extra:
+                names = sorted(os.path.relpath(p, d)[: -len(".img.off.npy")]
+                               for p in glob.glob(os.path.join(d, "*", "*.img.off.npy")))
+                names = [n for n in names if all(os.path.exists(os.path.join(d, f"{n}.{k}.npy"))
+                                                 for k in ("off", f"tok_{tok_suffix}") + ((f"tok_{alt_suffix}",)
+                                                                                           if alt_suffix else ()))]
+                assert names, f"--img-extra {d}: no shards with images and tokens"
+                stores.append(ShardStore(d, names, tok_suffix, null_np, alt_suffix, args.pl_prob, "img", d,
+                                         img_res=img_res))
+                sources.append(f"{d}: {len(stores[-1]):,}")
+            store = ConcatStore(stores) if len(stores) > 1 else store
+            encoder = LatentEncoder(args.enc_vae, device, args.enc_chunk)
+            log(f"images -> latents in the loop ({args.enc_vae} encoder, {args.res} px): " + ", ".join(sources))
         if crops:
             log(f"RPE-2D resize-and-crop: {100 * args.crop_prob:.0f}% of the samples {args.res} px windows of "
                 f"{', '.join(f'{r} px' for r in args.crop_res)} latents ({', '.join(k for k, _ in crops)})")
@@ -995,10 +1031,15 @@ def main():
 
     val, val_lm = None, None
     if master and val_names:
-        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(), lat_kind, args.lat_dir)
+        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(),
+                       "img" if img_res else lat_kind, args.img_dir or args.lat_dir, img_res)
+        if img_res:  # the held-out images encoded once, as stored latents would be
+            val = (torch.cat([encoder(val[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(val[0]), 64)]),
+                   val[1])
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
         ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
-                                                ids_enc.null_ids(), lat_kind, args.lat_dir))[1]
+                                                ids_enc.null_ids(), "img" if img_res else lat_kind,
+                                                args.img_dir or args.lat_dir, img_res))[1]
         ch = 64  # evaluate()'s chunk for transformers LMs
         got = lm_split_forward_([trim_ids(ids_val[i:i + ch].to(device)) for i in range(0, len(ids_val), ch)])
         if master:
@@ -1188,11 +1229,11 @@ def main():
             return None, None, None, None, None, None, None, None
         with profile.phase("data_loader"):
             got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
-            mcond = got[-1].to(device, non_blocking=True) if args.micro_cond else None
-            got = got[:-1] if args.micro_cond else got
+            mcond = got[-1].to(device, non_blocking=True) if has_cond else None
+            got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
-        x0 = lat.to(device, non_blocking=True).float()
+        x0 = encoder(lat.to(device, non_blocking=True)) if encoder is not None else lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))

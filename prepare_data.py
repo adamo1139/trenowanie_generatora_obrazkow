@@ -256,6 +256,8 @@ def tokenize_parquet_one(path: str, tokenizer_path: str, encoder: str, column: s
         rows[j, 0] = cfg["bos"]
         rows[j, 1:1 + len(ids)] = ids
     save_npy(f"{base}.tok_{encoder}{'_' + lang if lang else ''}.npy", rows)
+    if not lang:  # one caption per image: the aurora.data.ShardStore layout (<name>.off.npy) for training
+        save_npy(f"{base}.off.npy", np.arange(len(flat) + 1, dtype=np.int64))
     return path, len(flat), sum(not c for c in flat), fallback
 
 
