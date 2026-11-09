@@ -8,6 +8,13 @@ vLLM pins its own torch, so install it in a separate venv, not the training one:
   for i in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$i .venv-vllm/bin/python translate_captions.py \\
       --data data/aurora_full --rank $i --world 8 > translate_$i.log 2>&1 & done
 
+--parquet-dir: parquets of prepare_monet.py instead (one caption per image in --column, default caption_short): every
+<shard dir>/<file>.parquet gets a <file>.<suffix>.parquet next to it with `__key__` and `<column>_<suffix>`, in the same
+row order; empty captions stay empty.
+  .venv-vllm/bin/python translate_captions.py --parquet-dir data/monet_z_image --pilot 2000
+  for i in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$i .venv-vllm/bin/python translate_captions.py \\
+      --parquet-dir data/monet_z_image --rank $i --world 8 > translate_$i.log 2>&1 & done
+
 Text in double quotes is what is written in the image (a sign that says "OPEN"), so it is swapped for placeholders before
 translation and put back afterwards: the caption must keep matching the image. Captions whose placeholders do not survive
 are translated again without them. Each shard is written atomically with per-shard counters in <shard>.caps_pl.stats.json;
@@ -50,9 +57,54 @@ def suspicious(src, out):
     return (not out or CJK.search(out) is not None or not 0.4 <= len(out) / max(1, len(src)) <= 3.0)
 
 
+def pilot(flat, translate):
+    """Speed and 15 sample pairs."""
+    t0 = time.time()
+    res, st = translate(flat)
+    dt = time.time() - t0
+    print(json.dumps(st), f"| {len(flat) / dt:.1f} captions/s, {st['out_tokens'] / dt:.0f} output tok/s on this GPU")
+    random.seed(0)
+    for i in random.sample(range(len(flat)), min(15, len(flat))):
+        print(f"\nEN: {flat[i]}\nPL: {res[i]}")
+
+
+def parquet_mode(a, translate):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    suffix = f".{a.suffix}.parquet"
+    files = sorted(f for f in glob.glob(os.path.join(a.parquet_dir, "*", "*.parquet")) if not f.endswith(suffix))
+    if a.pilot:
+        texts = [c for c in pq.read_table(files[0], columns=[a.column])[a.column].to_pylist() if c]
+        pilot(list(dict.fromkeys(texts))[: a.pilot], translate)
+        return
+    mine = files[a.rank::a.world]
+    for n, path in enumerate(mine):
+        out = path[: -len(".parquet")] + suffix
+        if os.path.exists(out):
+            continue
+        t0 = time.time()
+        src = pq.read_table(path, columns=["__key__", a.column])
+        texts = src[a.column].to_pylist()
+        uniq = list(dict.fromkeys(c for c in texts if c))
+        res, st = translate(uniq)
+        table = dict(zip(uniq, res))
+        pq.write_table(pa.table({"__key__": src["__key__"],
+                                 f"{a.column}_{a.suffix}": pa.array([table.get(c) if c else None for c in texts],
+                                                                    pa.string())}), out + ".tmp", compression="zstd")
+        os.replace(out + ".tmp", out)
+        with open(out[: -len(".parquet")] + ".stats.json", "w") as fh:
+            json.dump(st, fh)
+        dt = time.time() - t0
+        print(f"[{n + 1}/{len(mine)}] {os.path.relpath(path, a.parquet_dir)}: {st['captions']} captions, "
+              f"{st['quoted']} quoted, {st['retried']} retried, {st['flagged']} flagged, {len(uniq) / dt:.1f} captions/s",
+              flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True)
+    p.add_argument("--data", default="", help="folder of <shard>.caps.json (FLUX-Reason training data)")
+    p.add_argument("--parquet-dir", default="", help="folder of prepare_monet.py parquets (<shard dir>/<file>.parquet)")
+    p.add_argument("--column", default="caption_short", help="--parquet-dir: the caption column to translate")
     p.add_argument("--model", default="IndexTeam/Index-Translate-2B")
     p.add_argument("--rank", type=int, default=0)
     p.add_argument("--world", type=int, default=1)
@@ -103,17 +155,14 @@ def main():
             st["out_tokens"] += len(tok(r, add_special_tokens=False).input_ids) if r else 0
         return res, st
 
+    assert bool(a.data) != bool(a.parquet_dir), "give --data or --parquet-dir"
+    if a.parquet_dir:
+        return parquet_mode(a, translate)
     shards = sorted(glob.glob(os.path.join(a.data, "*.caps.json")))
     if a.pilot:
         caps = json.load(open(shards[0]))
         flat = list(dict.fromkeys(c for img in caps for c in img))[: a.pilot]
-        t0 = time.time()
-        res, st = translate(flat)
-        dt = time.time() - t0
-        print(json.dumps(st), f"| {len(flat) / dt:.1f} captions/s, {st['out_tokens'] / dt:.0f} output tok/s on this GPU")
-        random.seed(0)
-        for i in random.sample(range(len(flat)), min(15, len(flat))):
-            print(f"\nEN: {flat[i]}\nPL: {res[i]}")
+        pilot(flat, translate)
         return
 
     mine = shards[a.rank::a.world]
