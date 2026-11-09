@@ -32,6 +32,22 @@ PROMPT = "请将以下{src}文本翻译为{tgt}，直接输出翻译结果，不
 QUOTE = re.compile(r'"[^"\n]{1,80}"|“[^”\n]{1,80}”|„[^”"\n]{1,80}[”"]')
 PH = "[[{}]]"
 CJK = re.compile(r"[぀-ヿ㐀-鿿]")
+# VLM boilerplate at the start of a caption ("The image shows ...", Florence-2 nearly always): users do not write it
+PREFIX_EN = re.compile(r"^(?:(?:the|this) (?:image|picture|photo(?:graph)?|illustration) (?:shows(?: shows| features| "
+                       r"depicts)?|depicts|features|captures|presents|displays|showcases|is(?: of)?)|in (?:this|the) "
+                       r"(?:image|picture)(?:,)? (?:we can see|there (?:is|are)|we see)|it is)\s+", re.I)
+# the same in Polish translations; only verbs that take what follows as their object (not "jest" + instrumental)
+PREFIX_PL = re.compile(r"^(?:(?:ten |to )?(?:obraz(?:ek)?|zdjęcie|ilustracja|fotografia)(?: ten)? (?:przedstawia|pokazuje|"
+                       r"ukazuje|prezentuje)|na (?:tym )?(?:obrazie|obrazku|zdjęciu|ilustracji|fotografii),? (?:widać|"
+                       r"widzimy|znajduje się|znajdują się))\s*:?\s+", re.I)
+
+
+def strip_prefix(text, lang="en"):
+    """Drop the leading "The image shows" / "Obraz przedstawia" boilerplate and capitalise the rest."""
+    if not text:
+        return text
+    out = (PREFIX_PL if lang == "pl" else PREFIX_EN).sub("", text.strip(), count=1)
+    return (out[:1].upper() + out[1:]) if out else text
 
 
 def protect(text):
@@ -69,12 +85,13 @@ def pilot(flat, translate):
 
 
 def parquet_mode(a, translate):
-    import pyarrow as pa
+    import pyarrow as pa  # imported before the model loads too (main), so a missing package fails fast
     import pyarrow.parquet as pq
     suffix = f".{a.suffix}.parquet"
     files = sorted(f for f in glob.glob(os.path.join(a.parquet_dir, "*", "*.parquet")) if not f.endswith(suffix))
     if a.pilot:
-        texts = [c for c in pq.read_table(files[0], columns=[a.column])[a.column].to_pylist() if c]
+        texts = [strip_prefix(c) if a.strip_prefix else c
+                 for c in pq.read_table(files[0], columns=[a.column])[a.column].to_pylist() if c]
         pilot(list(dict.fromkeys(texts))[: a.pilot], translate)
         return
     mine = files[a.rank::a.world]
@@ -84,7 +101,7 @@ def parquet_mode(a, translate):
             continue
         t0 = time.time()
         src = pq.read_table(path, columns=["__key__", a.column])
-        texts = src[a.column].to_pylist()
+        texts = [strip_prefix(c) for c in src[a.column].to_pylist()] if a.strip_prefix else src[a.column].to_pylist()
         uniq = list(dict.fromkeys(c for c in texts if c))
         res, st = translate(uniq)
         table = dict(zip(uniq, res))
@@ -105,6 +122,9 @@ def main():
     p.add_argument("--data", default="", help="folder of <shard>.caps.json (FLUX-Reason training data)")
     p.add_argument("--parquet-dir", default="", help="folder of prepare_monet.py parquets (<shard dir>/<file>.parquet)")
     p.add_argument("--column", default="caption_short", help="--parquet-dir: the caption column to translate")
+    p.add_argument("--strip-prefix", action="store_true",
+                   help="--parquet-dir: drop \"The image shows\" etc. before translating (the Polish then starts with the "
+                        "subject in the nominative instead of the accusative object of \"Obraz przedstawia\")")
     p.add_argument("--model", default="IndexTeam/Index-Translate-2B")
     p.add_argument("--rank", type=int, default=0)
     p.add_argument("--world", type=int, default=1)
@@ -118,6 +138,8 @@ def main():
     p.add_argument("--pilot", type=int, default=0, help="translate this many captions of the first shard, print samples")
     a = p.parse_args()
 
+    if a.parquet_dir:
+        import pyarrow.parquet  # noqa: F401  (the vLLM venv does not ship it: pip install pyarrow)
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
     tok = AutoTokenizer.from_pretrained(a.model)

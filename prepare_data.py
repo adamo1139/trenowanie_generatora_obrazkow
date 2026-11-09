@@ -17,6 +17,9 @@
   #    for a frozen-LM text encoder, e.g. Poziomka, English and then the Polish translations (translate_captions.py):
   python prepare_data.py tokenize --data data/aurora --encoder poziomka
   python prepare_data.py tokenize --data data/aurora --encoder poziomka --lang pl
+  #    MONET parquets (prepare_monet.py), English caption_short and its translation (translate_captions.py --parquet-dir):
+  python prepare_data.py tokenize-parquet --parquet-dir data/monet_z_image
+  python prepare_data.py tokenize-parquet --parquet-dir data/monet_z_image --lang pl
 
 Only `lat` and `caps` are kept; `dino` (first 60 shards) and `clip` are dropped.
 """
@@ -223,6 +226,56 @@ def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = "", l
     return name, len(caps), len(flat), fallback
 
 
+def tokenize_parquet_one(path: str, tokenizer_path: str, encoder: str, column: str, lang: str = ""):
+    """prepare_monet.py parquet (one caption per image in `column`, or its translation <file>.<lang>.parquet column
+    <column>_<lang>) -> <file>.tok_<encoder>[_<lang>].npy, one row per image in the parquet's order. "The image shows"
+    boilerplate is dropped (translate_captions.strip_prefix). A missing caption, or a translation flagged as broken,
+    becomes the English caption (Polish) or an empty prompt (English: BOS only, like the CFG null prompt)."""
+    import pyarrow.parquet as pq
+    from tokenizers import Tokenizer
+    from translate_captions import strip_prefix, suspicious
+    tok, cfg = Tokenizer.from_file(tokenizer_path), ENCODERS[encoder]
+    base = path[: -len(".parquet")]
+    en = [strip_prefix(c) for c in pq.read_table(path, columns=[column])[column].to_pylist()]
+    texts, fallback = en, 0
+    if lang:
+        pl = pq.read_table(f"{base}.{lang}.parquet")
+        assert pl["__key__"].to_pylist() == pq.read_table(path, columns=["__key__"])["__key__"].to_pylist(), path
+        texts = []
+        for e, p in zip(en, pl[f"{column}_{lang}"].to_pylist()):
+            p = strip_prefix(p, lang) if p else p
+            bad = bool(e) and (not p or suspicious(e, p))
+            fallback += bad
+            texts.append(e if bad else p)
+    flat = [" ".join((c or "").split()) for c in texts]
+    w = cfg["width"]
+    rows = np.full((len(flat), w), cfg["pad"], dtype=np.uint16)
+    for j, e in enumerate(tok.encode_batch(flat, add_special_tokens=False)):
+        ids = e.ids[: w - 1]
+        rows[j, 0] = cfg["bos"]
+        rows[j, 1:1 + len(ids)] = ids
+    save_npy(f"{base}.tok_{encoder}{'_' + lang if lang else ''}.npy", rows)
+    return path, len(flat), sum(not c for c in flat), fallback
+
+
+def cmd_tokenize_parquet(args):
+    from huggingface_hub import hf_hub_download
+    tokenizer = hf_hub_download(ENCODERS[args.encoder]["repo"], "tokenizer.json")
+    suffix = f"tok_{args.encoder}" + (f"_{args.lang}" if args.lang else "")
+    files = sorted(f for f in glob.glob(os.path.join(args.parquet_dir, "*", "*.parquet"))
+                   if os.path.basename(f).count(".") == 1)  # not the <file>.<lang>.parquet translations
+    todo = [f for f in files if args.force or not os.path.exists(f"{f[: -len('.parquet')]}.{suffix}.npy")]
+    if args.lang:
+        todo = [f for f in todo if os.path.exists(f"{f[: -len('.parquet')]}.{args.lang}.parquet")]
+    print(f"{len(files)} parquets, {len(todo)} to tokenise for {suffix}")
+    with ProcessPoolExecutor(args.workers) as ex:
+        futs = [ex.submit(tokenize_parquet_one, f, tokenizer, args.encoder, args.column, args.lang) for f in todo]
+        for i, fut in enumerate(as_completed(futs)):
+            path, n, empty, fb = fut.result()
+            print(f"[{i + 1}/{len(futs)}] {os.path.relpath(path, args.parquet_dir)}: {n} images, {empty} empty"
+                  + (f", {fb} flagged -> English" if args.lang else ""), flush=True)
+
+
 def cmd_tokenize(args):
     names = sorted(os.path.basename(p)[: -len(".caps.json")] for p in glob.glob(os.path.join(args.data, "*.caps.json")))
     tokenizer = args.tokenizer
@@ -268,8 +321,16 @@ def main():
                    "(writes <shard>.tok_<encoder>_<lang>.npy; e.g. --encoder poziomka --lang pl)")
     s.add_argument("--workers", type=int, default=8)
     s.add_argument("--force", action="store_true")
+    s = sub.add_parser("tokenize-parquet", help="prepare_monet.py parquets: one caption per image")
+    s.add_argument("--parquet-dir", required=True)
+    s.add_argument("--encoder", choices=sorted(ENCODERS), default="poziomka")
+    s.add_argument("--column", default="caption_short")
+    s.add_argument("--lang", default="", help="the translation <file>.<lang>.parquet (translate_captions.py)")
+    s.add_argument("--workers", type=int, default=8)
+    s.add_argument("--force", action="store_true")
     args = p.parse_args()
-    {"inspect": cmd_inspect, "convert": cmd_convert, "tokenize": cmd_tokenize}[args.cmd](args)
+    {"inspect": cmd_inspect, "convert": cmd_convert, "tokenize": cmd_tokenize,
+     "tokenize-parquet": cmd_tokenize_parquet}[args.cmd](args)
 
 
 if __name__ == "__main__":
