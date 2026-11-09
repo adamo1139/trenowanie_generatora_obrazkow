@@ -18,7 +18,7 @@ import os
 import shutil
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -26,7 +26,7 @@ import pyarrow.parquet as pq
 REPO = "LucasFang/FLUX-Reason-6M"
 
 
-def pack(blobs, out_base):
+def pack(blobs, out_base):  # whole list in memory: small sources only (MONET thumbnails)
     """list of bytes -> <out_base>.img.bin + .img.off.npy, atomically (offsets written last = shard complete)."""
     off = np.zeros(len(blobs) + 1, dtype=np.int64)
     np.cumsum([len(b) for b in blobs], out=off[1:])
@@ -44,7 +44,33 @@ def image_bytes(col):
     return [x["bytes"] if isinstance(x, dict) else x for x in col]
 
 
-def flux_reason_one(path, out, data, tmp_root):
+class PackWriter:
+    """Streaming pack(): images appended one row group at a time, so a shard is never held in memory whole."""
+
+    def __init__(self, out_base):
+        self.base, self.sizes = out_base, []
+        self.f = open(out_base + ".img.bin.tmp", "wb")
+
+    def add(self, blobs):
+        for b in blobs:
+            self.f.write(b)
+            self.sizes.append(len(b))
+
+    def close(self):
+        self.f.close()
+        off = np.zeros(len(self.sizes) + 1, dtype=np.int64)
+        np.cumsum(self.sizes, out=off[1:])
+        os.replace(self.base + ".img.bin.tmp", self.base + ".img.bin")
+        with open(self.base + ".img.off.npy.tmp", "wb") as f:
+            np.save(f, off)
+        os.replace(self.base + ".img.off.npy.tmp", self.base + ".img.off.npy")  # offsets last = shard complete
+        return len(self.sizes), int(off[-1])
+
+
+def flux_reason_one(job):
+    """One shard, in its own short-lived process (Pool maxtasksperchild=1): whatever pyarrow / the downloader keep
+    allocated goes back to the OS when it exits (in threads it piled up until the OOM killer stopped the run)."""
+    path, out, data, tmp_root = job
     from huggingface_hub import hf_hub_download
     name = os.path.basename(path)[: -len(".parquet")]
     base = os.path.join(out, name)
@@ -53,17 +79,17 @@ def flux_reason_one(path, out, data, tmp_root):
     tmp = tempfile.mkdtemp(dir=tmp_root)
     try:
         local = hf_hub_download(REPO, path, repo_type="dataset", local_dir=tmp)
-        pf = pq.ParquetFile(local)
-        blobs = []
+        pf = pq.ParquetFile(local, memory_map=True)
+        w = PackWriter(base)
         for g in range(pf.metadata.num_row_groups):
-            blobs += image_bytes(pf.read_row_group(g, columns=["image"])["image"].to_pylist())
+            w.add(image_bytes(pf.read_row_group(g, columns=["image"])["image"].to_pylist()))
         if data:
             n_lat = len(np.load(os.path.join(data, f"{name}.off.npy"))) - 1
-            assert n_lat == len(blobs), f"{name}: {len(blobs)} images, {n_lat} in {data}"
-        size = pack(blobs, base)
+            assert n_lat == len(w.sizes), f"{name}: {len(w.sizes)} images, {n_lat} in {data}"
+        n, size = w.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return name, len(blobs), size, False
+    return name, n, size, False
 
 
 def cmd_flux_reason(a):
@@ -78,10 +104,9 @@ def cmd_flux_reason(a):
     os.makedirs(a.out, exist_ok=True)
     print(f"{len(by_name)} parquets, {len(names)} selected ({len(val)} held-out) -> {a.out}", flush=True)
     t0, done, imgs, gb = time.time(), 0, 0, 0.0
-    with ThreadPoolExecutor(a.workers) as ex:
-        futs = [ex.submit(flux_reason_one, by_name[n], a.out, a.data, a.tmp or a.out) for n in names]
-        for fut in as_completed(futs):
-            name, n, size, skipped = fut.result()
+    jobs = [(by_name[n], a.out, a.data, a.tmp or a.out) for n in names]
+    with Pool(a.workers, maxtasksperchild=1) as pool:
+        for name, n, size, skipped in pool.imap_unordered(flux_reason_one, jobs):
             done += 1
             imgs += n
             gb += size / 1e9
