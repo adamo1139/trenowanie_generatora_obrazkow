@@ -6,7 +6,7 @@ read with mmap like the latents.
   # disk peak is the packed size + --workers parquets). Shard names and row order are those of the latent shards in
   # --data (QLNI/FLUX-Reason-6M-flux2-latents), so their captions / tokens (.off.npy, .tok_poziomka*.npy) apply as is;
   # with --data the image count of every shard is checked against its .off.npy.
-  python prepare_images.py flux-reason --out data/flux_reason_1024 --data data/aurora_full --workers 4
+  python prepare_images.py flux-reason --out data/flux_reason_1024 --data data/aurora_full --workers 16
   python prepare_images.py flux-reason --out data/flux_reason_1024 --fraction 0.5   # half of the training shards
 
   # MONET parquets of prepare_monet.py: their 384 px WEBP thumbnails, next to each parquet
@@ -134,7 +134,7 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--data", default="", help="latent shards to check the image counts against (their .off.npy)")
     s.add_argument("--fraction", type=float, default=1.0, help="of the training shards (held-out ones always)")
-    s.add_argument("--workers", type=int, default=4, help="parquets downloaded and packed at once")
+    s.add_argument("--workers", type=int, default=16, help="parquets downloaded and packed at once (one process each)")
     s.add_argument("--tmp", default="", help="where the parquets are downloaded to (default --out)")
     s.add_argument("--max-shards", type=int, default=0, help="only the first N selected shards (a test)")
     s = sub.add_parser("monet")
