@@ -114,7 +114,8 @@ def parquet_mode(a, translate):
             json.dump(st, fh)
         dt = time.time() - t0
         print(f"[{n + 1}/{len(mine)}] {os.path.relpath(path, a.parquet_dir)}: {st['captions']} captions, "
-              f"{st['quoted']} quoted, {st['retried']} retried, {st['flagged']} flagged, {len(uniq) / dt:.1f} captions/s",
+              f"{st['quoted']} quoted, {st['retried']} retried, {st['flagged']} flagged, {st['too_long']} too long, "
+              f"{len(uniq) / dt:.1f} captions/s",
               flush=True)
 
 
@@ -157,13 +158,25 @@ def main():
         except TypeError:
             return tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
 
+    max_in = 4096 - a.max_tokens  # max_model_len minus the output budget
+
     def translate(texts):
-        """Unique English captions -> Polish, with quoted-span protection, a retry without it, and counters."""
+        """Unique English captions -> Polish, with quoted-span protection, a retry without it, and counters. A caption
+        whose prompt does not fit the context (degenerate VLM output, a phrase repeated thousands of times) is not
+        translated: None, i.e. the English caption at tokenisation, instead of vLLM rejecting the whole call."""
         prot = [protect(t) for t in texts]
-        outs = [o.outputs[0].text.strip() for o in llm.generate([prompt(pt) for pt, _ in prot], params)]
+        prompts = [prompt(pt) for pt, _ in prot]
+        fits = [len(tok(p, add_special_tokens=False).input_ids) <= max_in for p in prompts]
+        ok = [i for i, f in enumerate(fits) if f]
+        outs = [None] * len(texts)
+        for i, o in zip(ok, llm.generate([prompts[i] for i in ok], params)):
+            outs[i] = o.outputs[0].text.strip()
         res, retry, st = [], [], dict(captions=len(texts), quoted=sum(bool(s) for _, s in prot), retried=0, flagged=0,
-                                      out_tokens=0)
+                                      out_tokens=0, too_long=len(texts) - len(ok))
         for i, ((pt, spans), out) in enumerate(zip(prot, outs)):
+            if out is None:
+                res.append(None)
+                continue
             r = restore(out, spans) if spans else out
             if r is None:
                 retry.append(i)
@@ -174,7 +187,7 @@ def main():
             for i, out in zip(retry, outs2):
                 res[i] = out
         for t, r in zip(texts, res):
-            st["flagged"] += suspicious(t, r)
+            st["flagged"] += r is not None and suspicious(t, r)
             st["out_tokens"] += len(tok(r, add_special_tokens=False).input_ids) if r else 0
         return res, st
 
