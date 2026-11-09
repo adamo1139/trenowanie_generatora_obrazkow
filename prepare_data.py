@@ -279,6 +279,64 @@ def cmd_tokenize_parquet(args):
                   + (f", {fb} flagged -> English" if args.lang else ""), flush=True)
 
 
+HF_CAPTIONS = "cpral/FLUX-Reason-6M-captions-pl"
+
+
+def tokenize_hf_file(path: str, out: str, tokenizer_path: str, encoder: str):
+    """One parquet of cpral/FLUX-Reason-6M-captions-pl (shard, row, captions_en, captions_pl, pl_flagged) -> for every
+    shard in it <out>/<shard>.off.npy, .tok_<encoder>.npy and .tok_<encoder>_pl.npy, the layout `tokenize` writes from
+    .caps.json (a flagged translation is replaced by its English caption, as there). Rows are images in the order of
+    the LucasFang/FLUX-Reason-6M parquets; an image without captions gets none (the null prompt in training)."""
+    import pyarrow.parquet as pq
+    from tokenizers import Tokenizer
+    tok, cfg = Tokenizer.from_file(tokenizer_path), ENCODERS[encoder]
+    t = pq.read_table(path).to_pylist()
+    by_shard = {}
+    for r in t:
+        by_shard.setdefault(r["shard"], {})[r["row"]] = r
+    done = []
+    for shard, rows in sorted(by_shard.items()):
+        img_off = os.path.join(out, f"{shard}.img.off.npy")
+        n = len(np.load(img_off)) - 1 if os.path.exists(img_off) else max(rows) + 1
+        assert max(rows) < n, f"{shard}: caption row {max(rows)} but {n} images"
+        en, pl, off, fb = [], [], np.zeros(n + 1, dtype=np.int64), 0
+        for i in range(n):
+            r = rows.get(i)
+            if r:
+                for e, p, bad in zip(r["captions_en"], r["captions_pl"], r["pl_flagged"]):
+                    if e and e.split():
+                        en.append(" ".join(e.split()))
+                        pl.append(" ".join((e if bad or not p else p).split()))
+                        fb += bool(bad or not p)
+            off[i + 1] = len(en)
+        w = cfg["width"]
+        for texts, suffix in ((en, f"tok_{encoder}"), (pl, f"tok_{encoder}_pl")):
+            rows_np = np.full((len(texts), w), cfg["pad"], dtype=np.uint16)
+            for j, e in enumerate(tok.encode_batch(texts, add_special_tokens=False)):
+                ids = e.ids[: w - 1]
+                rows_np[j, 0] = cfg["bos"]
+                rows_np[j, 1:1 + len(ids)] = ids
+            save_npy(os.path.join(out, f"{shard}.{suffix}.npy"), rows_np)
+        save_npy(os.path.join(out, f"{shard}.off.npy"), off)  # written last = shard tokenised
+        done.append((shard, n, len(en), fb))
+    return done
+
+
+def cmd_tokenize_hf(args):
+    from huggingface_hub import HfApi, hf_hub_download
+    tokenizer = hf_hub_download(ENCODERS[args.encoder]["repo"], "tokenizer.json")
+    files = sorted(s.rfilename for s in HfApi().dataset_info(HF_CAPTIONS).siblings if s.rfilename.endswith(".parquet"))
+    os.makedirs(args.out, exist_ok=True)
+    print(f"{HF_CAPTIONS}: {len(files)} parquets -> {args.out}", flush=True)
+    paths = [hf_hub_download(HF_CAPTIONS, f, repo_type="dataset") for f in files]
+    with ProcessPoolExecutor(args.workers) as ex:
+        futs = [ex.submit(tokenize_hf_file, p, args.out, tokenizer, args.encoder) for p in paths]
+        for i, fut in enumerate(as_completed(futs)):
+            got = fut.result()
+            print(f"[{i + 1}/{len(futs)}] {len(got)} shards, {sum(g[1] for g in got):,} images, "
+                  f"{sum(g[2] for g in got):,} captions, {sum(g[3] for g in got):,} Polish -> English", flush=True)
+
+
 def cmd_tokenize(args):
     names = sorted(os.path.basename(p)[: -len(".caps.json")] for p in glob.glob(os.path.join(args.data, "*.caps.json")))
     tokenizer = args.tokenizer
@@ -324,6 +382,10 @@ def main():
                    "(writes <shard>.tok_<encoder>_<lang>.npy; e.g. --encoder poziomka --lang pl)")
     s.add_argument("--workers", type=int, default=8)
     s.add_argument("--force", action="store_true")
+    s = sub.add_parser("tokenize-hf", help=f"captions + tokens of every FLUX-Reason shard from {HF_CAPTIONS}")
+    s.add_argument("--out", required=True)
+    s.add_argument("--encoder", choices=sorted(ENCODERS), default="poziomka")
+    s.add_argument("--workers", type=int, default=8)
     s = sub.add_parser("tokenize-parquet", help="prepare_monet.py parquets: one caption per image")
     s.add_argument("--parquet-dir", required=True)
     s.add_argument("--encoder", choices=sorted(ENCODERS), default="poziomka")
@@ -333,7 +395,7 @@ def main():
     s.add_argument("--force", action="store_true")
     args = p.parse_args()
     {"inspect": cmd_inspect, "convert": cmd_convert, "tokenize": cmd_tokenize,
-     "tokenize-parquet": cmd_tokenize_parquet}[args.cmd](args)
+     "tokenize-parquet": cmd_tokenize_parquet, "tokenize-hf": cmd_tokenize_hf}[args.cmd](args)
 
 
 if __name__ == "__main__":

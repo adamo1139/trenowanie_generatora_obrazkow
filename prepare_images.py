@@ -6,7 +6,9 @@ read with mmap like the latents.
   # disk peak is the packed size + --workers parquets). Shard names and row order are those of the latent shards in
   # --data (QLNI/FLUX-Reason-6M-flux2-latents), so their captions / tokens (.off.npy, .tok_poziomka*.npy) apply as is;
   # with --data the image count of every shard is checked against its .off.npy.
-  python prepare_images.py flux-reason --out data/flux_reason_1024 --data data/aurora_full --workers 16
+  python prepare_images.py flux-reason --out data/flux_reason_1024 --workers 16
+  # captions + Poziomka tokens for them, from cpral/FLUX-Reason-6M-captions-pl (shard + row aligned):
+  python prepare_data.py tokenize-hf --out data/flux_reason_1024
   python prepare_images.py flux-reason --out data/flux_reason_1024 --fraction 0.5   # half of the training shards
 
   # MONET parquets of prepare_monet.py: their 384 px WEBP thumbnails, next to each parquet
@@ -83,9 +85,10 @@ def flux_reason_one(job):
         w = PackWriter(base)
         for g in range(pf.metadata.num_row_groups):
             w.add(image_bytes(pf.read_row_group(g, columns=["image"])["image"].to_pylist()))
-        if data:
-            n_lat = len(np.load(os.path.join(data, f"{name}.off.npy"))) - 1
-            assert n_lat == len(w.sizes), f"{name}: {len(w.sizes)} images, {n_lat} in {data}"
+        ref = os.path.join(data, f"{name}.off.npy") if data else ""
+        if ref and os.path.exists(ref):  # captions already there (prepare_data.py tokenize-hf): same image count
+            n_cap = len(np.load(ref)) - 1
+            assert n_cap == len(w.sizes), f"{name}: {len(w.sizes)} images, {n_cap} caption rows in {data}"
         n, size = w.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

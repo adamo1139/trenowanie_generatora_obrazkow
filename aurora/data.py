@@ -66,10 +66,10 @@ def select_fraction(train_names, fraction: float):
     return sorted(picked)
 
 
-def full_shard_list(root: str):
+def full_shard_list(root: str, img_root: str = ""):
     """All shards of the source dataset (manifest.json from prepare_data.py), else whatever is prepared."""
     manifest = os.path.join(root, "manifest.json")
-    return json.load(open(manifest))["shards"] if os.path.exists(manifest) else list_shards(root)
+    return json.load(open(manifest))["shards"] if os.path.exists(manifest) else list_shards(root, img_root)
 
 
 def tok_kind(suffix: str = "") -> str:
@@ -82,7 +82,7 @@ def select_shards(root: str, fraction: float, tok_suffix: str = "", alt_suffix: 
     kinds = [tok_kind(tok_suffix)] + ([tok_kind(alt_suffix)] if alt_suffix else [])
     present = [n for n in list_shards(root, img_root)
                if all(os.path.exists(os.path.join(root, f"{n}.{k}.npy")) for k in kinds)]
-    train, val = split_shards(full_shard_list(root))
+    train, val = split_shards(full_shard_list(root, img_root))
     train = select_fraction(train, fraction)
     missing = sorted(set(train + val) - set(present))
     if missing:
