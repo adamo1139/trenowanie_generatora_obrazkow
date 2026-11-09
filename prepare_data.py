@@ -229,8 +229,10 @@ def tokenize_one(name: str, data: str, tokenizer_path: str, encoder: str = "", l
 def tokenize_parquet_one(path: str, tokenizer_path: str, encoder: str, column: str, lang: str = ""):
     """prepare_monet.py parquet (one caption per image in `column`, or its translation <file>.<lang>.parquet column
     <column>_<lang>) -> <file>.tok_<encoder>[_<lang>].npy, one row per image in the parquet's order. "The image shows"
-    boilerplate is dropped (translate_captions.strip_prefix). A missing caption, or a translation flagged as broken,
-    becomes the English caption (Polish) or an empty prompt (English: BOS only, like the CFG null prompt)."""
+    boilerplate is dropped from the English (translate_captions.strip_prefix); the translations are taken as they are,
+    since translate_captions.py --strip-prefix already dropped it before translating (stripping "Obraz przedstawia"
+    afterwards would also cut "A painting of ..." -> "Obraz przedstawia ..."). A missing caption, or a translation
+    flagged as broken, becomes the English caption (Polish) or an empty prompt (English: BOS only, the CFG null prompt)."""
     import pyarrow.parquet as pq
     from tokenizers import Tokenizer
     from translate_captions import strip_prefix, suspicious
@@ -243,7 +245,6 @@ def tokenize_parquet_one(path: str, tokenizer_path: str, encoder: str, column: s
         assert pl["__key__"].to_pylist() == pq.read_table(path, columns=["__key__"])["__key__"].to_pylist(), path
         texts = []
         for e, p in zip(en, pl[f"{column}_{lang}"].to_pylist()):
-            p = strip_prefix(p, lang) if p else p
             bad = bool(e) and (not p or suspicious(e, p))
             fallback += bad
             texts.append(e if bad else p)

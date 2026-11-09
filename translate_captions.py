@@ -36,7 +36,8 @@ CJK = re.compile(r"[぀-ヿ㐀-鿿]")
 PREFIX_EN = re.compile(r"^(?:(?:the|this) (?:image|picture|photo(?:graph)?|illustration) (?:shows(?: shows| features| "
                        r"depicts)?|depicts|features|captures|presents|displays|showcases|is(?: of)?)|in (?:this|the) "
                        r"(?:image|picture)(?:,)? (?:we can see|there (?:is|are)|we see)|it is)\s+", re.I)
-# the same in Polish translations; only verbs that take what follows as their object (not "jest" + instrumental)
+# the same in Polish; not applied to translations of --strip-prefix captions, where "Obraz przedstawia" can be the
+# translation of "A painting of" (only verbs that take what follows as their object, not "jest" + instrumental)
 PREFIX_PL = re.compile(r"^(?:(?:ten |to )?(?:obraz(?:ek)?|zdjęcie|ilustracja|fotografia)(?: ten)? (?:przedstawia|pokazuje|"
                        r"ukazuje|prezentuje)|na (?:tym )?(?:obrazie|obrazku|zdjęciu|ilustracji|fotografii),? (?:widać|"
                        r"widzimy|znajduje się|znajdują się))\s*:?\s+", re.I)
