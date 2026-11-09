@@ -1,7 +1,7 @@
 """Faces side by side for several models (e.g. before / after --opd): rows = models, columns = prompts, one grid per
 seed; every model gets the same prompts and noise. Models load one at a time (fits a 16 GB GPU).
 
-  python tests/face_sweep.py --models cpral/HomeIMG-1.2B-PL-epoch22:3 cpral/HomeIMG-1.2B-PL-epoch22-OPD300:1 \\
+  python tests/face_sweep.py --models cpral/HomeIMG-1.2B-PL-EN-epoch22:3 cpral/HomeIMG-1.2B-PL-EN-epoch22-OPD300:1 \\
       --out-dir faces --seeds 0 1 --cache-dir /path/with/space
 """
 import argparse
@@ -30,7 +30,7 @@ FACES_PL = [
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--models", nargs="+", required=True, help="repo_or_dir:cfg, e.g. cpral/HomeIMG-1.2B-PL-epoch22:3")
+    p.add_argument("--models", nargs="+", required=True, help="repo_or_dir:cfg, e.g. cpral/HomeIMG-1.2B-PL-EN-epoch22:3")
     p.add_argument("--prompts", nargs="+", default=FACES_PL)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     p.add_argument("--steps", type=int, default=50)

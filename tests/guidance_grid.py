@@ -13,7 +13,7 @@ Options per method after "|": shift=S (time grid t = S u / (1 + (S - 1) u), u = 
 noise, as AuroraIMG2-100M samples with S = 1.5) and off=T (no guidance while t <= T: plain conditional velocity on the
 last, lowest-noise steps; AuroraIMG2-100M uses 0.05).
 
-  python tests/guidance_grid.py --model cpral/HomeIMG-641M-PL-stage1 --out-dir guidance \\
+  python tests/guidance_grid.py --model cpral/HomeIMG-641M-PL-EN-stage1 --out-dir guidance \\
       --methods cfg:3 "cfg:3|shift=1.5|off=0.05" cfgzero:3 ag:cpral/HomeIMG-50M:2
 """
 import argparse
@@ -93,7 +93,7 @@ def sample(good, prompts, method, guides, steps, seed, device, decode=True):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="cpral/HomeIMG-641M-PL-stage1")
+    p.add_argument("--model", default="cpral/HomeIMG-641M-PL-EN-stage1")
     p.add_argument("--methods", nargs="+", default=["cfg:3", "cfgzero:3", "ag:cpral/HomeIMG-253M:2",
                                                      "ag:cpral/HomeIMG-50M:2"])
     p.add_argument("--steps", type=int, default=50)

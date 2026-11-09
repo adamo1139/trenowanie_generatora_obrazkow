@@ -4,8 +4,8 @@ repo). By default the README prompts in English and in Polish, with the same noi
 two languages can be compared image by image; --prompt for your own. --export writes the weights (EMA) as
 safetensors + configs + the decoder, for a Hub upload.
 
-  python sample_ckpt.py runs/poziomka_stage1/latest.pt --out-dir exports/HomeIMG-641M-PL-stage1 --export
-  python sample_ckpt.py cpral/HomeIMG-641M-PL-stage1 --out-dir out --prompt "rudy kot na parapecie" "a red cat"
+  python sample_ckpt.py runs/poziomka_stage1/latest.pt --out-dir exports/HomeIMG-641M-PL-EN-stage1 --export
+  python sample_ckpt.py cpral/HomeIMG-641M-PL-EN-stage1 --out-dir out --prompt "rudy kot na parapecie" "a red cat"
 """
 import argparse
 import json

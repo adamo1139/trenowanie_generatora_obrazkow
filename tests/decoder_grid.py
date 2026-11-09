@@ -1,7 +1,7 @@
 """Same latents, two FLUX.2 decoders: top row the small decoder shipped with HomeIMG, bottom row the full one.
 Both share the encoder (identical latent normalisation), so only the decoding differs. Saved 1:1 and 2x (nearest).
 
-  python tests/decoder_grid.py --model cpral/HomeIMG-641M-PL-epoch19 --full kaiyuyue/FLUX.2-dev-vae
+  python tests/decoder_grid.py --model cpral/HomeIMG-641M-PL-EN-epoch19 --full kaiyuyue/FLUX.2-dev-vae
 """
 import argparse
 import os
@@ -17,7 +17,7 @@ from guidance_grid import FACES, GENERAL, load, sample  # noqa: E402
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="cpral/HomeIMG-641M-PL-epoch19")
+    p.add_argument("--model", default="cpral/HomeIMG-641M-PL-EN-epoch19")
     p.add_argument("--full", default="kaiyuyue/FLUX.2-dev-vae", help="repo[:subfolder] of the full VAE")
     p.add_argument("--cfg", type=float, default=3.0)
     p.add_argument("--steps", type=int, default=50)

@@ -2,7 +2,7 @@
 
   python sample.py exports/aurora-step247805 --out grid.png
   python sample.py AuroraIMG2-50M-Preview --out grid_ref.png
-  python sample.py exports/HomeIMG-641M-PL-stage1 --lang pl --out exports/HomeIMG-641M-PL-stage1/grid_pl.png
+  python sample.py exports/HomeIMG-641M-PL-EN-stage1 --lang pl --out exports/HomeIMG-641M-PL-EN-stage1/grid_pl.png
 """
 import argparse
 
