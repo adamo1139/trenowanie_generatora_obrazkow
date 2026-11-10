@@ -299,6 +299,17 @@ class TrainStream(IterableDataset):
             m += nw
 
 
+def val_groups(root: str, names, n: int):
+    """[(shard, count)]: how load_val's n images split over its shards (consecutive, in `names` order)."""
+    per = -(-n // len(names))
+    out, left = [], n
+    for name in names:
+        k = min(per, len(np.load(os.path.join(root, f"{name}.off.npy"))) - 1, left)
+        out.append((name, k))
+        left -= k
+    return out
+
+
 def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat", lat_root: str = "",
              img_res: int = 0):
     """First n images of the held-out shards (round-robin across shards), first caption each. img_res: uint8 images

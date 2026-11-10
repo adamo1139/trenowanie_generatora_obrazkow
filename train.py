@@ -413,10 +413,11 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
 
 
 @torch.no_grad()
-def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None):
+def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=()):
     """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs.
     lm_states: optional precomputed frozen-LM states, one tensor per `chunk` of captions (trimmed the same way), for
-    text encoders whose LM is not held whole on this rank (train_pp.py --lm-split)."""
+    text encoders whose LM is not held whole on this rank (train_pp.py --lm-split).
+    groups: [(label, count)] consecutive runs of the held-out set (e.g. its shards): also val_<label>/loss each."""
     lat, ids = val
     if getattr(te.config, "kind", "") == "lm" and getattr(te.config, "backend", "") == "hf":
         chunk = min(chunk, 64)  # a big MoE LM's routing buffers at 256 captions x 256 tokens would not fit next to training
@@ -426,6 +427,7 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None):
     te.eval(), den.eval()
     tot, n = 0.0, 0
     buckets = torch.zeros(4), torch.zeros(4)
+    per_all = []
     for i in range(0, len(lat), chunk):
         x0 = lat[i:i + chunk].to(device).float()
         t, eps = t_all[i:i + chunk].to(device), eps_all[i:i + chunk].to(device)
@@ -440,6 +442,7 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None):
             tt = t.view(-1, 1, 1, 1)
             v = den((1 - tt) * x0 + tt * eps, t, text, valid)
         per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
+        per_all.append(per)
         tot += per.sum().item()
         n += len(per)
         b = (t.cpu() * 4).long().clamp(max=3)
@@ -449,6 +452,10 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None):
     out = {"val/loss": tot / n}
     for k in range(4):
         out[f"val/loss_t{k / 4:.2f}-{(k + 1) / 4:.2f}"] = (buckets[0][k] / buckets[1][k].clamp(min=1)).item()
+    per_all, i = torch.cat(per_all), 0
+    for label, count in groups:
+        out[f"val_{label}/loss"] = per_all[i:i + count].mean().item()
+        i += count
     return out
 
 

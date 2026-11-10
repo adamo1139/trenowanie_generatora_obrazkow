@@ -40,6 +40,7 @@ import glob
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import asdict, replace
 
@@ -51,7 +52,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
-from aurora.data import ConcatStore, ShardStore, TrainStream, load_val, select_shards
+from aurora.data import ConcatStore, ShardStore, TrainStream, load_val, select_shards, val_groups
 from aurora.model import (CrossAttention, Denoiser, DenoiserConfig, LMEncoderConfig, TextAttention, TextEncoder,
                           build_rope_2d, default_micro_cond, make_configs, micro_cond_embedding,
                           random_rope_coords, rope_2d_from_coords, te_config_from_dict, timestep_embedding)
@@ -118,6 +119,9 @@ def get_args():
     p.add_argument("--img-extra-val", nargs="*", default=[],
                    help="per --img-extra source, the file kept out of training as its validation set, e.g. 45-0/000005 "
                         "(logged as val_<folder>/...; val/ is the --img-dir held-out shards, val_all/ both together)")
+    p.add_argument("--val-per-shard", action="store_true",
+                   help="also log the loss of every held-out shard of --data on its own (val_<shard>/loss, e.g. "
+                        "val_aesthetics-part01, val_text): the same images as val/, no extra compute")
     p.add_argument("--enc-vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 whose encoder makes the latents")
     p.add_argument("--enc-chunk", type=int, default=8, help="images per encoder call (memory)")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
@@ -1047,6 +1051,11 @@ def main():
         if img_res:  # the held-out images encoded once, as stored latents would be
             val = (torch.cat([encoder(val[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(val[0]), 64)]),
                    val[1])
+    val_shard_groups = ()
+    if master and val_names and args.val_per_shard:  # fluxdb-text-00142-of-00143 -> text
+        val_shard_groups = [(re.sub(r"^fluxdb-|-\d+-of-\d+$", "", s), k)
+                            for s, k in val_groups(args.data, val_names, args.val_samples)]
+        log("validation per shard: " + ", ".join(f"{g} {k}" for g, k in val_shard_groups))
     # --img-extra: each source's held-out file is a second validation set, logged as val_<folder>/...
     val_extra = {}
     if master and img_res:
@@ -1180,7 +1189,7 @@ def main():
         den_eval.rope_cos, den_eval.rope_sin = cos.to(device), sin.to(device)
         te_live = [p.detach().clone() for p in te.parameters()]
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])
-        res = evaluate(te, den_eval, val, device, lm_states=val_lm)
+        res = evaluate(te, den_eval, val, device, lm_states=val_lm, groups=val_shard_groups)
         if val_extra:  # every source on its own, and val_all/: all held-out images together (size-weighted)
             n_all, sums = len(val[0]), {k: x * len(val[0]) for k, x in res.items()}
             for label, (v, v_lm) in val_extra.items():
