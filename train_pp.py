@@ -1191,7 +1191,8 @@ def main():
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])
         res = evaluate(te, den_eval, val, device, lm_states=val_lm, groups=val_shard_groups)
         if val_extra:  # every source on its own, and val_all/: all held-out images together (size-weighted)
-            n_all, sums = len(val[0]), {k: x * len(val[0]) for k, x in res.items()}
+            # only the val/ keys: val_<shard>/ (--val-per-shard) has no counterpart in the other sources
+            n_all, sums = len(val[0]), {k: x * len(val[0]) for k, x in res.items() if k.startswith("val/")}
             for label, (v, v_lm) in val_extra.items():
                 got = evaluate(te, den_eval, v, device, lm_states=v_lm)
                 res.update({k.replace("val/", f"{label}/", 1): x for k, x in got.items()})
