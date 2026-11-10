@@ -151,9 +151,10 @@ def get_args():
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-states", type=int, default=4,
                    help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
-    p.add_argument("--lm-gpu", type=int, default=2,
+    p.add_argument("--lm-gpu", type=int, default=4,
                    help="--lm-rank: physical GPU (nvidia-smi / PCI bus order) of the (last) LM server rank, the training "
-                        "ranks take the others; on adamo-rigga GPU 2 runs hottest and the LM GPU is only ~50%% busy. "
+                        "ranks take the others; on adamo-rigga GPU 4 runs hottest (junction 104 C, it throttled and "
+                        "held every MuLoCo sync back) and the LM GPU is only ~15-50%% busy. "
                         "-1 = plain rank order")
     p.add_argument("--lm-split", action="store_true",
                    help="frozen transformers LM (Poziomka) split by layers over the pipeline's stages: each GPU holds "
