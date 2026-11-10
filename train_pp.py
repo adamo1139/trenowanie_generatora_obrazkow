@@ -286,6 +286,34 @@ class Stage(nn.Module):
 
 
 @torch.no_grad()
+def host_rss_gb():
+    """Resident memory of this process and its children (the DataLoader workers), GB: a growing host-RAM footprint
+    gets the run killed by the OOM killer (it happened at a checkpoint save, the RAM peak of rank 0)."""
+    def rss(pid):
+        try:
+            with open(f"/proc/{pid}/status") as fh:
+                return next(int(l.split()[1]) for l in fh if l.startswith("VmRSS:")) / 2**20
+        except (OSError, StopIteration):
+            return 0.0
+    me, total = os.getpid(), 0.0
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat") as fh:
+                    if int(fh.read().rsplit(")", 1)[1].split()[1]) == me:
+                        total += rss(d)
+            except (OSError, IndexError, ValueError):
+                pass
+    return rss(me) + total
+
+
+def host_ram_used_gb():
+    """(used, total) host RAM in GB, used = MemTotal - MemAvailable."""
+    with open("/proc/meminfo") as fh:
+        m = {l.split(":")[0]: int(l.split()[1]) for l in fh}
+    return (m["MemTotal"] - m["MemAvailable"]) / 2**20, m["MemTotal"] / 2**20
+
+
 def average_params(params, n, group, bucket=64 * 2**20):
     """MuLoCo with outer lr 1 and no momentum: every replica's weights become the replicas' mean (fp32 all-reduce in
     buckets of ~`bucket` elements)."""
@@ -1475,8 +1503,8 @@ def main():
             mem_s = ""
             if device.type == "cuda":
                 ms = torch.cuda.memory_stats(device)
-                mine_mem = torch.tensor([ms.get("allocated_bytes.all.peak", 0) / 2**30, ms.get("num_alloc_retries", 0), opt_ms, opt_max_ms],
-                                        device=device)
+                mine_mem = torch.tensor([ms.get("allocated_bytes.all.peak", 0) / 2**30, ms.get("num_alloc_retries", 0), opt_ms, opt_max_ms,
+                                         host_rss_gb()], device=device)
                 all_mem = [torch.zeros_like(mine_mem) for _ in range(world)]
                 dist.all_gather(all_mem, mine_mem, group=train_group)
                 all_mem = torch.stack(all_mem).cpu()
@@ -1486,6 +1514,12 @@ def main():
                 stats["opt_global_max_ms"] = all_mem[:, 3].max().item()
                 stats.update({"mem_peak_gb": all_mem[worst, 0].item(), "alloc_retries": retries})
                 mem_s = f" | mem {all_mem[worst, 0]:.1f} GB (GPU {worst}){f', ALLOC RETRIES {retries}' if retries else ''}"
+                used, total = host_ram_used_gb()
+                big = int(all_mem[:, 4].argmax())
+                stats.update({"host_ram_used_gb": used, "host_rss_max_rank_gb": all_mem[big, 4].item(),
+                              "host_rss_ranks_gb": all_mem[:, 4].sum().item()})
+                mem_s += (f" | RAM {used:.0f}/{total:.0f} GB, ranks+workers {all_mem[:, 4].sum():.0f} GB "
+                          f"(max {all_mem[big, 4]:.1f} GB, rank {big})")
             # Include statistics / communication in the window. The timestamp is taken before print;
             # printing, W&B and any following eval/checkpoint are included in the next window.
             stamp = time.time()
