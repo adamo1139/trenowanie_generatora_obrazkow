@@ -285,7 +285,6 @@ class Stage(nn.Module):
         return x, t6, text, validf
 
 
-@torch.no_grad()
 def host_rss_gb():
     """Resident memory of this process and its children (the DataLoader workers), GB: a growing host-RAM footprint
     gets the run killed by the OOM killer (it happened at a checkpoint save, the RAM peak of rank 0)."""
@@ -314,6 +313,7 @@ def host_ram_used_gb():
     return (m["MemTotal"] - m["MemAvailable"]) / 2**20, m["MemTotal"] / 2**20
 
 
+@torch.no_grad()
 def average_params(params, n, group, bucket=64 * 2**20):
     """MuLoCo with outer lr 1 and no momentum: every replica's weights become the replicas' mean (fp32 all-reduce in
     buckets of ~`bucket` elements)."""
