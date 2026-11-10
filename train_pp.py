@@ -1204,8 +1204,12 @@ def main():
             f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift {args.t_shift:.2f}")
     if args.rope_random or args.micro_cond:
+        whole = default_micro_cond(args.micro_cond, args.res, 1)[0].int().tolist() if args.micro_cond else None
+        mc = ("off" if not args.micro_cond else
+              f"from the loader (crops of a {args.micro_cond} px original, else {whole})" if has_cond else
+              f"every sample a whole image: {whole} [orig h, w, crop t, l, b, r, target h, w], as at sampling")
         log(f"RPE-2D: {'random positions of 0..' + str(args.rope_ref - 1) if args.rope_random else 'even positions'}"
-            f", micro-conditioning {'on (original ' + str(args.micro_cond) + ' px)' if args.micro_cond else 'off'}")
+            f", micro-conditioning {mc}")
     log(f"lr: {args.schedule} after {warmup} warmup steps, Muon {args.lr_muon}, AdamW x{args.lr_scale:.2f}, "
         f"EMA {args.ema:.5f}; sync: {'MuLoCo every %d steps%s' % (args.diloco, ' (plain averaging, no global copy)' if plain_avg else '') if replicas > 1 and args.diloco else 'gradients every step' if replicas > 1 else 'single pipeline'}")
     acc = torch.zeros(4, device=device)  # sum loss, n, sum repa, n repa
