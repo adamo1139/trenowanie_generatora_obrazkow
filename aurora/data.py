@@ -162,8 +162,8 @@ class ShardStore:
         so it also finds the English original of a Polish caption (CaptionText)."""
         self._open()
         picked = np.full((len(indices), 2), -1, dtype=np.int64)
-        r = self.img_res
-        lat = (np.empty((len(indices), 3, r, r), dtype=np.uint8) if r
+        res = self.img_res
+        lat = (np.empty((len(indices), 3, res, res), dtype=np.uint8) if res
                else np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16))
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         n = lat.shape[-1]  # target grid side
@@ -179,9 +179,9 @@ class ShardStore:
                 lat[j] = src[i, :, r:r + n, c:c + n]
                 px = self.cond_base / side  # original pixels per source token
                 cond[j, 2:6] = r * px, c * px, (r + n) * px, (c + n) * px
-            elif r:
+            elif res:
                 blob, off = self._lat[s]
-                lat[j] = decode_image(blob[off[i]:off[i + 1]], r)
+                lat[j] = decode_image(blob[off[i]:off[i + 1]], res)
             else:
                 lat[j] = self._lat[s][i]
             lo, hi = self.offs[s][i], self.offs[s][i + 1]
