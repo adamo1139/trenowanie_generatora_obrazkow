@@ -717,6 +717,7 @@ def main():
     assert all(r > args.res for r in args.crop_res), "--crop-res must be larger than --res"
     assert not (args.img_dir and args.crop_res), "--crop-res crops stored latents; not with --img-dir"
     assert args.img_dir or not args.img_extra, "--img-extra needs --img-dir"
+    assert not (args.img_extra and args.lm_split), "--img-extra validation sets have no --lm-split LM states"
     lat_kind = "lat" if args.res == 256 else f"lat{args.res}"
     assert not args.freeze_den, "--freeze-den is only supported by train.py"
     assert not args.ema_cpu or (args.diloco and world > pp), "--ema-cpu needs --diloco with several pipelines"
@@ -986,6 +987,18 @@ def main():
     # images: every sample is a whole image, so no micro-conditions from the loader (the model's default ones)
     has_cond = bool(args.micro_cond) and not args.img_dir
     img_res = args.res if args.img_dir else 0
+
+    def extra_names(d):
+        """(training files, held-out file) of an --img-extra source: one file, picked with a fixed seed (the same on
+        every rank and in every run), is kept out of training as that source's own validation set."""
+        names = sorted(os.path.relpath(p, d)[: -len(".img.off.npy")]
+                       for p in glob.glob(os.path.join(d, "*", "*.img.off.npy")))
+        names = [n for n in names if all(os.path.exists(os.path.join(d, f"{n}.{k}.npy"))
+                                         for k in ("off", f"tok_{tok_suffix}") + ((f"tok_{alt_suffix}",)
+                                                                                   if alt_suffix else ()))]
+        assert len(names) > 1, f"--img-extra {d}: no shards with images and tokens"
+        held = names[int(np.random.default_rng(20261110).integers(len(names)))]
+        return [n for n in names if n != held], held
     encoder = None
     loader = store = None
     if needs_data:
@@ -999,15 +1012,10 @@ def main():
             sources = [f"{args.img_dir}: {len(store):,}"]
             stores = [store]
             for d in args.img_extra:
-                names = sorted(os.path.relpath(p, d)[: -len(".img.off.npy")]
-                               for p in glob.glob(os.path.join(d, "*", "*.img.off.npy")))
-                names = [n for n in names if all(os.path.exists(os.path.join(d, f"{n}.{k}.npy"))
-                                                 for k in ("off", f"tok_{tok_suffix}") + ((f"tok_{alt_suffix}",)
-                                                                                           if alt_suffix else ()))]
-                assert names, f"--img-extra {d}: no shards with images and tokens"
+                names, held = extra_names(d)
                 stores.append(ShardStore(d, names, tok_suffix, null_np, alt_suffix, args.pl_prob, "img", d,
                                          img_res=img_res))
-                sources.append(f"{d}: {len(stores[-1]):,}")
+                sources.append(f"{d}: {len(stores[-1]):,} (held out for validation: {held})")
             store = ConcatStore(stores) if len(stores) > 1 else store
             encoder = LatentEncoder(args.enc_vae, device, args.enc_chunk)
             log(f"images -> latents in the loop ({args.enc_vae} encoder, {args.res} px): " + ", ".join(sources))
@@ -1036,6 +1044,15 @@ def main():
         if img_res:  # the held-out images encoded once, as stored latents would be
             val = (torch.cat([encoder(val[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(val[0]), 64)]),
                    val[1])
+    # --img-extra: each source's held-out file is a second validation set, logged as val_<folder>/...
+    val_extra = {}
+    if master and img_res:
+        for d in args.img_extra:
+            _, held = extra_names(d)
+            v = load_val(d, [held], args.val_samples, tok_suffix, te.null_ids(), "img", d, img_res)
+            v = (torch.cat([encoder(v[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(v[0]), 64)]), v[1])
+            val_extra[f"val_{os.path.basename(d.rstrip('/'))}"] = [v, None]
+            log(f"validation: {len(v[0])} images of {d}/{held} as val_{os.path.basename(d.rstrip('/'))}")
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
         ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
                                                 ids_enc.null_ids(), "img" if img_res else lat_kind,
@@ -1067,6 +1084,11 @@ def main():
             val_lm.append(full[i:i + ch, :w].cpu())
         del full, h
         log(f"--lm-rank: LM on ranks {lm_servers}; held-out LM states for {len(ids_val)} captions precomputed")
+        for label, entry in val_extra.items():  # the same for the extra validation sets
+            ids_x = entry[0][1].to(device)
+            full = lm_client.collect(lm_client.request(entry[0][1]))
+            entry[1] = [full[i:i + ch, :trim_ids(ids_x[i:i + ch]).shape[1]].cpu() for i in range(0, len(ids_x), ch)]
+            del full
 
     # FLOPs per sample (fwd + bwd), analytic: matmuls 6 N T, attention 12 L d T (T + T_text), frozen LM forward 2 N T
     T, Tt = den_cfg.latent_size ** 2, getattr(te_cfg, "max_tokens", 64)
@@ -1156,6 +1178,9 @@ def main():
         te_live = [p.detach().clone() for p in te.parameters()]
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])
         res = evaluate(te, den_eval, val, device, lm_states=val_lm)
+        for label, (v, v_lm) in val_extra.items():
+            res.update({k.replace("val/", f"{label}/", 1): x
+                        for k, x in evaluate(te, den_eval, v, device, lm_states=v_lm).items()})
         torch._foreach_copy_(list(te.parameters()), te_live)
         del den_eval
         if device.type == "cuda":
