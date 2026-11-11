@@ -285,6 +285,19 @@ class Stage(nn.Module):
         return x, t6, text, validf
 
 
+def ema_update_(ema, params, weight, stage=None):
+    """ema <- lerp(ema, params, weight). stage: CPU buffers shaped like `ema` (allocated once, pinned) that the
+    parameters are copied into when the EMA lives on the CPU, instead of a fresh CPU copy of every weight at every
+    MuLoCo sync (5 GB in hundreds of tensors each time; host RAM grew ~1 GB per sync in the 384 px run)."""
+    if stage is None:
+        torch._foreach_lerp_(ema, [p.detach().float().to(e.device) for p, e in zip(params, ema)], weight)
+        return
+    for b, p in zip(stage, params):
+        b.copy_(p.detach(), non_blocking=True)
+    torch.cuda.synchronize()
+    torch._foreach_lerp_(ema, stage, weight)
+
+
 def host_rss_gb():
     """Resident memory of this process and its children (the DataLoader workers), GB: a growing host-RAM footprint
     gets the run killed by the OOM killer (it happened at a checkpoint save, the RAM peak of rank 0)."""
@@ -907,6 +920,8 @@ def main():
     keep_ema = replica == 0
     ema_dev = "cpu" if args.ema_cpu else None
     ema = [p.detach().clone().float().to(ema_dev or p.device) for p in model_params] if keep_ema else None
+    ema_stage = ([torch.empty_like(e, pin_memory=device.type == "cuda") for e in ema]
+                 if keep_ema and ema_dev == "cpu" else None)
 
     # ---- resume ----------------------------------------------------------------------------------------------------
     if not args.bench:
@@ -1474,7 +1489,7 @@ def main():
                     if keep_ema:
                         n_sync = step // args.diloco
                         d = min(args.ema ** args.diloco, (1 + n_sync) / (10 + n_sync))
-                        torch._foreach_lerp_(ema, [p.detach().float().to(ema_dev or p.device) for p in model_params], 1 - d)
+                        ema_update_(ema, model_params, 1 - d, ema_stage)
             elif keep_ema:
                 d = min(args.ema, step / (9 + step))
                 torch._foreach_lerp_(ema, [p.detach().float() for p in model_params], 1 - d)
