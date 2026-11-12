@@ -1391,7 +1391,9 @@ def main():
             got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
-        x0 = encoder(lat.to(device, non_blocking=True)) if encoder is not None else lat.to(device, non_blocking=True).float()
+        with profile.phase("vae_encode"):
+            x0 = (encoder(lat.to(device, non_blocking=True)) if encoder is not None
+                  else lat.to(device, non_blocking=True).float())
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
