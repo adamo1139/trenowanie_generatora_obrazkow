@@ -21,6 +21,10 @@ def make_lm():
     return lm.bfloat16()
 
 
+def fake_vae(u8):  # (B, 3, H, H) uint8 -> (B, 4, H/4, H/4) float32, deterministic
+    return u8.float()[:, :1, ::4, ::4].repeat(1, 4, 1, 1) / 255 + torch.arange(4.).view(1, 4, 1, 1)
+
+
 def main():
     torch.set_num_threads(1)
     dist.init_process_group('gloo', timeout=timedelta(seconds=45))
@@ -28,7 +32,7 @@ def main():
     control = dist.new_group(backend='gloo', timeout=timedelta(seconds=45))
     device, lm = torch.device('cpu'), make_lm()
     if rank == 2:
-        lm_server(SimpleNamespace(repo='test'), [0, 1], device, print, control, lm=lm)
+        lm_server(SimpleNamespace(repo='test'), [0, 1], device, print, control, lm=lm, vae=fake_vae)
     else:
         client = LMClient(2, 8, device, control)
         # Rank 0 cannot submit until rank 1 receives its result: round-robin would deadlock.
@@ -39,7 +43,12 @@ def main():
             ids[:, 0] = LM_NULL
             if iteration != 1:
                 ids[1, :9], ids[34, :70], ids[66, :] = 1, 2, 3
-            got = client.collect(client.request(ids))
+            # --vae-on-lm order of the training loop: the batch's images first, then its captions
+            u8 = torch.randint(0, 256, (5 + rank, 3, 16, 16), dtype=torch.uint8)
+            hv = client.request_vae(u8, (5 + rank, 4, 4, 4))
+            hl = client.request(ids)
+            torch.testing.assert_close(LMClient.vae_collect(hv), fake_vae(u8), rtol=0, atol=0)
+            got = client.collect(hl)
             ref = torch.zeros(67, 128, 8, dtype=torch.bfloat16)
             for i, rows, sub in lm_chunk_plan(ids):
                 h = hf_lm_part(lm, sub.masked_fill(sub.eq(LM_PAD), 0), True, True)
@@ -50,7 +59,7 @@ def main():
         client.stop()
     dist.barrier()
     if rank == 0:
-        print('OK: ready-client scheduling, partial/null/repeated requests and shutdown')
+        print('OK: ready-client scheduling, partial/null/repeated requests, VAE requests and shutdown')
     dist.destroy_process_group()
 
 

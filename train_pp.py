@@ -125,6 +125,9 @@ def get_args():
                         "val_aesthetics-part01, val_text): the same images as val/, no extra compute")
     p.add_argument("--enc-vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 whose encoder makes the latents")
     p.add_argument("--enc-chunk", type=int, default=8, help="images per encoder call (memory)")
+    p.add_argument("--vae-on-lm", action="store_true",
+                   help="--img-dir with --lm-rank: the LM server rank also encodes the training images (its GPU idles "
+                        "~90%% between LM requests; at 1024 px encoding took ~16%% of a training rank's step)")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
     p.add_argument("--t-shift", type=float, default=1.0,
@@ -479,7 +482,8 @@ def lm_packed_chunks(lm, plan, device, max_tokens=8192):
     return chunks
 
 
-def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None, opd_cfg=4.0, teacher_clients=()):
+def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None, opd_cfg=4.0, teacher_clients=(),
+              vae=None):
     """CPU/Gloo any-source control queue; hidden states still travel directly over NCCL.
 
     The optional lm argument is a small fake encoder in the distributed protocol test.
@@ -495,8 +499,8 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
     stops = {c: (c in clients) + (c in teacher_clients) for c in set(clients) | set(teacher_clients)}
     null = teacher.encode([""]) if teacher else None
     active, served, t0 = set(stops), 0, time.perf_counter()
-    idle = compute = transfer = 0.0
-    win_t, win_n = t0, 0
+    idle = compute = transfer = vae_time = 0.0
+    win_t, win_n, vae_n = t0, 0, 0
     while active:
         hdr = torch.empty(3, dtype=torch.long)
         start = time.perf_counter()
@@ -507,6 +511,17 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
             if not stops[r]:
                 active.remove(r)
             idle += time.perf_counter() - start
+            continue
+        if hdr[0].item() == 3:  # --vae-on-lm: uint8 images (B, 3, H, H) in over NCCL, latents out
+            imgs = torch.empty(int(hdr[1]), 3, int(hdr[2]), int(hdr[2]), dtype=torch.uint8, device=device)
+            dist.recv(imgs, src=r)
+            idle += time.perf_counter() - start
+            start = time.perf_counter()
+            lat = vae(imgs).contiguous()
+            dist.isend(lat, dst=r).wait()
+            del imgs
+            vae_time += time.perf_counter() - start
+            vae_n += int(hdr[1])
             continue
         if hdr[0].item() == 2:  # a teacher request (aurora/klein.py protocol, header on this tag)
             from aurora.klein import serve_request
@@ -551,9 +566,10 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
             dt = time.perf_counter() - win_t
             log(f"LM server (rank {dist.get_rank()}): LM forward (CUDA events) {100 * compute / dt:.0f}%, "
                 f"transfer/dispatch residual {100 * transfer / dt:.0f}%, waiting for requests {100 * idle / dt:.0f}%, "
-                f"{win_n / dt:.0f} captions/s", flush=True)
-            idle = compute = transfer = 0.0
-            win_t, win_n = time.perf_counter(), 0
+                f"{win_n / dt:.0f} captions/s" + (f", VAE encoding {100 * vae_time / dt:.0f}% ({vae_n / dt:.1f} images/s)"
+                                                  if vae is not None else ""), flush=True)
+            idle = compute = transfer = vae_time = 0.0
+            win_t, win_n, vae_n = time.perf_counter(), 0, 0
     log(f"LM server: {served:,} captions in {time.perf_counter() - t0:.0f} s, done", flush=True)
 
 
@@ -584,6 +600,22 @@ class LMClient:
         for (i, rows, sub), buf in zip(h["plans"], h["bufs"]):
             full[:, :sub.shape[1]].index_copy_(0, (rows + i).to(full.device), buf.to(full.device))
         return full
+
+    def request_vae(self, u8, shape):
+        """--vae-on-lm: uint8 images (B, 3, H, H) on this GPU -> a handle; vae_collect() gives the (B, C, h, w) float32
+        latents. Issue it before the LM request of the same batch (the server answers a client in request order, and
+        NCCL matches this pair's sends / receives in issue order)."""
+        hdr = torch.tensor([3, u8.shape[0], u8.shape[-1]], dtype=torch.long)
+        out = torch.empty(*shape, dtype=torch.float32, device=self.device)
+        reqs = [dist.isend(hdr, dst=self.server, group=self.control_group, tag=1),
+                dist.isend(u8.contiguous(), dst=self.server), dist.irecv(out, src=self.server)]
+        return dict(vae=out, reqs=reqs, u8=u8)
+
+    @staticmethod
+    def vae_collect(h):
+        for r in h["reqs"]:
+            r.wait()
+        return h["vae"]
 
     def stop(self):
         dist.send(torch.tensor([0, 0, 0]), dst=self.server, group=self.control_group, tag=1)
@@ -861,10 +893,14 @@ def main():
             if args.opd and args.teacher_on_lm:
                 from aurora.klein import KleinTeacher
                 teacher = KleinTeacher(device, args.klein, quant=args.klein_quant, compile=not args.no_compile)
+            vae = (LatentEncoder(args.enc_vae, device, args.enc_chunk, compile=not args.no_compile)
+                   if args.vae_on_lm else None)
             lm_server(te_cfg, [r * pp for r in range(replicas) if r % args.lm_rank == k], device, print, control_group,
-                      teacher=teacher, opd_cfg=args.opd_cfg, teacher_clients=list(range(replicas)) if teacher else ())
+                      teacher=teacher, opd_cfg=args.opd_cfg, teacher_clients=list(range(replicas)) if teacher else (),
+                      vae=vae)
             dist.destroy_process_group()
             return
+    assert not args.vae_on_lm or (args.lm_rank and args.img_dir), "--vae-on-lm needs --lm-rank and --img-dir"
     assert M >= pp, f"need at least {pp} micro-batches"
     ranges = stage_ranges(den_cfg.depth, pp, args.te_cost if pp > 1 else 0.0)
     lo, hi = ranges[s]
@@ -1391,15 +1427,20 @@ def main():
             got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
+        shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
         with profile.phase("vae_encode"):
-            x0 = (encoder(lat.to(device, non_blocking=True)) if encoder is not None
-                  else lat.to(device, non_blocking=True).float())
+            if args.vae_on_lm and encoder is not None:  # a handle; the main loop collects it (vae_collect)
+                x0 = lm_client.request_vae(lat.to(device, non_blocking=True), shape)
+            elif encoder is not None:
+                x0 = encoder(lat.to(device, non_blocking=True))
+            else:
+                x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
         if args.t_shift != 1.0:
             t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
-        eps = torch.randn(x0.shape, device=device, generator=g)
+        eps = torch.randn(x0["vae"].shape if isinstance(x0, dict) else x0.shape, device=device, generator=g)
         # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         drop_cpu = torch.rand(per_pipe, generator=g_cpu) < args.cfg_drop
@@ -1425,6 +1466,9 @@ def main():
                 with profile.phase("lm_request"):
                     pending = (nb, lm_client.request(nb[5]))
             (x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond), req = pending
+            if isinstance(x0, dict):  # --vae-on-lm: this step's latents from the LM server
+                with profile.phase("vae_wait"):
+                    x0 = LMClient.vae_collect(x0)
             with profile.phase("lm_wait_collect"):
                 lm_full = lm_client.collect(req)
             del req
