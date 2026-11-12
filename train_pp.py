@@ -1377,15 +1377,14 @@ def main():
         if not needs_data:
             if not (x0_from_first and last):
                 return None, None, None, None, None, None, None, None
-            x0 = torch.empty(per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size,
-                             device=device)
-            dist.recv(x0, src=replica * pp, group=x0_groups[replica])  # this step's latents, from stage 0
+            # x0 itself comes from stage 0 right before this step's pipeline (see the main loop)
+            shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
             g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
             t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))  # the same t and noise as stage 0
             if args.t_shift != 1.0:
                 t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
-            eps = torch.randn(x0.shape, device=device, generator=g)
-            return x0, None, t, eps, None, None, None, None
+            eps = torch.randn(shape, device=device, generator=g)
+            return torch.empty(shape, device=device), None, t, eps, None, None, None, None
         with profile.phase("data_loader"):
             got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
             mcond = got[-1].to(device, non_blocking=True) if has_cond else None
@@ -1393,10 +1392,6 @@ def main():
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
         x0 = encoder(lat.to(device, non_blocking=True)) if encoder is not None else lat.to(device, non_blocking=True).float()
-        if x0_from_first and first:  # async: the last stage takes it when it starts that step (deadlock-free with the
-            if x0_send[0] is not None:  # LM prefetch, which encodes step + 1 before the pipeline runs step)
-                x0_send[0].wait()
-            x0_send[:] = [dist.isend(x0, dst=replica * pp + pp - 1, group=x0_groups[replica]), x0]
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
@@ -1417,7 +1412,6 @@ def main():
                                                                "te_config": asdict(te_cfg), "rank": rank})
     opt_window = []  # keep every step in the logging window, including cheap periodic-Muon steps
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
-    x0_send = [None, None]  # the pending latents hand-over (pp > 1 from images) and its tensor
     # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
     # pipeline's first p2p (NCCL communicator setup) long before stage 0 is ready
     dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
@@ -1481,6 +1475,13 @@ def main():
             rope_seed = args.seed * 1_000_003 + replica * 1009 + step + 13 if args.rope_random else None
             if pp > 1 and args.rope_random:
                 stage_mod.rope_field, stage_mod.rope_seed = args.rope_ref, rope_seed
+            if x0_from_first and (first or last):  # this step's latents, stage 0 -> last stage, right before the
+                # pipeline: blocking and in the same order on both (an async send of the prefetched step + 1 next to
+                # the pipeline's own p2p deadlocked NCCL)
+                if first:
+                    dist.send(x0, dst=replica * pp + pp - 1, group=x0_groups[replica])
+                else:
+                    dist.recv(x0, src=replica * pp, group=x0_groups[replica])
             try:
                 with amp:
                     if first:
@@ -1647,8 +1648,6 @@ def main():
             save(merge_only=True)
             dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
 
-    if x0_send[0] is not None:
-        x0_send[0].wait()
     profile.close()
     if lm_client is not None:
         lm_client.stop()
