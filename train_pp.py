@@ -725,6 +725,27 @@ def owned_den_names(den, s, pp, ranges):
     return out
 
 
+def load_val_cached(root, names, n, tok_suffix, null_row, lat_kind, lat_root, img_res, encode, vae, log):
+    """load_val; from images (encode) the latents + token ids are cached in <lat_root>/val_cache/ (decoding and encoding
+    4096 held-out images at 1024 px takes ~7 min on one GPU), keyed by everything that changes them."""
+    if encode is None:
+        return load_val(root, names, n, tok_suffix, null_row, lat_kind, lat_root, img_res)
+    import hashlib
+    key = hashlib.sha1(repr((sorted(names), n, tok_suffix, img_res, os.path.basename(os.path.normpath(vae)),
+                             null_row.tolist() if null_row is not None else None)).encode()).hexdigest()[:12]
+    path = os.path.join(lat_root, "val_cache", f"val_{img_res}px_{n}_{key}.pt")
+    if os.path.exists(path):
+        lat, ids = torch.load(path)
+        log(f"validation: {len(lat)} latents from the cache {path}")
+        return lat, ids
+    lat, ids = load_val(root, names, n, tok_suffix, null_row, lat_kind, lat_root, img_res, encode=encode)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save((lat, ids), path + ".tmp")
+    os.replace(path + ".tmp", path)
+    log(f"validation: {len(lat)} latents encoded and cached in {path}")
+    return lat, ids
+
+
 def main():
     args = resolve_defaults(get_args())
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1127,8 +1148,9 @@ def main():
     if master and val_names:
         # images: encoded once as they are read, as stored latents would be (only the latents kept)
         enc_val = (lambda u8: encoder(u8.to(device)).half().cpu()) if img_res else None
-        val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(),
-                       "img" if img_res else lat_kind, args.img_dir or args.lat_dir, img_res, encode=enc_val)
+        val = load_val_cached(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(),
+                              "img" if img_res else lat_kind, args.img_dir or args.lat_dir, img_res, enc_val,
+                              args.enc_vae, log)
     val_shard_groups = ()
     if master and val_names and args.val_per_shard:  # fluxdb-text-00142-of-00143 -> text
         val_shard_groups = [(re.sub(r"^fluxdb-|-\d+-of-\d+$", "", s), k)
@@ -1139,7 +1161,8 @@ def main():
     if master and img_res:
         for d, held in zip(args.img_extra, args.img_extra_val):
             _, held = extra_names(d, held)
-            v = load_val(d, [held], args.val_samples, tok_suffix, te.null_ids(), "img", d, img_res, encode=enc_val)
+            v = load_val_cached(d, [held], args.val_samples, tok_suffix, te.null_ids(), "img", d, img_res, enc_val,
+                                args.enc_vae, log)
             val_extra[f"val_{os.path.basename(d.rstrip('/'))}"] = [v, None]
             log(f"validation: {len(v[0])} images of {d}/{held} as val_{os.path.basename(d.rstrip('/'))}")
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
