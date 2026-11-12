@@ -1256,12 +1256,13 @@ def main():
         den_eval.rope_cos, den_eval.rope_sin = cos.to(device), sin.to(device)
         te_live = [p.detach().clone() for p in te.parameters()]
         torch._foreach_copy_(list(te.parameters()), [emas[("te", n)].to(device) for n in te_names])
-        res = evaluate(te, den_eval, val, device, lm_states=val_lm, groups=val_shard_groups)
+        dc = max(1, 16384 // den_cfg.latent_size ** 2)  # denoiser images per call: 4 at 1024 px, 64 at 256 px
+        res = evaluate(te, den_eval, val, device, lm_states=val_lm, groups=val_shard_groups, den_chunk=dc)
         if val_extra:  # every source on its own, and val_all/: all held-out images together (size-weighted)
             # only the val/ keys: val_<shard>/ (--val-per-shard) has no counterpart in the other sources
             n_all, sums = len(val[0]), {k: x * len(val[0]) for k, x in res.items() if k.startswith("val/")}
             for label, (v, v_lm) in val_extra.items():
-                got = evaluate(te, den_eval, v, device, lm_states=v_lm)
+                got = evaluate(te, den_eval, v, device, lm_states=v_lm, den_chunk=dc)
                 res.update({k.replace("val/", f"{label}/", 1): x for k, x in got.items()})
                 n_all += len(v[0])
                 for k, x in got.items():

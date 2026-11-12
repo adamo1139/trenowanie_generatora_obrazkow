@@ -413,11 +413,12 @@ def outer_sync(global_params, live, outer_opt, n, comm="bf16", group=None, bucke
 
 
 @torch.no_grad()
-def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=()):
+def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=(), den_chunk=0):
     """Velocity MSE on the held-out set with fixed t and noise, so numbers are comparable across runs.
     lm_states: optional precomputed frozen-LM states, one tensor per `chunk` of captions (trimmed the same way), for
     text encoders whose LM is not held whole on this rank (train_pp.py --lm-split).
-    groups: [(label, count)] consecutive runs of the held-out set (e.g. its shards): also val_<label>/loss each."""
+    groups: [(label, count)] consecutive runs of the held-out set (e.g. its shards): also val_<label>/loss each.
+    den_chunk > 0: the denoiser runs on that many images at a time (large images; same numbers, less memory)."""
     lat, ids = val
     if getattr(te.config, "kind", "") == "lm" and getattr(te.config, "backend", "") == "hf":
         chunk = min(chunk, 64)  # a big MoE LM's routing buffers at 256 captions x 256 tokens would not fit next to training
@@ -440,7 +441,9 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
             else:
                 text, valid = te(chunk_ids)
             tt = t.view(-1, 1, 1, 1)
-            v = den((1 - tt) * x0 + tt * eps, t, text, valid)
+            zt, dc = (1 - tt) * x0 + tt * eps, den_chunk or len(x0)
+            v = torch.cat([den(zt[j:j + dc], t[j:j + dc], text[j:j + dc], valid[j:j + dc])
+                           for j in range(0, len(x0), dc)])
         per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
         per_all.append(per)
         tot += per.sum().item()
