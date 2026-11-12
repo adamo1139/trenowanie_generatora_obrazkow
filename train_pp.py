@@ -129,6 +129,9 @@ def get_args():
                    help="--img-dir with --lm-rank: one extra rank (the last, on GPU --vae-gpu) that only encodes the "
                         "training images of every pipeline")
     p.add_argument("--vae-gpu", type=int, default=4, help="--vae-rank: its physical GPU (nvidia-smi order)")
+    p.add_argument("--vae-remote-frac", type=float, default=1.0,
+                   help="--vae-on-lm / --vae-rank: the share of each batch encoded by the server; the rest is encoded "
+                        "on the training rank (when the server can't keep up with all of them)")
     p.add_argument("--vae-on-lm", action="store_true",
                    help="--img-dir with --lm-rank: the LM server rank also encodes the training images (its GPU idles "
                         "~90%% between LM requests; at 1024 px encoding took ~16%% of a training rank's step)")
@@ -621,7 +624,7 @@ class LMClient:
     def vae_collect(h):
         for r in h["reqs"]:
             r.wait()
-        return h["vae"]
+        return h["vae"] if h.get("local") is None else torch.cat([h["vae"], h["local"]])
 
     def stop(self):
         dist.send(torch.tensor([0, 0, 0]), dst=self.server, group=self.control_group, tag=1)
@@ -1449,8 +1452,12 @@ def main():
         ids_cpu = ids
         shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
         with profile.phase("vae_encode"):
-            if vae_client is not None and encoder is not None:  # a handle; the main loop collects it (vae_collect)
-                x0 = vae_client.request_vae(lat.to(device, non_blocking=True), shape)
+            if vae_client is not None and encoder is not None and round(args.vae_remote_frac * per_pipe) > 0:
+                # a handle (the first k images on the server, the rest here); the main loop collects it
+                u8 = lat.to(device, non_blocking=True)
+                k = round(args.vae_remote_frac * per_pipe)
+                x0 = vae_client.request_vae(u8[:k], (k, *shape[1:]))
+                x0["local"] = encoder(u8[k:]) if k < per_pipe else None
             elif encoder is not None:
                 x0 = encoder(lat.to(device, non_blocking=True))
             else:
@@ -1460,7 +1467,7 @@ def main():
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
         if args.t_shift != 1.0:
             t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
-        eps = torch.randn(x0["vae"].shape if isinstance(x0, dict) else x0.shape, device=device, generator=g)
+        eps = torch.randn(shape if isinstance(x0, dict) else x0.shape, device=device, generator=g)
         # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         drop_cpu = torch.rand(per_pipe, generator=g_cpu) < args.cfg_drop
