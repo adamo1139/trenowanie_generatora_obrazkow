@@ -151,6 +151,9 @@ def get_args():
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-states", type=int, default=4,
                    help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
+    p.add_argument("--skip-gpus", type=int, nargs="*", default=[],
+                   help="physical GPUs (nvidia-smi order) left unused, e.g. 2 for a card that overheats; with --lm-rank "
+                        "the ranks then take the other GPUs (run torchrun with that many fewer processes)")
     p.add_argument("--lm-gpu", type=int, default=4,
                    help="--lm-rank: physical GPU (nvidia-smi / PCI bus order) of the (last) LM server rank, the training "
                         "ranks take the others; on adamo-rigga GPU 4 runs hottest (junction 104 C, it throttled and "
@@ -220,6 +223,14 @@ class AddAux(torch.autograd.Function):
         return g, torch.ones((), device=g.device, dtype=torch.float32)
 
 
+def microbatch_rope(seed, mb, b, side, field, d, device):
+    """RPE-2D positions (cos, sin) of micro-batch `mb` of a step, drawn from (seed, mb) alone, so every pipeline stage of
+    a replica draws the same ones without communicating (and pp = 1 the same as pp > 1)."""
+    g = torch.Generator(device=device).manual_seed(seed * 4099 + mb)
+    rows, cols = random_rope_coords(b, side, field, device, g)
+    return rope_2d_from_coords(rows, cols, d)
+
+
 class Stage(nn.Module):
     """One pipeline stage: optional stem (text encoder, time projection, patch_in), blocks [lo, hi), optional head."""
 
@@ -246,6 +257,8 @@ class Stage(nn.Module):
         # per micro-batch (local_train_step): (B, 8) micro-conditions (None: whole images) and (cos, sin) of random
         # RPE-2D positions (None: the even grid in the buffers)
         self.mb_cond, self.mb_rope = None, None
+        # RPE-2D: random positions of 0 .. rope_field - 1 per micro-batch, from (rope_seed, _mb); set per training step
+        self.rope_field, self.rope_seed = 0, None
 
     def forward(self, *args):
         if self.first:
@@ -269,7 +282,13 @@ class Stage(nn.Module):
             # pipelining sends a gradient back for every stage input; the mask needs a (zero) one
             x = x + 0 * validf.sum()
         valid = validf > 0.5
-        cos, sin = self.mb_rope if self.mb_rope is not None else (self.rope_cos, self.rope_sin)
+        if self.mb_rope is not None:
+            cos, sin = self.mb_rope
+        elif self.rope_field and self.rope_seed is not None and not x.is_meta:
+            cos, sin = microbatch_rope(self.rope_seed, self._mb, x.shape[0], self.cfg.latent_size, self.rope_field,
+                                       self.cfg.dim // self.cfg.heads, x.device)
+        else:
+            cos, sin = self.rope_cos, self.rope_sin
         for i, fn in enumerate(self.block_fns):
             x = fn(x, t6, text, valid, cos, sin)
             if i == self.repa_block and self.repa_targets is not None and not x.is_meta \
@@ -574,21 +593,19 @@ def text_widths(ids_cpu, microbatch, multiple=64):
 
 
 def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, divide=True, cond=None,
-                     rope_field=0, rope_gen=None):
+                     rope_field=0, rope_seed=None):
     """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch. divide=False:
     leave the summed gradients (the caller divides once after several calls) and return the micro-batch count.
-    cond: (B, 8) micro-conditions; rope_field > 0: random RPE-2D positions of 0 .. rope_field - 1 (rope_gen)."""
+    cond: (B, 8) micro-conditions; rope_field > 0: random RPE-2D positions of 0 .. rope_field - 1 (microbatch_rope)."""
     count = z.shape[0] // microbatch
     states = stage.lm_states
+    stage.rope_field, stage.rope_seed = rope_field, rope_seed
     try:
         for k in range(count):
             sl = slice(k * microbatch, (k + 1) * microbatch)
             width = widths[k] if widths is not None else ids.shape[1]
             stage._mb = k
             stage.mb_cond = cond[sl] if cond is not None else None
-            if rope_field:
-                rows, cols = random_rope_coords(microbatch, z.shape[-1], rope_field, z.device, rope_gen)
-                stage.mb_rope = rope_2d_from_coords(rows, cols, stage.cfg.dim // stage.cfg.heads)
             if states is not None:
                 # Stage indexes this list by _mb; do not retain padded views after the step.
                 stage.lm_states = [None] * count
@@ -605,6 +622,7 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, 
     finally:
         stage.lm_states = states
         stage.mb_cond = stage.mb_rope = None
+        stage.rope_field, stage.rope_seed = 0, None
     return count
 
 
@@ -719,11 +737,16 @@ def main():
     first, last = s == 0, s == pp - 1
     n_dev = max(1, torch.cuda.device_count())
     local = int(os.environ.get("LOCAL_RANK", 0)) % n_dev
-    if args.lm_rank and args.lm_gpu >= 0 and n_dev == world_all and args.lm_gpu < n_dev:
+    usable = [d for d in range(n_dev) if d not in args.skip_gpus]
+    if args.skip_gpus:
+        assert len(usable) == world_all, f"--skip-gpus {args.skip_gpus}: {len(usable)} GPUs left for {world_all} ranks"
+    if args.lm_rank and args.lm_gpu >= 0 and len(usable) == world_all and args.lm_gpu in usable:
         # the LM server(s) are the last rank(s): give the last one GPU --lm-gpu (nvidia-smi numbering), the training
-        # ranks the others in order
-        order = [d for d in range(n_dev) if d != args.lm_gpu] + [args.lm_gpu]
-        local = order[local]
+        # ranks the other usable GPUs in order
+        order = [d for d in usable if d != args.lm_gpu] + [args.lm_gpu]
+        local = order[int(os.environ.get("LOCAL_RANK", 0))]
+    elif args.skip_gpus:
+        local = usable[int(os.environ.get("LOCAL_RANK", 0))]
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
         device = torch.device("cpu")
     else:
@@ -759,8 +782,8 @@ def main():
                                    args.te_experts, args.te_quant)
     assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
     den_cfg = replace(den_cfg, latent_size=args.res // 16, rope_ref=args.rope_ref, micro_cond=args.micro_cond)
-    assert not args.rope_random or (args.rope_ref >= args.res // 16 and pp == 1 and not args.opd), \
-        "--rope-random needs --rope-ref >= the grid side (the field to sample from), --pp 1, no --opd"
+    assert not args.rope_random or (args.rope_ref >= args.res // 16 and not args.opd), \
+        "--rope-random needs --rope-ref >= the grid side (the field to sample from), no --opd"
     assert not args.crop_res or (args.micro_cond and pp == 1 and not args.opd), \
         "--crop-res needs --micro-cond, --pp 1, no --opd"
     assert all(r > args.res for r in args.crop_res), "--crop-res must be larger than --res"
@@ -1402,6 +1425,10 @@ def main():
         stage_mod.repa_losses = []
         losses = []
         with profile.phase("forward_backward"):
+            # RPE-2D positions: the same seed on every stage of this replica (pipelined stages draw them per micro-batch)
+            rope_seed = args.seed * 1_000_003 + replica * 1009 + step + 13 if args.rope_random else None
+            if pp > 1 and args.rope_random:
+                stage_mod.rope_field, stage_mod.rope_seed = args.rope_ref, rope_seed
             try:
                 with amp:
                     if first:
@@ -1413,13 +1440,9 @@ def main():
                         elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)
-                            rope_gen = None
-                            if args.rope_random:
-                                rope_gen = torch.Generator(device=device).manual_seed(
-                                    args.seed * 1_000_003 + replica * 1009 + step + 13)
                             local_train_step(stage_mod, z_t, t, cond_ids, eps - x0, mb, losses, widths,
                                              cond=mcond, rope_field=args.rope_ref if args.rope_random else 0,
-                                             rope_gen=rope_gen)
+                                             rope_seed=rope_seed)
                         elif last:
                             sched.step(z_t, t, cond_ids, target=eps - x0, losses=losses, return_outputs=False)
                         else:
@@ -1432,6 +1455,8 @@ def main():
                 mem_report(f"OOM at step {step + 1}")  # no barrier: the other ranks may be stuck in communication
                 dump_snapshot("OOM")
                 raise
+            finally:
+                stage_mod.rope_field, stage_mod.rope_seed = 0, None
         stage_mod.lm_states = None  # backward has finished; release current LM states before optimizer temporaries
         if losses:
             acc[0] += torch.stack([l.detach().float() for l in losses]).mean()

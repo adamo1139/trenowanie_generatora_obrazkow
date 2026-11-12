@@ -4,7 +4,8 @@ including the REPA auxiliary loss injected in a middle stage (compared against D
   DIST_BACKEND=gloo torchrun --nproc_per_node 2 tests/check_pp.py
   DIST_BACKEND=gloo torchrun --nproc_per_node 4 tests/check_pp.py [conv] [full|selective]
     # conv = iREPA projector; full / selective = activation checkpointing; lm = frozen Slayer149 + refiner, with the
-    # LM states computed on every stage and gathered to stage 0 (as train_pp.py does)
+    # LM states computed on every stage and gathered to stage 0 (as train_pp.py does); rope = RPE-2D random positions,
+    # drawn per micro-batch on every stage (train_pp.microbatch_rope) and compared with the plain model on the same ones
 
 Runs on CPU (gloo), fp32, so the comparison is exact up to float rounding.
 """
@@ -18,7 +19,7 @@ from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 sys.path.insert(0, ".")
 from aurora.model import build_models, make_configs
 from aurora.repa import make_projector
-from train_pp import Stage, gather_to_stage, owned_den_names, stage_ranges, local_train_step
+from train_pp import Stage, gather_to_stage, owned_den_names, stage_ranges, local_train_step, microbatch_rope
 
 dist.init_process_group("gloo")
 rank, pp = dist.get_rank(), dist.get_world_size()
@@ -46,15 +47,22 @@ REPA_LAYER, N_REPA, W = 5, 1, 0.5
 proj = make_projector(den_cfg.dim, 32, hidden=64, conv="conv" in sys.argv[1:])
 CKPT = next((a for a in sys.argv[1:] if a in ("full", "selective")), None)
 repa_tgts = [torch.randn(N_REPA, 256, 32) for _ in range(M)]
+ROPE = "rope" in sys.argv[1:]
+ROPE_FIELD, ROPE_SEED = 40, 12345
 
 # reference: the plain models (Denoiser.forward with hidden_at), mean over micro-batches of fm + W * repa
 loss_ref = 0
+buffers = den.rope_cos, den.rope_sin
 for k, (zc, tc, ic, gc) in enumerate(zip(z.chunk(M), t.chunk(M), ids.chunk(M), target.chunk(M))):
+    if ROPE:
+        den.rope_cos, den.rope_sin = microbatch_rope(ROPE_SEED, k, len(zc), den_cfg.latent_size, ROPE_FIELD,
+                                                     den_cfg.dim // den_cfg.heads, zc.device)
     text, valid = te(ic)
     v, h = den(zc, tc, text, valid, hidden_at=REPA_LAYER)
     repa = -F.cosine_similarity(proj(h[:N_REPA]), repa_tgts[k], dim=-1).mean()
     loss_ref = loss_ref + (F.mse_loss(v, gc) + W * repa) / M
 loss_ref.backward()
+den.rope_cos, den.rope_sin = buffers
 ref_proj = {n: p.grad.clone() for n, p in proj.named_parameters()}
 for p in proj.parameters():
     p.grad = None
@@ -71,6 +79,8 @@ repa_here = lo <= b < hi
 stage = Stage(den, den_cfg, lo, hi, first, last, te if first else None, proj if repa_here else None,
               b - lo if repa_here else -1, W, act_checkpoint=CKPT)
 stage.repa_targets = repa_tgts if repa_here else None
+if ROPE:
+    stage.rope_field, stage.rope_seed = ROPE_FIELD, ROPE_SEED
 if LM:
     mb = B // M
     with torch.no_grad():
@@ -88,7 +98,8 @@ sched = Schedule1F1B(pstage, M,
                      loss_fn=lambda v, g: F.mse_loss(v, g))  # needed on every stage to enable backward
 losses = []
 if first and last:
-    local_train_step(stage, z, t, ids, target, B // M, losses)
+    local_train_step(stage, z, t, ids, target, B // M, losses, rope_field=ROPE_FIELD if ROPE else 0,
+                     rope_seed=ROPE_SEED if ROPE else None)
 elif first:
     sched.step(z, t, ids, return_outputs=False)
 elif last:
