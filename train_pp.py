@@ -125,6 +125,10 @@ def get_args():
                         "val_aesthetics-part01, val_text): the same images as val/, no extra compute")
     p.add_argument("--enc-vae", default="FLUX.2-dev-vae", help="diffusers AutoencoderKLFlux2 whose encoder makes the latents")
     p.add_argument("--enc-chunk", type=int, default=8, help="images per encoder call (memory)")
+    p.add_argument("--vae-rank", type=int, default=0, choices=[0, 1],
+                   help="--img-dir with --lm-rank: one extra rank (the last, on GPU --vae-gpu) that only encodes the "
+                        "training images of every pipeline")
+    p.add_argument("--vae-gpu", type=int, default=4, help="--vae-rank: its physical GPU (nvidia-smi order)")
     p.add_argument("--vae-on-lm", action="store_true",
                    help="--img-dir with --lm-rank: the LM server rank also encodes the training images (its GPU idles "
                         "~90%% between LM requests; at 1024 px encoding took ~16%% of a training rank's step)")
@@ -483,17 +487,19 @@ def lm_packed_chunks(lm, plan, device, max_tokens=8192):
 
 
 def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None, opd_cfg=4.0, teacher_clients=(),
-              vae=None):
+              vae=None, serve_lm=True):
     """CPU/Gloo any-source control queue; hidden states still travel directly over NCCL.
 
     The optional lm argument is a small fake encoder in the distributed protocol test.
     """
     from aurora.slayer import LM_NULL, LMTextEncoder, enable_packed, hf_lm_part
-    packed = lm is None and device.type == "cuda"  # real LM on a GPU: captions packed, no padding (varlen flash)
-    lm = LMTextEncoder(te_cfg).to(device).lm if lm is None else lm
+    packed = serve_lm and lm is None and device.type == "cuda"  # real LM on a GPU: captions packed (varlen flash)
+    if serve_lm:  # serve_lm=False: a --vae-rank server, VAE requests only
+        lm = LMTextEncoder(te_cfg).to(device).lm if lm is None else lm
     if packed:
         enable_packed(lm, compile=True)
-    log(f"LM server: {te_cfg.repo} for ranks {clients}{' (+ the --opd teacher)' if teacher else ''}", flush=True)
+    log(f"LM server: {te_cfg.repo} for ranks {clients}{' (+ the --opd teacher)' if teacher else ''}" if serve_lm
+        else f"VAE server (rank {dist.get_rank()}) for ranks {clients}", flush=True)
     # one stop per LM client, and one per teacher client when this rank also serves klein (--teacher-on-lm: every
     # training rank, not only this server's LM clients)
     stops = {c: (c in clients) + (c in teacher_clients) for c in set(clients) | set(teacher_clients)}
@@ -786,9 +792,10 @@ def main():
     dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"), timeout=dist_to)
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
-    # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers
-    world = world_all - args.lm_rank - args.teacher_ranks
-    lm_servers = list(range(world + args.teacher_ranks, world_all))
+    # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers, then the --vae-rank
+    world = world_all - args.lm_rank - args.teacher_ranks - args.vae_rank
+    lm_servers = list(range(world + args.teacher_ranks, world_all - args.vae_rank))
+    vae_servers = list(range(world_all - args.vae_rank, world_all))
     teachers = list(range(world, world + args.teacher_ranks)) + (lm_servers if args.teacher_on_lm else [])
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
@@ -799,10 +806,13 @@ def main():
     usable = [d for d in range(n_dev) if d not in args.skip_gpus]
     if args.skip_gpus:
         assert len(usable) == world_all, f"--skip-gpus {args.skip_gpus}: {len(usable)} GPUs left for {world_all} ranks"
-    if args.lm_rank and args.lm_gpu >= 0 and len(usable) == world_all and args.lm_gpu in usable:
-        # the LM server(s) are the last rank(s): give the last one GPU --lm-gpu (nvidia-smi numbering), the training
-        # ranks the other usable GPUs in order
-        order = [d for d in usable if d != args.lm_gpu] + [args.lm_gpu]
+    tail = (([args.lm_gpu] if args.lm_rank and args.lm_gpu >= 0 else [])
+            + ([args.vae_gpu] if args.vae_rank else []))
+    assert len(set(tail)) == len(tail), "--lm-gpu and --vae-gpu must differ"
+    if tail and len(usable) == world_all and all(d in usable for d in tail):
+        # the LM server(s), then the VAE server, are the last ranks: the last LM server gets GPU --lm-gpu, the VAE
+        # server --vae-gpu (nvidia-smi numbering), the training ranks the other usable GPUs in order
+        order = [d for d in usable if d not in tail] + tail
         local = order[int(os.environ.get("LOCAL_RANK", 0))]
     elif args.skip_gpus:
         local = usable[int(os.environ.get("LOCAL_RANK", 0))]
@@ -824,7 +834,7 @@ def main():
     # for the loss target), on a communicator of their own (the hand-over runs ahead of the pipeline's own p2p)
     x0_groups = ([dist.new_group([r * pp, r * pp + pp - 1], timeout=dist_to) for r in range(replicas)]
                  if args.img_dir and pp > 1 else None)
-    servers = args.lm_rank or args.teacher_ranks
+    servers = args.lm_rank or args.teacher_ranks or args.vae_rank
     control_group = dist.new_group(backend="gloo", timeout=dist_to) if servers else None
     train_group = dist.new_group(list(range(world)), timeout=dist_to) if servers else None  # None = everyone
     # Every barrier below specifies device_ids: with --lm-gpu, rank % device_count
@@ -884,6 +894,13 @@ def main():
                            args.klein_quant, compile=not args.no_compile)
             dist.destroy_process_group()
             return
+    assert not args.vae_rank or (args.lm_rank and args.img_dir and not args.vae_on_lm), \
+        "--vae-rank needs --lm-rank and --img-dir, not --vae-on-lm"
+    if rank in vae_servers:
+        lm_server(te_cfg, [r * pp for r in range(replicas)], device, print, control_group,
+                  vae=LatentEncoder(args.enc_vae, device, args.enc_chunk, compile=not args.no_compile), serve_lm=False)
+        dist.destroy_process_group()
+        return
     if args.lm_rank:
         assert getattr(te_cfg, "backend", "") == "hf" and not args.lm_split and not args.lm_stage0, \
             "--lm-rank needs a transformers LM text encoder (--te-size poziomka), without --lm-split / --lm-stage0"
@@ -1213,6 +1230,9 @@ def main():
                 f"{len(ids_val)} captions precomputed")
     lm_client = (LMClient(lm_servers[replica % args.lm_rank], te_cfg.lm_dim, device, control_group) if args.lm_rank and first
                  else None)
+    # images -> latents on another rank: the LM server (--vae-on-lm) or the --vae-rank server
+    vae_client = (lm_client if args.vae_on_lm else
+                  LMClient(vae_servers[0], 0, device, control_group) if args.vae_rank and first else None)
     teacher_client = qwen_tok = captions_en = None
     if args.opd:
         from aurora.data import CaptionText
@@ -1429,8 +1449,8 @@ def main():
         ids_cpu = ids
         shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
         with profile.phase("vae_encode"):
-            if args.vae_on_lm and encoder is not None:  # a handle; the main loop collects it (vae_collect)
-                x0 = lm_client.request_vae(lat.to(device, non_blocking=True), shape)
+            if vae_client is not None and encoder is not None:  # a handle; the main loop collects it (vae_collect)
+                x0 = vae_client.request_vae(lat.to(device, non_blocking=True), shape)
             elif encoder is not None:
                 x0 = encoder(lat.to(device, non_blocking=True))
             else:
@@ -1697,6 +1717,8 @@ def main():
     profile.close()
     if lm_client is not None:
         lm_client.stop()
+    if vae_client is not None and vae_client is not lm_client:
+        vae_client.stop()
     if teacher_client is not None:
         teacher_client.stop()
     log("done")

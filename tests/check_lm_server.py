@@ -1,4 +1,5 @@
-"""CPU protocol test: torchrun --standalone --nproc_per_node 3 tests/check_lm_server.py"""
+"""CPU protocol test: torchrun --standalone --nproc_per_node 3 tests/check_lm_server.py (VAE requests on the LM
+server, --vae-on-lm); --nproc_per_node 4: rank 3 a separate VAE server (--vae-rank)"""
 import sys
 from datetime import timedelta
 from types import SimpleNamespace
@@ -31,10 +32,15 @@ def main():
     rank = dist.get_rank()
     control = dist.new_group(backend='gloo', timeout=timedelta(seconds=45))
     device, lm = torch.device('cpu'), make_lm()
-    if rank == 2:
-        lm_server(SimpleNamespace(repo='test'), [0, 1], device, print, control, lm=lm, vae=fake_vae)
+    separate = dist.get_world_size() == 4
+    if rank == 3:
+        lm_server(SimpleNamespace(repo='test'), [0, 1], device, print, control, vae=fake_vae, serve_lm=False)
+    elif rank == 2:
+        lm_server(SimpleNamespace(repo='test'), [0, 1], device, print, control, lm=lm,
+                  vae=None if separate else fake_vae)
     else:
         client = LMClient(2, 8, device, control)
+        vae_client = LMClient(3, 0, device, control) if separate else client
         # Rank 0 cannot submit until rank 1 receives its result: round-robin would deadlock.
         if rank == 0:
             dist.recv(torch.empty(1, dtype=torch.long), src=1, group=control, tag=99)
@@ -45,7 +51,7 @@ def main():
                 ids[1, :9], ids[34, :70], ids[66, :] = 1, 2, 3
             # --vae-on-lm order of the training loop: the batch's images first, then its captions
             u8 = torch.randint(0, 256, (5 + rank, 3, 16, 16), dtype=torch.uint8)
-            hv = client.request_vae(u8, (5 + rank, 4, 4, 4))
+            hv = vae_client.request_vae(u8, (5 + rank, 4, 4, 4))
             hl = client.request(ids)
             torch.testing.assert_close(LMClient.vae_collect(hv), fake_vae(u8), rtol=0, atol=0)
             got = client.collect(hl)
@@ -57,6 +63,8 @@ def main():
             if rank == 1 and iteration == 0:
                 dist.send(torch.ones(1, dtype=torch.long), dst=0, group=control, tag=99)
         client.stop()
+        if separate:
+            vae_client.stop()
     dist.barrier()
     if rank == 0:
         print('OK: ready-client scheduling, partial/null/repeated requests, VAE requests and shutdown')
