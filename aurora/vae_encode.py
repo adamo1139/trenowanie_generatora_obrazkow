@@ -12,7 +12,7 @@ def patchify_flux2(z):
 
 
 class LatentEncoder:
-    def __init__(self, path: str, device, chunk: int = 8):
+    def __init__(self, path: str, device, chunk: int = 8, compile: bool = False):
         from diffusers import AutoencoderKLFlux2
         vae = AutoencoderKLFlux2.from_pretrained(path, torch_dtype=torch.bfloat16)
         vae.decoder = nn.Identity()  # never used here
@@ -21,6 +21,8 @@ class LatentEncoder:
         self.mean = vae.bn.running_mean.float().view(1, -1, 1, 1).to(device)
         self.std = torch.sqrt(vae.bn.running_var.float() + eps).view(1, -1, 1, 1).to(device)
         self.chunk = chunk
+        if compile:  # ~25% faster at 1024 px (102 -> 78 ms/img on a 5080); outputs differ only by bf16 rounding
+            self.vae.encoder = torch.compile(self.vae.encoder)
 
     @torch.no_grad()
     def __call__(self, img: torch.Tensor) -> torch.Tensor:

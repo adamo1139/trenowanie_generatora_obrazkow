@@ -1124,7 +1124,7 @@ def main():
                                          img_res=img_res))
                 sources.append(f"{d}: {len(stores[-1]):,} (held out for validation: {held})")
             store = ConcatStore(stores) if len(stores) > 1 else store
-            encoder = LatentEncoder(args.enc_vae, device, args.enc_chunk)
+            encoder = LatentEncoder(args.enc_vae, device, args.enc_chunk, compile=not args.no_compile)
             log(f"images -> latents in the loop ({args.enc_vae} encoder, {args.res} px): " + ", ".join(sources))
         if crops:
             log(f"RPE-2D resize-and-crop: {100 * args.crop_prob:.0f}% of the samples {args.res} px windows of "
