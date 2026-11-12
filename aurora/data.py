@@ -311,11 +311,19 @@ def val_groups(root: str, names, n: int):
 
 
 def load_val(root: str, names, n: int, tok_suffix: str = "", null_row=None, lat_kind: str = "lat", lat_root: str = "",
-             img_res: int = 0):
+             img_res: int = 0, encode=None, chunk: int = 64):
     """First n images of the held-out shards (round-robin across shards), first caption each. img_res: uint8 images
-    (ShardStore img_res) instead of latents."""
+    (ShardStore img_res) instead of latents. encode: applied to every `chunk` of images as they are read (e.g. the VAE
+    encoder), so only its outputs are kept, never all the images at once (4096 at 1024 px would be 13 GB)."""
     store = ShardStore(root, names, tok_suffix, null_row, lat_kind=lat_kind, lat_root=lat_root, img_res=img_res)
     per = -(-n // len(names))
     idx = np.concatenate([store.starts[s] + np.arange(min(per, store.sizes[s])) for s in range(len(names))])[:n]
-    lat, ids = store.fetch(idx, None)
-    return torch.from_numpy(lat), torch.from_numpy(ids)
+    if encode is None:
+        lat, ids = store.fetch(idx, None)
+        return torch.from_numpy(lat), torch.from_numpy(ids)
+    lats, ids = [], []
+    for i in range(0, len(idx), chunk):
+        lat, ids_c = store.fetch(idx[i:i + chunk], None)
+        lats.append(encode(torch.from_numpy(lat)))
+        ids.append(torch.from_numpy(ids_c))
+    return torch.cat(lats), torch.cat(ids)

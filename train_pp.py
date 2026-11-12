@@ -761,6 +761,10 @@ def main():
     # every rank creates every group in the same order
     pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp))) for r in range(replicas)]
     stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
+    # pp > 1 from images: stage 0 loads and encodes them and hands the latents to the last stage (which needs them only
+    # for the loss target), on a communicator of their own (the hand-over runs ahead of the pipeline's own p2p)
+    x0_groups = ([dist.new_group([r * pp, r * pp + pp - 1]) for r in range(replicas)]
+                 if args.img_dir and pp > 1 else None)
     servers = args.lm_rank or args.teacher_ranks
     control_group = dist.new_group(backend="gloo") if servers else None
     train_group = dist.new_group(list(range(world))) if servers else None  # None = everyone
@@ -1055,7 +1059,9 @@ def main():
     ids_enc = te if first else lm_enc  # null prompt row (same on every stage that reads captions)
     null_cpu = torch.from_numpy(ids_enc.null_ids()) if ids_enc is not None else None
     null_row = null_cpu.to(device) if null_cpu is not None else None
-    needs_data = first or last or args.repa_weight > 0 or lm_offload  # REPA targets / LM states: every stage
+    # pp > 1 from images: the last stage gets the latents from stage 0 instead of loading (and encoding) the images too
+    x0_from_first = bool(args.img_dir) and pp > 1 and args.repa_weight == 0 and not lm_offload
+    needs_data = first or (last and not x0_from_first) or args.repa_weight > 0 or lm_offload  # REPA / LM states
     alt_suffix = f"{tok_suffix}_pl" if args.pl_prob > 0 else ""
     assert not alt_suffix or tok_suffix, "--pl-prob needs a frozen-LM text encoder (--te-size poziomka)"
     train_names, val_names = select_shards(args.data, args.fraction, tok_suffix, alt_suffix, img_root=args.img_dir)
@@ -1113,11 +1119,10 @@ def main():
 
     val, val_lm = None, None
     if master and val_names:
+        # images: encoded once as they are read, as stored latents would be (only the latents kept)
+        enc_val = (lambda u8: encoder(u8.to(device)).half().cpu()) if img_res else None
         val = load_val(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(),
-                       "img" if img_res else lat_kind, args.img_dir or args.lat_dir, img_res)
-        if img_res:  # the held-out images encoded once, as stored latents would be
-            val = (torch.cat([encoder(val[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(val[0]), 64)]),
-                   val[1])
+                       "img" if img_res else lat_kind, args.img_dir or args.lat_dir, img_res, encode=enc_val)
     val_shard_groups = ()
     if master and val_names and args.val_per_shard:  # fluxdb-text-00142-of-00143 -> text
         val_shard_groups = [(re.sub(r"^fluxdb-|-\d+-of-\d+$", "", s), k)
@@ -1128,8 +1133,7 @@ def main():
     if master and img_res:
         for d, held in zip(args.img_extra, args.img_extra_val):
             _, held = extra_names(d, held)
-            v = load_val(d, [held], args.val_samples, tok_suffix, te.null_ids(), "img", d, img_res)
-            v = (torch.cat([encoder(v[0][i:i + 64].to(device)).half().cpu() for i in range(0, len(v[0]), 64)]), v[1])
+            v = load_val(d, [held], args.val_samples, tok_suffix, te.null_ids(), "img", d, img_res, encode=enc_val)
             val_extra[f"val_{os.path.basename(d.rstrip('/'))}"] = [v, None]
             log(f"validation: {len(v[0])} images of {d}/{held} as val_{os.path.basename(d.rstrip('/'))}")
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
@@ -1342,7 +1346,17 @@ def main():
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
-            return None, None, None, None, None, None, None, None
+            if not (x0_from_first and last):
+                return None, None, None, None, None, None, None, None
+            x0 = torch.empty(per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size,
+                             device=device)
+            dist.recv(x0, src=replica * pp, group=x0_groups[replica])  # this step's latents, from stage 0
+            g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
+            t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))  # the same t and noise as stage 0
+            if args.t_shift != 1.0:
+                t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
+            eps = torch.randn(x0.shape, device=device, generator=g)
+            return x0, None, t, eps, None, None, None, None
         with profile.phase("data_loader"):
             got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
             mcond = got[-1].to(device, non_blocking=True) if has_cond else None
@@ -1350,6 +1364,10 @@ def main():
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
         x0 = encoder(lat.to(device, non_blocking=True)) if encoder is not None else lat.to(device, non_blocking=True).float()
+        if x0_from_first and first:  # async: the last stage takes it when it starts that step (deadlock-free with the
+            if x0_send[0] is not None:  # LM prefetch, which encodes step + 1 before the pipeline runs step)
+                x0_send[0].wait()
+            x0_send[:] = [dist.isend(x0, dst=replica * pp + pp - 1, group=x0_groups[replica]), x0]
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
@@ -1370,6 +1388,7 @@ def main():
                                                                "te_config": asdict(te_cfg), "rank": rank})
     opt_window = []  # keep every step in the logging window, including cheap periodic-Muon steps
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
+    x0_send = [None, None]  # the pending latents hand-over (pp > 1 from images) and its tensor
     while step < args.steps:
         profile.begin_step(step + 1)
         if lm_client is not None:
@@ -1596,6 +1615,8 @@ def main():
             save(merge_only=True)
             dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
 
+    if x0_send[0] is not None:
+        x0_send[0].wait()
     profile.close()
     if lm_client is not None:
         lm_client.stop()
