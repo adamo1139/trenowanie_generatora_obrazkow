@@ -1556,6 +1556,8 @@ def main():
         profile.end_step(step)
         if args.bench:
             continue
+        if step % args.ckpt_every == 0 or step == args.steps:  # before the eval: an eval that fails loses no steps
+            save()
         if step % args.eval_every == 0 or step == args.steps:
             res = ema_eval()
             if master and res is not None:
@@ -1563,8 +1565,6 @@ def main():
                 if wb:
                     wb.log({**res, "train/samples": step * args.batch}, step=step)
             dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
-        if step % args.ckpt_every == 0 or step == args.steps:
-            save()
         if args.merge_every and step >= args.merge_start * args.steps and (
                 step % args.merge_every == 0 or step == args.steps):
             save(merge_only=True)
