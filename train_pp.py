@@ -35,6 +35,7 @@ the grown model starts as exactly the old one. Copying trained blocks instead di
       --depth 12 --pp 2 --te-size poziomka --te-quant int8 --pl-prob 0.5 --init runs/poziomka_stage2/latest.pt \\
       --batch 1024 --microbatches 16 --diloco 64 --outer-lr 1 --outer-momentum 0 --ema-cpu --out runs/grow12
 """
+import datetime
 import functools
 import glob
 import logging
@@ -151,6 +152,8 @@ def get_args():
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-states", type=int, default=4,
                    help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
+    p.add_argument("--dist-timeout", type=float, default=120,
+                   help="minutes a collective / p2p op may wait for the other ranks (evals at 1024 px take ~10 min)")
     p.add_argument("--skip-gpus", type=int, nargs="*", default=[],
                    help="physical GPUs (nvidia-smi order) left unused, e.g. 2 for a card that overheats; with --lm-rank "
                         "the ranks then take the other GPUs (run torchrun with that many fewer processes)")
@@ -724,7 +727,10 @@ def owned_den_names(den, s, pp, ranges):
 
 def main():
     args = resolve_defaults(get_args())
-    dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"))
+    # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
+    # others wait (the default 10 min killed the first 1024 px run)
+    dist_to = datetime.timedelta(minutes=args.dist_timeout)  # also given to every new_group (they don't inherit it)
+    dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"), timeout=dist_to)
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
     # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers
@@ -759,15 +765,15 @@ def main():
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.autocast("cpu", enabled=False)
 
     # every rank creates every group in the same order
-    pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp))) for r in range(replicas)]
-    stage_groups = [dist.new_group([r * pp + st for r in range(replicas)]) for st in range(pp)]
+    pipe_groups = [dist.new_group(list(range(r * pp, (r + 1) * pp)), timeout=dist_to) for r in range(replicas)]
+    stage_groups = [dist.new_group([r * pp + st for r in range(replicas)], timeout=dist_to) for st in range(pp)]
     # pp > 1 from images: stage 0 loads and encodes them and hands the latents to the last stage (which needs them only
     # for the loss target), on a communicator of their own (the hand-over runs ahead of the pipeline's own p2p)
-    x0_groups = ([dist.new_group([r * pp, r * pp + pp - 1]) for r in range(replicas)]
+    x0_groups = ([dist.new_group([r * pp, r * pp + pp - 1], timeout=dist_to) for r in range(replicas)]
                  if args.img_dir and pp > 1 else None)
     servers = args.lm_rank or args.teacher_ranks
-    control_group = dist.new_group(backend="gloo") if servers else None
-    train_group = dist.new_group(list(range(world))) if servers else None  # None = everyone
+    control_group = dist.new_group(backend="gloo", timeout=dist_to) if servers else None
+    train_group = dist.new_group(list(range(world)), timeout=dist_to) if servers else None  # None = everyone
     # Every barrier below specifies device_ids: with --lm-gpu, rank % device_count
     # may select another process's GPU and poison this group's first NCCL communicator.
     pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
@@ -1389,6 +1395,9 @@ def main():
     opt_window = []  # keep every step in the logging window, including cheap periodic-Muon steps
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     x0_send = [None, None]  # the pending latents hand-over (pp > 1 from images) and its tensor
+    # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
+    # pipeline's first p2p (NCCL communicator setup) long before stage 0 is ready
+    dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
     while step < args.steps:
         profile.begin_step(step + 1)
         if lm_client is not None:
