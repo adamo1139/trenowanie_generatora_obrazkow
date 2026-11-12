@@ -45,6 +45,9 @@ import re
 import time
 from dataclasses import asdict, replace
 
+# GPU numbers as in nvidia-smi (--lm-gpu, --vae-gpu, --skip-gpus): set before torch (or any import) can initialise CUDA
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -64,8 +67,6 @@ from aurora.vae_encode import LatentEncoder
 from train import (build_parser, evaluate, init_wandb, load_opt_state, lr_mult, make_muon, outer_sync, param_groups,
                    peak_tflops, resolve_defaults, wandb_logged_in, weight_sq, wrms_stats)
 
-# GPU numbers as in nvidia-smi (--lm-gpu); CUDA reads this when it initialises, after the imports
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 
 def get_args():
@@ -824,6 +825,10 @@ def main():
     else:
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
+        if rank >= world:  # servers: say which physical card they got (nvidia-smi shows the same bus id)
+            role = "VAE server" if rank in vae_servers else "LM server" if rank in lm_servers else "teacher"
+            print(f"rank {rank} ({role}): GPU {local}, PCI bus {torch.cuda.get_device_properties(local).pci_bus_id:02X}",
+                  flush=True)
     master = rank == 0
     log = print if master else (lambda *a, **k: None)
     torch.backends.cuda.matmul.allow_tf32 = True
