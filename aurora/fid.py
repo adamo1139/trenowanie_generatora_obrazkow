@@ -10,9 +10,10 @@ import torch.distributed as dist
 
 
 @torch.no_grad()
-def sample(te, den, ids, null_row, steps, cfg, seed, device, batch=64, shift=1.0):
-    """Normalised latents (N, C, H, W) for the prompts `ids` (N, T); noise is fixed by (seed, prompt index).
-    shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise, SD3)."""
+def sample(te, den, ids, null_row, steps, cfg, seed, device, batch=64, shift=1.0, compute_batch=0):
+    """Normalised latents (N, C, H, W) for the prompts `ids` (N, T); noise is fixed by (seed, prompt index) and drawn
+    `batch` prompts at a time. shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise,
+    SD3). compute_batch: denoise that many at a time (large images), same noise as `batch`."""
     c = getattr(den, "_orig_mod", den).config
     out = []
     u = torch.linspace(1.0, 0.0, steps + 1, device=device)
@@ -21,15 +22,19 @@ def sample(te, den, ids, null_row, steps, cfg, seed, device, batch=64, shift=1.0
         b_ids = ids[i:i + batch].to(device)
         b = len(b_ids)
         g = torch.Generator(device=device).manual_seed(seed * 1_000_003 + i)
-        z = torch.randn(b, c.latent_channels, c.latent_size, c.latent_size, device=device, generator=g)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            text, valid = te(torch.cat([null_row.expand(b, -1), b_ids]))
-            for k in range(steps):
-                t0, t1 = ts[k], ts[k + 1]
-                v = den(torch.cat([z, z]), t0.expand(2 * b), text, valid).float()
-                v_uncond, v_cond = v.chunk(2)
-                z = z + (t1 - t0) * (v_uncond + cfg * (v_cond - v_uncond))
-        out.append(z)
+        z_all = torch.randn(b, c.latent_channels, c.latent_size, c.latent_size, device=device, generator=g)
+        cb = compute_batch or b
+        for j in range(0, b, cb):
+            z, s_ids = z_all[j:j + cb], b_ids[j:j + cb]
+            n = len(z)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                text, valid = te(torch.cat([null_row.expand(n, -1), s_ids]))
+                for k in range(steps):
+                    t0, t1 = ts[k], ts[k + 1]
+                    v = den(torch.cat([z, z]), t0.expand(2 * n), text, valid).float()
+                    v_uncond, v_cond = v.chunk(2)
+                    z = z + (t1 - t0) * (v_uncond + cfg * (v_cond - v_uncond))
+            out.append(z)
     return torch.cat(out)
 
 

@@ -56,8 +56,11 @@ def main():
         dec = max(1, int(12 * (256 / res) ** 2))  # decoder images per call: 12 at 256 px, 1 at 1024 px
         for lang, ps in prompts.items():
             with torch.no_grad():
+                # noise in batches of 12 (as the earlier grids), denoised 12 / 5 / 3 at a time at <= 512 / 768 / 1024
+                # px (24 GB). Poziomka's MoE routing depends slightly on the batch, so keep this fixed per resolution.
+                cb = max(1, min(12, int(12 * (512 / res) ** 2)))
                 z = fidlib.sample(te, den, tokenize(ps, te.config), null_row, a.steps, a.cfg, 0, "cuda", batch=12,
-                                  shift=a.t_shift)
+                                  shift=a.t_shift, compute_batch=cb)
                 imgs = torch.cat([((vae.decode(z[i:i + dec]) + 1) / 2).clamp(0, 1).cpu()
                                   for i in range(0, len(z), dec)])
             arr = (imgs.permute(0, 2, 3, 1).float().numpy() * 255).round().astype(np.uint8)
