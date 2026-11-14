@@ -138,6 +138,16 @@ def get_args():
                         "~90%% between LM requests; at 1024 px encoding took ~16%% of a training rank's step)")
     p.add_argument("--lat-dir", default="", help="folder of the --res latents if not next to the shards (e.g. "
                    "prepare_lowres.py --out-dir X -> X/128px)")
+    p.add_argument("--multi-res", type=int, nargs="*", default=[],
+                   help="mixed-resolution training (--pp 1, --img-dir): these resolutions in every step, e.g. 256 512 768 "
+                        "1024; the images are read at --res (the largest) and downscaled on the GPU (bicubic, antialias)")
+    p.add_argument("--multi-res-mbs", type=int, nargs="*", default=[],
+                   help="--multi-res: micro-batches per replica and step at each resolution")
+    p.add_argument("--multi-res-mb", type=int, nargs="*", default=[],
+                   help="--multi-res: images per micro-batch at each resolution, e.g. 16 4 2 1 (~4k tokens each)")
+    p.add_argument("--t-shift-ref", type=int, default=0,
+                   help="resolution-dependent time shift s = res / REF (SD3's sqrt(tokens / tokens at REF)), e.g. 256: "
+                        "1 at 256 px, 2 at 512, 3 at 768, 4 at 1024; overrides --t-shift")
     p.add_argument("--t-shift", type=float, default=1.0,
                    help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn); 1 = none. SD3's "
                         "resolution rule would be sqrt(tokens / 256): 0.25 at 64 px, 0.5 at 128, 2 at 512, 4 at 1024")
@@ -286,9 +296,9 @@ class Stage(nn.Module):
             validf = valid.to(text.dtype)
             x = self.patch_in(z.flatten(2).transpose(1, 2))
             t_emb = self.time_mlp(timestep_embedding(t, 256))
-            if self.cfg.micro_cond:
+            if self.cfg.micro_cond:  # default: a whole image at this micro-batch's resolution (--multi-res)
                 cond = self.mb_cond if self.mb_cond is not None else default_micro_cond(
-                    self.cfg.micro_cond, 16 * self.cfg.latent_size, z.shape[0], z.device)
+                    self.cfg.micro_cond, 16 * z.shape[-1], z.shape[0], z.device)
                 t_emb = t_emb + self.cond_mlp(micro_cond_embedding(cond).to(t_emb.dtype))
             t6 = self.ada(F.silu(t_emb)).view(z.shape[0], 6, self.cfg.dim)
         else:
@@ -296,11 +306,15 @@ class Stage(nn.Module):
             # pipelining sends a gradient back for every stage input; the mask needs a (zero) one
             x = x + 0 * validf.sum()
         valid = validf > 0.5
+        side = math.isqrt(x.shape[1])  # the grid of this micro-batch (--multi-res: below cfg.latent_size)
         if self.mb_rope is not None:
             cos, sin = self.mb_rope
         elif self.rope_field and self.rope_seed is not None and not x.is_meta:
-            cos, sin = microbatch_rope(self.rope_seed, self._mb, x.shape[0], self.cfg.latent_size, self.rope_field,
+            cos, sin = microbatch_rope(self.rope_seed, self._mb, x.shape[0], side, self.rope_field,
                                        self.cfg.dim // self.cfg.heads, x.device)
+        elif side != self.cfg.latent_size:  # the even grid of the trained field (position interpolation)
+            cos, sin = (b.to(self.rope_cos) for b in build_rope_2d(side, self.cfg.dim // self.cfg.heads,
+                                                                   self.cfg.rope_ref))
         else:
             cos, sin = self.rope_cos, self.rope_sin
         for i, fn in enumerate(self.block_fns):
@@ -313,7 +327,7 @@ class Stage(nn.Module):
                 self.repa_losses.append(aux.detach())
                 x = AddAux.apply(x, self.repa_weight * aux)
         if self.last:
-            n = self.cfg.latent_size
+            n = side
             return self.patch_out(self.norm(x)).transpose(1, 2).reshape(x.shape[0], self.cfg.latent_channels, n, n)
         return x, t6, text, validf
 
@@ -849,9 +863,22 @@ def main():
     # may select another process's GPU and poison this group's first NCCL communicator.
     pipe_group, stage_group = (pipe_groups[replica], stage_groups[s]) if rank < world else (None, None)
 
+    # --multi-res: (resolution, micro-batches per step, images per micro-batch) groups; the step's images split among them
+    mr_groups = list(zip(args.multi_res, args.multi_res_mbs, args.multi_res_mb))
+    if args.multi_res:
+        assert len(args.multi_res) == len(args.multi_res_mbs) == len(args.multi_res_mb), \
+            "--multi-res, --multi-res-mbs and --multi-res-mb need one value per resolution"
+        assert pp == 1 and args.img_dir and max(args.multi_res) == args.res and all(r % 16 == 0 for r in args.multi_res), \
+            "--multi-res needs --pp 1, --img-dir and --res = the largest resolution (multiples of 16)"
+        assert args.repa_weight == 0 and not args.opd and not args.crop_res, "--multi-res: no REPA / --opd / --crop-res"
+        per_mr = sum(n * k for _, n, k in mr_groups)
+        assert args.batch == replicas * per_mr, \
+            f"--multi-res: {per_mr} images per replica and step, so --batch must be {replicas * per_mr}"
+        args.microbatches = sum(n for _, n, _ in mr_groups)
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)  # shapes x text widths
     per_pipe = args.batch // replicas
     M = args.microbatches or 4 * pp
-    assert per_pipe * replicas == args.batch and per_pipe % M == 0, \
+    assert per_pipe * replicas == args.batch and (mr_groups or per_pipe % M == 0), \
         f"batch {args.batch} must split into {replicas} pipelines x {M} micro-batches"
     mb = per_pipe // M
     # inner lrs: AdamW groups scaled to the batch each optimizer sees (the pipeline's batch with MuLoCo)
@@ -1269,6 +1296,9 @@ def main():
     # FLOPs per sample (fwd + bwd), analytic: matmuls 6 N T, attention 12 L d T (T + T_text), frozen LM forward 2 N T
     T, Tt = den_cfg.latent_size ** 2, getattr(te_cfg, "max_tokens", 64)
     flops_sample = 6 * n_den * T + 12 * den_cfg.depth * den_cfg.dim * T * (T + Tt)
+    if mr_groups:  # the average image of a step
+        flops_sample = sum(n * k * (6 * n_den * (r // 16) ** 2 + 12 * den_cfg.depth * den_cfg.dim * (r // 16) ** 2
+                                    * ((r // 16) ** 2 + Tt)) for r, n, k in mr_groups) / per_pipe
     if first:
         flops_sample += 6 * sum(p.numel() for p in te.parameters()) * Tt
         if getattr(te, "lm", None) is not None:
@@ -1377,7 +1407,12 @@ def main():
         log(f"REPA{' (iREPA)' if args.irepa else ''}: {args.repa_encoder} <- DiT block {args.repa_layer} "
             f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
             f"step {repa_steps}; decoding spread over all {pp} stages")
-    log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift {args.t_shift:.2f}")
+    log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift "
+        + (f"res / {args.t_shift_ref}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
+    if mr_groups:
+        log("multi-res per replica and step: " + ", ".join(
+            f"{r} px {n} x {k} ({n * k * (r // 16) ** 2:,} tokens, t shift "
+            f"{r / args.t_shift_ref if args.t_shift_ref else args.t_shift:g})" for r, n, k in mr_groups))
     if args.rope_random or args.micro_cond:
         whole = default_micro_cond(args.micro_cond, args.res, 1)[0].int().tolist() if args.micro_cond else None
         mc = ("off" if not args.micro_cond else
@@ -1436,6 +1471,50 @@ def main():
 
     if device.type == "cuda":  # the peak should be the training step's, not the one from loading (e.g. LM -> int8)
         torch.cuda.reset_peak_memory_stats(device)
+    def shift_t(t, res):
+        """The training time shift at this resolution: s = res / --t-shift-ref, else --t-shift."""
+        s_ = res / args.t_shift_ref if args.t_shift_ref else args.t_shift
+        return t if s_ == 1.0 else s_ * t / (1 + (s_ - 1) * t)
+
+    def encode_u8(u8, side):
+        """uint8 images (n, 3, H, H) on this GPU -> latents, or a handle when part of them go to the VAE server."""
+        n = len(u8)
+        k = round(args.vae_remote_frac * n) if vae_client is not None else 0
+        if not k:
+            return encoder(u8)
+        h = vae_client.request_vae(u8[:k], (k, den_cfg.latent_channels, side, side))
+        h["local"] = encoder(u8[k:]) if k < n else None
+        return h
+
+    def multi_res_batch(at, lat, ids, ids_cpu, rows, mcond):
+        """--multi-res: the step's images assigned to the resolution groups at random (the loader sorts them by caption
+        length), downscaled on the GPU, encoded; per group its latents (or a VAE-server handle), t (shifted for that
+        resolution) and noise. -> (groups, ids, None, None, cond, cond_cpu, rows, mcond); groups: list of dicts."""
+        g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
+        g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
+        perm = torch.randperm(per_pipe, generator=g_cpu)
+        u8_all = lat.to(device, non_blocking=True)
+        groups, o = [], 0
+        with profile.phase("vae_encode"):
+            for r, n, k in mr_groups:
+                idx = perm[o:o + n * k]
+                o += n * k
+                u8 = u8_all[idx.to(device)]
+                if r != args.res:
+                    u8 = F.interpolate(u8.float(), size=(r, r), mode="bicubic", antialias=True).round().clamp(0, 255)
+                    u8 = u8.to(torch.uint8)
+                side = r // 16
+                t = shift_t(torch.sigmoid(torch.randn(n * k, device=device, generator=g)), r)
+                eps = torch.randn(n * k, den_cfg.latent_channels, side, side, device=device, generator=g)
+                groups.append(dict(res=r, n=n, mb=k, idx=idx, x0=encode_u8(u8, side), t=t, eps=eps))
+        ids = ids.to(device, non_blocking=True)
+        drop_cpu = torch.rand(per_pipe, generator=g_cpu) < args.cfg_drop
+        drop = drop_cpu.to(device, non_blocking=True)
+        cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
+        cond_cpu = (torch.where(drop_cpu[:, None], null_cpu, ids_cpu)
+                    if hf_lm and null_row is not None else None)
+        return groups, ids, None, None, cond, cond_cpu, rows, mcond
+
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
@@ -1444,9 +1523,7 @@ def main():
             # x0 itself comes from stage 0 right before this step's pipeline (see the main loop)
             shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
             g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
-            t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))  # the same t and noise as stage 0
-            if args.t_shift != 1.0:
-                t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
+            t = shift_t(torch.sigmoid(torch.randn(per_pipe, device=device, generator=g)), args.res)  # as stage 0
             eps = torch.randn(shape, device=device, generator=g)
             return torch.empty(shape, device=device), None, t, eps, None, None, None, None
         with profile.phase("data_loader"):
@@ -1456,6 +1533,8 @@ def main():
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
         shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
+        if mr_groups:
+            return multi_res_batch(at, lat, ids, ids_cpu, rows, mcond)
         with profile.phase("vae_encode"):
             if vae_client is not None and encoder is not None and round(args.vae_remote_frac * per_pipe) > 0:
                 # a handle (the first k images on the server, the rest here); the main loop collects it
@@ -1469,9 +1548,7 @@ def main():
                 x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
-        t = torch.sigmoid(torch.randn(per_pipe, device=device, generator=g))
-        if args.t_shift != 1.0:
-            t = args.t_shift * t / (1 + (args.t_shift - 1) * t)
+        t = shift_t(torch.sigmoid(torch.randn(per_pipe, device=device, generator=g)), args.res)
         eps = torch.randn(shape if isinstance(x0, dict) else x0.shape, device=device, generator=g)
         # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
@@ -1501,6 +1578,11 @@ def main():
             if isinstance(x0, dict):  # --vae-on-lm: this step's latents from the LM server
                 with profile.phase("vae_wait"):
                     x0 = LMClient.vae_collect(x0)
+            elif isinstance(x0, list):  # --multi-res groups
+                with profile.phase("vae_wait"):
+                    for gr in x0:
+                        if isinstance(gr["x0"], dict):
+                            gr["x0"] = LMClient.vae_collect(gr["x0"])
             with profile.phase("lm_wait_collect"):
                 lm_full = lm_client.collect(req)
             del req
@@ -1512,7 +1594,16 @@ def main():
         else:
             x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond = next_batch(step)
         stage_mod.lm_states = None
-        if lm_client is not None:
+        if isinstance(x0, list) and not isinstance(x0[0]["x0"], torch.Tensor):  # --multi-res without an LM server
+            for gr in x0:
+                if isinstance(gr["x0"], dict):
+                    gr["x0"] = LMClient.vae_collect(gr["x0"])
+        if lm_client is not None and isinstance(x0, list):  # --multi-res: each group its rows' LM states
+            for gr in x0:
+                h = lm_full[gr["idx"].to(lm_full.device)]
+                gr["lm"] = [h[j * gr["mb"]:(j + 1) * gr["mb"]] for j in range(gr["n"])]
+            del lm_full
+        elif lm_client is not None:
             stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
             del lm_full
         if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
@@ -1562,7 +1653,24 @@ def main():
                     dist.recv(x0, src=replica * pp, group=x0_groups[replica])
             try:
                 with amp:
-                    if first:
+                    if first and isinstance(x0, list):  # --multi-res: one local_train_step per resolution group
+                        count = 0
+                        for gi, gr in enumerate(x0):
+                            tt = gr["t"].view(-1, 1, 1, 1)
+                            z_t = (1 - tt) * gr["x0"] + tt * gr["eps"]
+                            ids_g = cond_ids[gr["idx"].to(cond_ids.device)]
+                            cpu_g = cond_cpu[gr["idx"]] if cond_cpu is not None else None
+                            widths = (text_widths(cpu_g, gr["mb"], args.text_bucket)
+                                      if cpu_g is not None and args.text_bucket else None)
+                            stage_mod.lm_states = gr.get("lm")
+                            count += local_train_step(stage_mod, z_t, gr["t"], ids_g, gr["eps"] - gr["x0"], gr["mb"],
+                                                      losses, widths, divide=False,
+                                                      rope_field=args.rope_ref if args.rope_random else 0,
+                                                      rope_seed=None if rope_seed is None else rope_seed + 7919 * gi)
+                        stage_mod.lm_states = None
+                        grads = [p.grad for p in stage_mod.parameters() if p.grad is not None]
+                        torch._foreach_div_(grads, count)
+                    elif first:
                         tt = t.view(-1, 1, 1, 1)
                         z_t = (1 - tt) * x0 + tt * eps
                         if args.opd:
