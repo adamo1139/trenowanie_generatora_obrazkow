@@ -145,9 +145,10 @@ def get_args():
                    help="--multi-res: micro-batches per replica and step at each resolution")
     p.add_argument("--multi-res-mb", type=int, nargs="*", default=[],
                    help="--multi-res: images per micro-batch at each resolution, e.g. 16 4 2 1 (~4k tokens each)")
-    p.add_argument("--t-shift-ref", type=int, default=0,
-                   help="resolution-dependent time shift s = res / REF (SD3's sqrt(tokens / tokens at REF)), e.g. 256: "
-                        "1 at 256 px, 2 at 512, 3 at 768, 4 at 1024; overrides --t-shift")
+    p.add_argument("--t-shift-ref", type=float, default=0,
+                   help="resolution-dependent time shift s = res / REF (SD3's sqrt(tokens / tokens at REF)), e.g. 341.33: "
+                        "0.75 at 256 px, 1.5 at 512, 2.25 at 768, 3 at 1024 (SD3's 3 at 1024); 256: 1 / 2 / 3 / 4; "
+                        "overrides --t-shift")
     p.add_argument("--t-shift", type=float, default=1.0,
                    help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn); 1 = none. SD3's "
                         "resolution rule would be sqrt(tokens / 256): 0.25 at 64 px, 0.5 at 128, 2 at 512, 4 at 1024")
@@ -1408,11 +1409,11 @@ def main():
             f"(stage {repa_stage}), {args.repa_frac:.0%} of each micro-batch, every {args.repa_every} step(s), until "
             f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift "
-        + (f"res / {args.t_shift_ref}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
+        + (f"res / {args.t_shift_ref:g}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
     if mr_groups:
         log("multi-res per replica and step: " + ", ".join(
             f"{r} px {n} x {k} ({n * k * (r // 16) ** 2:,} tokens, t shift "
-            f"{r / args.t_shift_ref if args.t_shift_ref else args.t_shift:g})" for r, n, k in mr_groups))
+            f"{r / args.t_shift_ref if args.t_shift_ref else args.t_shift:.2f})" for r, n, k in mr_groups))
     if args.rope_random or args.micro_cond:
         whole = default_micro_cond(args.micro_cond, args.res, 1)[0].int().tolist() if args.micro_cond else None
         mc = ("off" if not args.micro_cond else
